@@ -1,3 +1,3 @@
 # solarium_1
-irigation and weather data system
+Smart zone controlled irigation and weather data system
 Work in progress...
