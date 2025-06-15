@@ -1,7 +1,8 @@
 
 **Smart zone controlled irigation and weather data system**
 
-![solarium Diagram drawio](https://github.com/user-attachments/assets/af386449-b127-4c43-8a3a-18a5e075b8d4)
+![solarium Diagram drawio](https://github.com/user-attachments/assets/f8a33487-a0ce-4170-98f9-2d25f3874cc6)
+
 
 Work in progress...
 
