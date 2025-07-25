@@ -1,0 +1,71 @@
+---
+# Clang-Format configuration for K&R style
+BasedOnStyle: LLVM
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+
+# Brace placement - K&R style
+BreakBeforeBraces: Linux
+BraceWrapping:
+  AfterFunction: true
+  AfterControlStatement: Never
+  AfterStruct: true
+  AfterUnion: true
+  AfterEnum: true
+  BeforeElse: false
+  BeforeCatch: false
+  BeforeWhile: false
+
+# Indentation
+IndentCaseLabels: true
+IndentPPDirectives: BeforeHash
+AccessModifierOffset: -4
+
+# Alignment
+AlignConsecutiveAssignments: false
+AlignConsecutiveDeclarations: false
+AlignTrailingComments: true
+AlignAfterOpenBracket: Align
+
+# Function parameters - force multiple lines for readability
+AllowAllParametersOfDeclarationOnNextLine: false
+BinPackParameters: false
+BinPackArguments: false
+AllowAllArgumentsOnNextLine: false
+
+# Spacing
+SpaceBeforeParens: ControlStatements
+SpaceInEmptyParentheses: false
+SpacesInParentheses: false
+SpacesInSquareBrackets: false
+SpaceAfterCStyleCast: true
+SpaceBeforeAssignmentOperators: true
+
+# Line breaks
+MaxEmptyLinesToKeep: 2
+KeepEmptyLinesAtTheStartOfBlocks: false
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortFunctionsOnASingleLine: None
+AllowShortBlocksOnASingleLine: Never
+
+# Column limit - encourage argument wrapping
+ColumnLimit: 120
+
+# Penalties to encourage argument wrapping
+PenaltyBreakBeforeFirstCallParameter: 10
+PenaltyBreakComment: 300
+PenaltyBreakFirstLessLess: 120
+PenaltyBreakString: 200
+PenaltyExcessCharacter: 1000
+
+# Comments
+ReflowComments: true
+
+# Include sorting
+SortIncludes: false
+
+# Pointer alignment
+PointerAlignment: Right
+DerivePointerAlignment: false 

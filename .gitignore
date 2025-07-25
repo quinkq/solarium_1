@@ -1,4 +1,4 @@
 .vscode/
 .devcontainer/
-.esp8266_test/
-.build/
+esp8266_test/
+build/
