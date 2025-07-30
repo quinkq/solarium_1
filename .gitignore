@@ -2,3 +2,6 @@
 .devcontainer/
 esp8266_test/
 build/
+main/wifi_credentials.h
+components/abp/abp_example.c
+components/abp/README.md
