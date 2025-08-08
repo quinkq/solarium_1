@@ -1,28 +1,65 @@
-
-## Work in progress!
+# Solarium - Solar-Powered Garden Automation System
 
 ![solarium Diagram drawio](https://github.com/user-attachments/assets/f8a33487-a0ce-4170-98f9-2d25f3874cc6)
 
+## Work in progres...
 
-## Smart zone controlled irrigation and weather data system
+## Overview
 
-This project is an automated irrigation/garden control system, built on an ESP32 microcontroller using the ESP-IDF framework and FreeRTOS. It manages a complex array of sensors and actuators to maintain an optimal environment. The system's core features include an intelligent, multi-zone irrigation system with a learning algorithm, a closed-loop solar tracking system for a photovoltaic panel, and extensive power management and real-time monitoring capabilities. Each major component runs as a dedicated RTOS task, ensuring concurrent and responsive operation.
+Solarium is an ESP32-S3 based garden automation system that combines intelligent irrigation, weather monitoring, solar tracking, and power management. The system is designed with a modular architecture using ESP-IDF and FreeRTOS, with each major subsystem implemented as separate components that can operate independently or as part of a distributed network.
 
-## Core Systems & Features:
-- Intelligent Irrigation: A multi-zone system using a state machine, adaptive learning, and safety protocols.
-- Closed-Loop Solar Tracking: A dual-axis solar tracker orients a PV panel using photoresistors and servos. It includes logic to power servos only when adjustments are needed.
-- Robust Sensor Integration: Manages environmental (SHT4x, BMP280), rotary position (AS5600) and power (INA219) sensors + analog devices (through ADS1115).
-- Power Management: Utilizes MOSFETs to control power to different hardware buses, minimizing idle energy consumption.
-## Irrigation System Highlights:
-- State Machine: Follows a safe sequence: IDLE -> MEASURING -> STARTING -> WATERING -> STOPPING.
-- Event-Driven Monitoring Task: A high-priority parallel task provides real-time control during watering:
-- Smart Cutoffs: Stops watering based on target water volume (flow meter) or if moisture levels rise too quickly (e.g., rain).
-- Safety Interlocks: Triggers an emergency stop for over-pressure, low-flow, empty water tank or over-current conditions.
-## Learning Algorithm:
-- Logs historical data (water volume vs. moisture change) to accurately predict future watering needs.
-- Automatically adjusts water volume based on ambient temperature.
-- Emergency Diagnostics: If a critical fault occurs, it runs automated test cycles to diagnose if the issue is system-wide (pump/filter) or a single-zone fault (valve), disabling only the faulty part.
+## System Architecture
 
-## Work in progress!
+The current Alpha implementation runs on a single ESP32-S3 with five main subsystems:
+
+**IMPLUVIUM (Irrigation)**: Multi-zone irrigation controller with learning algorithms that adjust watering based on historical data and temperature readings. Implements safety interlocks including over-pressure, low-flow, and empty tank detection. Features emergency diagnostics to isolate faults between system-wide (pump/filter) and zone-specific (valve) issues.
+
+**FLUCTUS (Power Management & Solar Tracking)**: Manages a 4-bus power distribution system (3.3V, 5V, 6.2V, 12V) with buck converter control and reference counting for multiple consumers. Implements 5-state load shedding (Normal -> Power Saving -> Low Power -> Very Low -> Critical) with inter-component communication. Includes dual-axis solar tracking using photoresistor feedback and automatic parking during low-light conditions.
+
+**TEMPESTA (Weather Station)**: Environmental monitoring using SHT4x (temperature/humidity), BME280 (t/h/pressure), AS5600 (wind speed via rotary encoder), and PMS5003 (air quality). Will feature custom wind measurement with triple-cup anemometer, rainfall detection via tipping bucket sensor, and sensor fusion with historical averaging.
+
+**STELLARIA (Ambient Lighting)**: LED lighting control with constant current driver, PWM intensity control, and automatic light sensing with hysteresis. Integrates with power management for load shedding support.
+
+## Technical Features
+
+### Power Management
+- Battery monitoring with voltage-based load shedding
+- Reference-counted bus sharing prevents premature shutdowns
+- Overcurrent protection (1.5A/3s warning, 3A immediate shutdown)
+- Consumer tracking for fault diagnosis
+
+### Irrigation Intelligence  
+- State machine: IDLE -> MEASURING -> WATERING -> STOPPING
+- Learning algorithm correlates water volume with moisture change
+- Temperature-adaptive watering volumes
+- Real-time monitoring task with safety interlocks
+- Emergency diagnostics with automated test cycles
+
+### Weather Data Processing
+- Sensor fusion combining multiple temperature/humidity sources
+- Weighted averaging with more recent samples prioritized
+- AS5600 wind measurement
+- Quarter-hour aligned data collection cycles
+- Power-aware sensor operation with progressive load shedding
+
+### Load Shedding Integration
+All components implement coordinated load shedding APIs:
+- Power save mode (reduced operation frequency)
+- Feature disabling (PMS5003 air quality sensor)
+- Complete shutdown for critical power states
+- Automatic restoration when power levels recover
+
+## Hardware Integration
+
+**Sensors**: SHT4x, BME280, AS5600, PMS5003, multiple ADS1115 ADCs, Honeywell ABP delta pressure sensor, flow sensor with pulse counting
+**Actuators**: Water valves, pump control, dual-axis servos, LED drivers, 12V PWM fan
+**Power**: Solar panel input, battery bank, multi-stage voltage regulation, INA219 power monitoring
+**Communication**: I2C, SPI, UART, GPIO, PWM interfaces
+
+## Development Status
+
+This Alpha stage focuses on single-node operation with integrated power management. The planned Beta architecture will transition to a distributed multi-node system with dedicated controllers for power management, RS485/ESP-NOW communication, and Linux server integration through Home Assistant or database systems.
+
+Current implementation includes complete integration of all five subsystems with centralized FLUCTUS power management, comprehensive load shedding communication, and thread-safe operation across concurrent FreeRTOS tasks.
 
 ![Zdjęcie WhatsApp 2025-05-09 o 20 46 51_e84f5e36](https://github.com/user-attachments/assets/1abb4618-83d8-4f8f-a14d-57da2c8549b5)

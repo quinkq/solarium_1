@@ -1,5 +1,7 @@
 #include "irrigation.h"
-#include "main.h"
+#include "ads1115_helper.h"
+#include "weather_station.h"
+#include "fluctus.h"
 
 #include <string.h>
 #include <math.h>
@@ -14,13 +16,13 @@
     return ESP_ERR_INVALID_ARG
 
 // ########################## Global Variable Definitions ##########################
-#define TAG "irrigation System"
+#define TAG "IMPLUVIUM"
 
 irrigation_zone_t irrigation_zones[IRRIGATION_ZONE_COUNT];
 irrigation_system_t irrigation_system;
 
 static SemaphoreHandle_t xIrrigationMutex = NULL;
-static TaskHandle_t xIrrigationTaskHandle = NULL; // Handle for the main task
+static TaskHandle_t xIrrigationTaskHandle = NULL;
 static TaskHandle_t xIrrigationMonitoringTaskHandle = NULL;
 static TimerHandle_t xMoistureCheckTimer = NULL;
 
@@ -31,8 +33,8 @@ static const gpio_num_t zone_valve_gpios[IRRIGATION_ZONE_COUNT] = {VALVE_GPIO_ZO
                                                                    VALVE_GPIO_ZONE_4,
                                                                    VALVE_GPIO_ZONE_5};
 
-// ABP sensor variable
-abp_t abp_sensor = {0};
+// ABP sensor handle
+abp_t abp_dev = {0};
 
 // NVS Storage Keys
 static const char *NVS_NAMESPACE = "irrigation";
@@ -47,7 +49,7 @@ static esp_err_t irrigation_pump_init(void);
 static esp_err_t irrigation_flow_sensor_init(void);
 
 // ------------------------ Zone Configuration Functions ------------------------
-// TODO: Implement remote zone configuration
+// TODO: implement remote zone configuration
 static esp_err_t irrigation_load_zone_config(void);
 static esp_err_t irrigation_save_learning_data(uint8_t zone_id, const watering_event_t *event);
 
@@ -147,9 +149,10 @@ static esp_err_t irrigation_system_init(void)
     irrigation_system.state = IRRIGATION_IDLE;
     irrigation_system.active_zone = NO_ACTIVE_ZONE_ID; // No active zone
     irrigation_system.queue_index = 0;                 // Start at beginning of queue
-    irrigation_system.sensors_powered = false;
     irrigation_system.state_start_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
     irrigation_system.system_start_time = irrigation_system.state_start_time;
+    irrigation_system.power_save_mode = false;         // Start in normal operation
+    irrigation_system.load_shed_shutdown = false;      // Start with load shedding disabled
 
     // Initialize zone configurations
     for (uint8_t i = 0; i < IRRIGATION_ZONE_COUNT; i++) {
@@ -195,7 +198,7 @@ static esp_err_t irrigation_system_init(void)
     }
 
     // Initialize ABP sensor for ±1 psi differential pressure
-    ret = abp_init(&abp_sensor, ABP_SPI_HOST, ABP_CS_PIN, ABP_RANGE_001PD);
+    ret = abp_init(&abp_dev, ABP_SPI_HOST, ABP_CS_PIN, ABP_RANGE_001PD);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to initialize ABP sensor: %s", esp_err_to_name(ret));
         return ret;
@@ -420,15 +423,7 @@ static esp_err_t irrigation_read_moisture_sensor(uint8_t zone_id, float *moistur
             *moisture_percent =
                 ((clamped_voltage - MOISTURE_SENSOR_DRY_V) / (MOISTURE_SENSOR_WET_V - MOISTURE_SENSOR_DRY_V)) * 100.0f;
 
-            // Update debug display variables with raw voltage
-            if (xSemaphoreTake(xDisplayDataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                uint8_t dev_id = zone->moisture_ads_device;
-                uint8_t ch_id =
-                    zone->moisture_channel - ADS111X_MUX_0_GND; // channels for display are (0-3), so it's this
-                                                                // "ads_111x_mux_t enum" (numbered 4-7), - "4"
-                latest_ads_voltages[dev_id][ch_id] = voltage;
-                xSemaphoreGive(xDisplayDataMutex);
-            }
+            // Voltage reading successful - ads1115_helper manages display data automatically
 
             if (attempt > 0) {
                 ESP_LOGD(TAG,
@@ -499,12 +494,6 @@ static esp_err_t irrigation_read_pressure(float *pressure_bar)
             // Assuming linear conversion for now
             *pressure_bar = voltage * 3.0f; // For implementation time/tests: 3 bar per volt
 
-            // Update debug display with raw voltage
-            if (xSemaphoreTake(xDisplayDataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                latest_ads_voltages[2][1] = voltage; // Dev#2, Ch1
-                xSemaphoreGive(xDisplayDataMutex);
-            }
-
             if (attempt > 0) {
                 ESP_LOGD(TAG,
                          "System pressure read succeeded on attempt %d: %.2f bar (%.3fV)",
@@ -552,7 +541,7 @@ static esp_err_t irrigation_read_water_level(float *water_level_percent)
     esp_err_t ret = ESP_FAIL;
 
     for (uint8_t attempt = 0; attempt < SENSOR_READ_MAX_RETRIES; attempt++) {
-        ret = abp_read_pressure_mbar(&abp_sensor, &water_level_pressure_mbar);
+        ret = abp_read_pressure_mbar(&abp_dev, &water_level_pressure_mbar);
         if (ret == ESP_OK)
             break;
         if (attempt < SENSOR_READ_MAX_RETRIES - 1) {
@@ -686,6 +675,39 @@ static void irrigation_pump_adaptive_control(float current_gain_rate, float targ
 // ########################## Irrigation System ##########################
 // ------------------- Learning Algorithm Functions -----------------------
 
+// Removed: irrigation_get_cached_weather_data - using simple weather_get_temperature() instead
+
+/**
+ * @brief Calculate dynamic moisture check interval based on temperature
+ *
+ * @param[in] current_temperature Current temperature in °C
+ * @return Moisture check interval in milliseconds
+ */
+static uint32_t irrigation_calc_moisture_check_interval(float current_temperature)
+{
+    // Check for power save mode override
+    if (irrigation_system.power_save_mode) {
+        ESP_LOGD(TAG, "Power save mode active - using 60min interval");
+        return MOISTURE_CHECK_INTERVAL_POWER_SAVE_MS;
+    }
+    
+    if (current_temperature == WEATHER_INVALID_VALUE) {
+        ESP_LOGW(TAG, "Invalid temperature - using default interval");
+        return MOISTURE_CHECK_INTERVAL_MS;
+    }
+
+    if (current_temperature < MIN_TEMPERATURE_WATERING) {
+        ESP_LOGI(TAG, "Temperature %.1f°C below watering threshold - skipping moisture checks", current_temperature);
+        return UINT32_MAX; // Skip moisture checks completely
+    } else if (current_temperature >= TEMPERATURE_OPTIMAL_THRESHOLD) {
+        ESP_LOGD(TAG, "Optimal temperature %.1f°C - using 15min interval", current_temperature);
+        return MOISTURE_CHECK_INTERVAL_OPTIMAL_MS;
+    } else {
+        ESP_LOGD(TAG, "Cool temperature %.1f°C - using 30min interval", current_temperature);
+        return MOISTURE_CHECK_INTERVAL_COLD_MS;
+    }
+}
+
 /**
  * @brief Calculate temperature correction factor for watering predictions
  *
@@ -695,12 +717,20 @@ static void irrigation_pump_adaptive_control(float current_gain_rate, float targ
 static float irrigation_calc_temperature_correction(zone_learning_t *learning)
 {
     // Calculate temperature correction factor
-    // Formula: 1.0 + (current_temp - baseline_temp) * correction_factor
+    // Formula: 1.0 + (current_temperature - baseline_temp) * correction_factor
     // Example: At 30°C: 1.0 + (30-20) * 0.01 = 1.10 (10% more water)
     //          At 10°C: 1.0 + (10-20) * 0.01 = 0.90 (10% less water)
-    float temp_correction = 1.0f + ((latest_sht_temp - TEMPERATURE_BASELINE) * TEMP_CORRECTION_FACTOR);
+    float current_temperature = weather_get_temperature();
+
+    if (current_temperature == WEATHER_INVALID_VALUE) {
+        ESP_LOGW(TAG, "Temperature sensors failed - using baseline correction");
+        learning->last_temperature_correction = 1.0f;
+        return 1.0f;
+    }
+
+    float temp_correction = 1.0f + ((current_temperature - TEMPERATURE_BASELINE) * TEMP_CORRECTION_FACTOR);
     learning->last_temperature_correction = temp_correction;
-    ESP_LOGD(TAG, "Temp %.1f°C, correction factor %.2f", latest_sht_temp, temp_correction);
+    ESP_LOGD(TAG, "Temp %.1f°C, correction factor %.2f", current_temperature, temp_correction);
     return temp_correction;
 }
 
@@ -1023,14 +1053,39 @@ static const char *emergency_state_name(emergency_state_t state)
  */
 static esp_err_t irrigation_state_measuring(void)
 {
-    // Power on sensors
-    power_on_3V3_sensor_bus();
+    // Check FLUCTUS power state before requesting power
+    fluctus_power_state_t power_state = fluctus_get_power_state();
+    if (power_state == FLUCTUS_POWER_STATE_CRITICAL) {
+        ESP_LOGW(TAG, "Critical power state - skipping irrigation cycle");
+        irrigation_change_state(IRRIGATION_IDLE);
+        return ESP_OK;
+    }
+    
+    if (power_state >= FLUCTUS_POWER_STATE_VERY_LOW) {
+        ESP_LOGW(TAG, "Very low power state - irrigation disabled for battery conservation");
+        irrigation_change_state(IRRIGATION_IDLE);
+        return ESP_OK;
+    }
+
+    // Power on sensors (3V3 for sensors, 5V for pressure transmitter)
+    FLUCTUS_REQUEST_BUS_OR_FAIL(POWER_BUS_3V3, "IMPLUVIUM", {
+        irrigation_change_state(IRRIGATION_MAINTENANCE);
+        return ESP_FAIL;
+    });
+    
+    FLUCTUS_REQUEST_BUS_OR_FAIL(POWER_BUS_5V, "IMPLUVIUM", {
+        fluctus_release_bus_power(POWER_BUS_3V3, "IMPLUVIUM");
+        irrigation_change_state(IRRIGATION_MAINTENANCE);
+        return ESP_FAIL;
+    });
+    
     vTaskDelay(pdMS_TO_TICKS(1000));
 
     // Perform pre-start safety checks directly
     if (irrigation_pre_check() != ESP_OK) {
         ESP_LOGE(TAG, "Pre-start safety check failed.");
-        power_off_3V3_sensor_bus();
+        fluctus_release_bus_power(POWER_BUS_5V, "IMPLUVIUM");
+        fluctus_release_bus_power(POWER_BUS_3V3, "IMPLUVIUM");
         irrigation_change_state(IRRIGATION_MAINTENANCE);
         return ESP_FAIL;
     }
@@ -1100,7 +1155,8 @@ static esp_err_t irrigation_state_measuring(void)
         irrigation_change_state(IRRIGATION_WATERING);
     } else {
         // No zones need watering - power off sensors and return to idle
-        power_off_3V3_sensor_bus();
+        fluctus_release_bus_power(POWER_BUS_5V, "IMPLUVIUM");
+        fluctus_release_bus_power(POWER_BUS_3V3, "IMPLUVIUM");
         irrigation_system.last_moisture_check = xTaskGetTickCount() * portTICK_PERIOD_MS;
         irrigation_change_state(IRRIGATION_IDLE);
     }
@@ -1131,6 +1187,15 @@ static esp_err_t irrigation_state_watering(void)
     uint8_t zone_id = irrigation_system.watering_queue[irrigation_system.queue_index].zone_id;
     irrigation_zone_t *zone = &irrigation_zones[zone_id];
     ESP_LOGI(TAG, "Watering sequence started for zone %d", zone_id);
+    
+    // Request 12V power for valve & pump operation
+    FLUCTUS_REQUEST_BUS_OR_FAIL(POWER_BUS_12V, "IMPLUVIUM", {
+        gpio_set_level(zone->valve_gpio, 0);
+        fluctus_release_bus_power(POWER_BUS_5V, "IMPLUVIUM");
+        fluctus_release_bus_power(POWER_BUS_3V3, "IMPLUVIUM");
+        irrigation_change_state(IRRIGATION_MAINTENANCE);
+        return ESP_FAIL;
+    });
 
     // Open valve
     gpio_set_level(zone->valve_gpio, 1);
@@ -1138,9 +1203,11 @@ static esp_err_t irrigation_state_watering(void)
 
     // Ramp up pump speed
     if (irrigation_pump_ramp_up(zone_id) != ESP_OK) {
-        ESP_LOGE(TAG, "Pump ramp-up failed for zone %d", zone_id);
+        ESP_LOGE(TAG, "Pump ramp-up failed for zone %d, turning off power buses", zone_id);
         gpio_set_level(zone->valve_gpio, 0);
-        power_off_3V3_sensor_bus();
+        fluctus_release_bus_power(POWER_BUS_12V, "IMPLUVIUM");
+        fluctus_release_bus_power(POWER_BUS_5V, "IMPLUVIUM");
+        fluctus_release_bus_power(POWER_BUS_3V3, "IMPLUVIUM");
         irrigation_change_state(IRRIGATION_MAINTENANCE);
         return ESP_FAIL;
     }
@@ -1204,13 +1271,17 @@ static esp_err_t irrigation_state_stopping(void)
             float moisture_increase_percent = final_moisture_percent - queue_item->moisture_at_start_percent;
 
             // Check for anomalies that would invalidate learning
-            if (irrigation_system.current_anomaly.type != ANOMALY_NONE || latest_sht_temp < TEMP_EXTREME_LOW ||
-                latest_sht_temp > TEMP_EXTREME_HIGH) {
+            float current_temperature = weather_get_temperature();
+
+            if (irrigation_system.current_anomaly.type != ANOMALY_NONE ||
+                current_temperature == WEATHER_INVALID_VALUE || current_temperature < TEMP_EXTREME_LOW ||
+                current_temperature > TEMP_EXTREME_HIGH) {
                 learning_valid = false;
                 ESP_LOGW(TAG,
-                         "Zone %d: Anomaly detected (%d), not using for learning",
+                         "Zone %d: Anomaly detected (type=%d, temp=%.1f°C), not using for learning",
                          active_zone,
-                         irrigation_system.current_anomaly.type);
+                         irrigation_system.current_anomaly.type,
+                         current_temperature);
             }
 
             // Update learning algorithm with results
@@ -1248,8 +1319,10 @@ static esp_err_t irrigation_state_stopping(void)
         // All zones completed - finish session
         ESP_LOGI(TAG, "All %d zones in queue completed", irrigation_system.watering_queue_size);
 
-        // Power off sensors now that all zones are done
-        power_off_3V3_sensor_bus();
+        // Power off all buses now that all zones are done
+        fluctus_release_bus_power(POWER_BUS_12V, "IMPLUVIUM");
+        fluctus_release_bus_power(POWER_BUS_5V, "IMPLUVIUM");
+        fluctus_release_bus_power(POWER_BUS_3V3, "IMPLUVIUM");
 
         // Reset queue and state
         irrigation_system.queue_index = 0;
@@ -1321,8 +1394,10 @@ static esp_err_t irrigation_state_maintenance(void)
                 ESP_LOGE(TAG, "Emergency diagnostics failed - USER INTERVENTION REQUIRED");
                 ESP_LOGE(TAG, "Failure: %s", irrigation_system.emergency.failure_reason);
                 ESP_LOGE(TAG, "Failed zones mask: 0x%02X", irrigation_system.emergency.failed_zones_mask);
-                // Power off sensors to conserve power while waiting for user
-                power_off_3V3_sensor_bus();
+                // Power off all buses to conserve power while waiting for user
+                fluctus_release_bus_power(POWER_BUS_12V, "IMPLUVIUM");
+                fluctus_release_bus_power(POWER_BUS_5V, "IMPLUVIUM");
+                fluctus_release_bus_power(POWER_BUS_3V3, "IMPLUVIUM");
                 // Stay in this state until user manually resets system. The task will block waiting for a notification.
                 return ESP_OK;
 
@@ -1351,10 +1426,15 @@ static esp_err_t irrigation_state_maintenance(void)
 static esp_err_t irrigation_pre_check(void)
 {
     // Check temperature
-    if (latest_sht_temp < MIN_TEMPERATURE_WATERING) {
+    float current_temperature = weather_get_temperature();
+
+    if (current_temperature == WEATHER_INVALID_VALUE) {
+        ESP_LOGE(TAG, "Pre-check failed: Temperature sensors unavailable");
+        return ESP_FAIL;
+    } else if (current_temperature < MIN_TEMPERATURE_WATERING) {
         ESP_LOGW(TAG,
                  "Pre-check failed: Temperature %.1f°C is below minimum %.1f°C",
-                 latest_sht_temp,
+                 current_temperature,
                  MIN_TEMPERATURE_WATERING);
         return ESP_FAIL;
     }
@@ -1386,7 +1466,7 @@ static esp_err_t irrigation_pre_check(void)
 
     ESP_LOGI(TAG,
              "Safety pre-check complete: temp %.1f°C, water level %.1f %%, pressure %.2f bar, allowed YES",
-             latest_sht_temp,
+             current_temperature,
              irrigation_system.water_level,
              irrigation_system.pressure);
 
@@ -1527,24 +1607,7 @@ static bool irrigation_periodic_safety_check(uint32_t *error_count, uint32_t tim
         failure_reason = "Water level sensor read failed";
     }
 
-    // Check output current (immediate emergency stop)
-    // TODO: move ina reading to Power Management System
-    if (ina219_devices[0].initialized) {
-        float current_amps;
-        if (ina219_get_current(&ina219_devices[0].dev, &current_amps) == ESP_OK) {
-            if (current_amps > MAX_OUTPUT_CURRENT_AMPS) {
-                ESP_LOGE(TAG,
-                         "CRITICAL: Current %.2fA > %.2fA - EMERGENCY STOP",
-                         current_amps,
-                         MAX_OUTPUT_CURRENT_AMPS);
-                irrigation_emergency_stop("Overcurrent protection triggered.");
-                return false;
-            }
-        } else {
-            ESP_LOGE(TAG, "Failed to read current during safety check");
-            return false;
-        }
-    }
+    // Overcurrent monitoring delegated to Fluctus (power management) system.
 
     // Check safety parameters
     if (failure_reason == NULL) {
@@ -1631,7 +1694,12 @@ static esp_err_t emergency_diagnostics_start(const char *reason)
     ESP_LOGW(TAG, "Reason: %s", reason);
 
     // Power on sensors for the duration of the diagnostics
-    power_on_3V3_sensor_bus();
+    FLUCTUS_REQUEST_BUS_OR_FAIL(POWER_BUS_3V3, "IMPLUVIUM_DIAG", return ESP_FAIL);
+    
+    FLUCTUS_REQUEST_BUS_OR_FAIL(POWER_BUS_5V, "IMPLUVIUM_DIAG", {
+        fluctus_release_bus_power(POWER_BUS_3V3, "IMPLUVIUM_DIAG");
+        return ESP_FAIL;
+    });
 
     // Reset diagnostics state
     memset(&irrigation_system.emergency, 0, sizeof(emergency_diagnostics_t));
@@ -1703,6 +1771,8 @@ static esp_err_t emergency_diagnostics_check_moisture_levels(void)
  */
 static esp_err_t emergency_diagnostics_test_zone(uint8_t zone_id)
 {
+    FLUCTUS_REQUEST_BUS_OR_FAIL(POWER_BUS_12V, "IMPLUVIUM_DIAG", return ESP_FAIL);
+    
     if (zone_id >= IRRIGATION_ZONE_COUNT) {
         ESP_LOGE(TAG, "Invalid zone for diagnostics: %d", zone_id);
         return ESP_ERR_INVALID_ARG;
@@ -1739,26 +1809,7 @@ static esp_err_t emergency_diagnostics_test_zone(uint8_t zone_id)
     // Wait for test duration, checking for overcurrent midway
     vTaskDelay(pdMS_TO_TICKS(EMERGENCY_TEST_DURATION_MS / 5));
 
-    // Check for overcurrent during the test
-    // TODO: move ina219 reading to Power Management System
-    if (ina219_devices[0].initialized) {
-        float current_amps;
-        if (ina219_get_current(&ina219_devices[0].dev, &current_amps) == ESP_OK) {
-            if (current_amps > MAX_OUTPUT_CURRENT_AMPS) {
-                ESP_LOGE(TAG, "CRITICAL DIAGNOSTIC: Current %.2fA > %.2fA", current_amps, MAX_OUTPUT_CURRENT_AMPS);
-                // Stop everything immediately and mark this zone as failed
-                irrigation_set_pump_speed(0);
-                gpio_set_level(zone->valve_gpio, 0);
-                irrigation_system.emergency.failed_zones_mask |= (1 << zone_id);
-                irrigation_system.emergency.test_flow_rates[zone_id] = 0.0f;
-                irrigation_system.emergency.test_pressures[zone_id] = 0.0f;
-                return ESP_FAIL; // Abort test for this zone
-            }
-        } else {
-            ESP_LOGE(TAG, "Failed to read current during diagnostic test for zone %d", zone_id);
-            return ESP_FAIL;
-        }
-    }
+    // Overcurrent monitoring delegated to Fluctus (power management) system.
 
     vTaskDelay(pdMS_TO_TICKS(EMERGENCY_TEST_DURATION_MS));
 
@@ -1779,6 +1830,7 @@ static esp_err_t emergency_diagnostics_test_zone(uint8_t zone_id)
     irrigation_set_pump_speed(0);
     vTaskDelay(pdMS_TO_TICKS(PRESSURE_EQUALIZE_DELAY_MS)); // Wait for pressure to drop
     gpio_set_level(zone->valve_gpio, 0);
+    fluctus_release_bus_power(POWER_BUS_12V, "IMPLUVIUM_DIAG");
 
     // Store test results
     irrigation_system.emergency.test_flow_rates[zone_id] = test_flow_rate;
@@ -1946,7 +1998,8 @@ static esp_err_t emergency_diagnostics_resolve(void)
     }
 
     // Power off sensors now that diagnostics are complete
-    power_off_3V3_sensor_bus();
+    fluctus_release_bus_power(POWER_BUS_3V3, "IMPLUVIUM_DIAG");
+    fluctus_release_bus_power(POWER_BUS_5V, "IMPLUVIUM_DIAG");
 
     // Clear emergency state
     irrigation_system.emergency.state = EMERGENCY_NONE;
@@ -1964,11 +2017,35 @@ static esp_err_t emergency_diagnostics_resolve(void)
 // -----------------#################################-----------------
 
 /**
- * @brief Timer callback to trigger moisture check
+ * @brief Timer callback for moisture checking with dynamic temperature-based intervals
  */
 static void vTimerCallbackMoistureCheck(TimerHandle_t xTimer)
 {
-    // Set a bit in the event group to notify the main irrigation task
+    // Get current temperature to determine next interval
+    float current_temperature = weather_get_temperature();
+    uint32_t next_interval_ms = irrigation_calc_moisture_check_interval(current_temperature);
+
+    // If temperature is too low, skip moisture checks entirely
+    if (next_interval_ms == UINT32_MAX) {
+        ESP_LOGI("MoistureTimer", "Skipping moisture check due to low temperature (%.1f°C)", current_temperature);
+        // Set timer to check again in 1 hour
+        next_interval_ms = 60 * 60 * 1000;
+        return; // Don't trigger moisture check
+    }
+
+    // Update timer interval if it has changed
+    TickType_t current_period = xTimerGetPeriod(xTimer);
+    TickType_t new_period = pdMS_TO_TICKS(next_interval_ms);
+
+    if (current_period != new_period) {
+        ESP_LOGI("MoistureTimer",
+                 "Updating moisture check interval: %" PRIu32 "min (temp: %.1f°C)",
+                 next_interval_ms / (60 * 1000),
+                 current_temperature);
+        xTimerChangePeriod(xTimer, new_period, 0);
+    }
+
+    // Notify the main irrigation task to perform moisture check
     xTaskNotify(xIrrigationTaskHandle, IRRIGATION_TASK_NOTIFY_REQUEST_MOISTURE_CHECK, eSetBits);
 }
 
@@ -2008,8 +2085,10 @@ void irrigation_task(void *pvParameters)
         if (xSemaphoreTake(xIrrigationMutex, portMAX_DELAY) == pdTRUE) {
             // --- Event Handling ---
             if (notification_value & IRRIGATION_TASK_NOTIFY_REQUEST_MOISTURE_CHECK) {
-                ESP_LOGD(task_tag, "Notification: Moisture check requested");
-                if (irrigation_system.state == IRRIGATION_IDLE) {
+                ESP_LOGI(task_tag, "Notification: Moisture check requested");
+                if (irrigation_system.load_shed_shutdown) {
+                    ESP_LOGD(task_tag, "Load shedding shutdown active - skipping moisture check");
+                } else if (irrigation_system.state == IRRIGATION_IDLE) {
                     irrigation_change_state(IRRIGATION_MEASURING);
                 }
             }
@@ -2149,4 +2228,108 @@ static void irrigation_monitoring_task(void *pvParameters)
             }
         }
     }
+}
+
+// ########################## Public API Functions ##########################
+
+/**
+ * @brief Initialize the IMPLUVIUM irrigation system
+ * 
+ * Initializes the irrigation system hardware, creates required tasks,
+ * and loads configuration from NVS. Must be called before any irrigation operations.
+ * 
+ * @return ESP_OK on successful initialization
+ * @return ESP_FAIL on initialization failure
+ */
+esp_err_t impluvium_init(void)
+{
+    ESP_LOGI(TAG, "Initializing IMPLUVIUM irrigation system...");
+
+    // Initialize system hardware and zones
+    esp_err_t ret = irrigation_system_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize irrigation system: %s", esp_err_to_name(ret));
+        return ESP_FAIL;
+    }
+
+    // Create the main irrigation task
+    BaseType_t xResult = xTaskCreate(irrigation_task,
+                                     "IMPLUVIUM",
+                                     configMINIMAL_STACK_SIZE * 6,
+                                     NULL,
+                                     5, // Medium priority
+                                     &xIrrigationTaskHandle);
+    if (xResult != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create IMPLUVIUM irrigation task");
+        return ESP_FAIL;
+    }
+
+    // Create the monitoring task
+    xResult = xTaskCreate(irrigation_monitoring_task,
+                          "IMPLUVIUM_Monitor",
+                          configMINIMAL_STACK_SIZE * 4,
+                          NULL,
+                          6, // Higher priority for monitoring
+                          &xIrrigationMonitoringTaskHandle);
+    if (xResult != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create IMPLUVIUM monitoring task");
+        // Clean up main task
+        if (xIrrigationTaskHandle != NULL) {
+            vTaskDelete(xIrrigationTaskHandle);
+            xIrrigationTaskHandle = NULL;
+        }
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "IMPLUVIUM irrigation system initialized successfully");
+    return ESP_OK;
+}
+
+// ########################## Load Shedding Functions ##########################
+
+/**
+ * @brief Set power saving mode for IMPLUVIUM irrigation system
+ */
+esp_err_t impluvium_set_power_save_mode(bool enable)
+{
+    if (!irrigation_system.sensors_powered) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    
+    irrigation_system.power_save_mode = enable;
+    
+    if (enable) {
+        ESP_LOGI(TAG, "Power save mode enabled - moisture check interval extended to 60min");
+    } else {
+        ESP_LOGI(TAG, "Power save mode disabled - normal moisture check intervals restored");
+    }
+    
+    return ESP_OK;
+}
+
+/**
+ * @brief Set shutdown state for IMPLUVIUM irrigation system (for load shedding)
+ */
+esp_err_t impluvium_set_shutdown(bool shutdown)
+{
+    if (!irrigation_system.sensors_powered) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    
+    irrigation_system.load_shed_shutdown = shutdown;
+    
+    if (shutdown) {
+        ESP_LOGI(TAG, "Load shedding shutdown - all irrigation operations disabled");
+        // Force system to IDLE state and clear watering queue
+        if (irrigation_system.state != IRRIGATION_IDLE) {
+            irrigation_change_state(IRRIGATION_IDLE);
+        }
+        irrigation_system.watering_queue_size = 0;
+        irrigation_system.queue_index = 0;
+        irrigation_system.active_zone = NO_ACTIVE_ZONE_ID;
+    } else {
+        ESP_LOGI(TAG, "Load shedding shutdown lifted - irrigation operations restored");
+    }
+    
+    return ESP_OK;
 }

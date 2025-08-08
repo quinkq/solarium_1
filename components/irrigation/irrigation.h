@@ -73,7 +73,11 @@
 #define NO_ACTIVE_ZONE_ID 255                    // No active zone
 
 // Learning Algorithm Settings
-#define MOISTURE_CHECK_INTERVAL_MS (15 * 60 * 1000)                               // 15 minutes
+#define MOISTURE_CHECK_INTERVAL_MS (15 * 60 * 1000)                               // 15 minutes (default)
+#define MOISTURE_CHECK_INTERVAL_COLD_MS (30 * 60 * 1000)                          // 30 minutes below 20°C
+#define MOISTURE_CHECK_INTERVAL_OPTIMAL_MS (15 * 60 * 1000)                       // 15 minutes above 20°C
+#define MOISTURE_CHECK_INTERVAL_POWER_SAVE_MS (60 * 60 * 1000)                    // 60 minutes (power save mode)
+#define TEMPERATURE_OPTIMAL_THRESHOLD 20.0f                                       // Optimal irrigation temp
 #define POST_WATER_CHECK_INTERVALS 3                                              // Check 3 times after watering
 #define POST_WATER_CHECK_TIMES_MS {5 * 60 * 1000, 10 * 60 * 1000, 15 * 60 * 1000} // 5, 10, 15 min
 #define LEARNING_HISTORY_SIZE 15                                                  // Keep last 15 cycles
@@ -170,7 +174,7 @@ typedef struct {
 typedef struct {
     uint8_t zone_id;                 // Zone number (0-4)
     gpio_num_t valve_gpio;           // Solenoid valve control pin
-    uint8_t moisture_ads_device;     // ADS1115 device ID (0, 1 or 2)
+    uint8_t moisture_ads_device;     // ADS1115 device ID (1 or 2)
     ads111x_mux_t moisture_channel;  // Channel on ADS device
     float target_moisture_percent;   // Desired moisture level (0-100%)
     float moisture_deadband_percent; // Tolerance around target (±%)
@@ -231,6 +235,8 @@ typedef struct {
     float current_moisture_gain_rate;                            // Current moisture gain rate (%/sec) during watering
     bool emergency_stop;                                         // Emergency shutdown flag
     bool sensors_powered;                                        // 3.3V sensor bus state
+    bool power_save_mode;                                        // Power save mode (60min moisture check interval)
+    bool load_shed_shutdown;                                     // Load shedding shutdown flag
     uint32_t state_start_time;                                   // When current state started
     uint32_t system_start_time;                                  // System startup timestamp
     uint32_t last_moisture_check;                                // Last time all zones were checked
@@ -257,6 +263,31 @@ extern irrigation_system_t irrigation_system;
 
 
 // ########################## FUNCTION DECLARATIONS ################################
+
+/**
+ * @brief Initialize the IMPLUVIUM irrigation system
+ * 
+ * Initializes the irrigation system hardware, creates required tasks,
+ * and loads configuration from NVS. Must be called before any irrigation operations.
+ * 
+ * @return ESP_OK on successful initialization
+ * @return ESP_FAIL on initialization failure
+ */
+esp_err_t impluvium_init(void);
+
+/**
+ * @brief Set power saving mode for IMPLUVIUM irrigation system
+ * @param enable True to enable power save mode (60min moisture check interval), false for normal operation
+ * @return ESP_OK on success, ESP_ERR_INVALID_STATE if not initialized
+ */
+esp_err_t impluvium_set_power_save_mode(bool enable);
+
+/**
+ * @brief Set shutdown state for IMPLUVIUM irrigation system (for load shedding)
+ * @param shutdown True to shutdown all irrigation operations, false to restore
+ * @return ESP_OK on success, ESP_ERR_INVALID_STATE if not initialized
+ */
+esp_err_t impluvium_set_shutdown(bool shutdown);
 
 // Main irrigation task to be created by app_main
 void irrigation_task(void *pvParameters);
