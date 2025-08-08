@@ -16,7 +16,7 @@ The current Alpha implementation runs on a single ESP32-S3 with four main subsys
 
 **FLUCTUS (Power Management & Solar Tracking)**: Manages a 4-bus power distribution system (3.3V, 5V, 6.2V, 12V) with buck converter control and reference counting for multiple consumers. Implements 5-state load shedding (Normal -> Power Saving -> Low Power -> Very Low -> Critical) with inter-component communication. Includes dual-axis solar tracking using photoresistor feedback and automatic parking during low-light conditions.
 
-**TEMPESTA (Weather Station)**: Environmental monitoring using SHT4x (temperature/humidity), BME280 (t/h/pressure), AS5600 (wind speed via rotary encoder), and PMS5003 (air quality). Will feature custom wind measurement with triple-cup anemometer, rainfall detection via tipping bucket sensor, and sensor fusion with historical averaging.
+**TEMPESTA (Weather Station)**: Environmental monitoring using SHT4x (temperature/humidity), BME280 (t/h/pressure), AS5600 (wind speed via rotary encoder), and PMS5003 (air quality). Will feature custom wind measurement with triple-cup anemometer, rainfall detection via tipping bucket HAL sensor, and sensor fusion with historical averaging.
 
 **STELLARIA (Ambient Lighting)**: LED lighting control with constant current driver, PWM intensity control, and automatic light sensing with hysteresis. Integrates with power management for load shedding support.
 
@@ -61,9 +61,9 @@ All components implement coordinated load shedding APIs:
 
 ## Development Status
 
-This Alpha stage focuses on single-node operation with integrated power management. The planned Beta architecture will transition to a distributed multi-node system with dedicated controllers for power management, RS485/ESP-NOW communication, and Linux server integration through Home Assistant or database systems.
+This Alpha stage focuses on single-node operation with integrated power management and a temporary blackbox MPPT. The planned Beta architecture will transition to a distributed multi-node system with dedicated controllers for power management, RS485/ESP-NOW communication, and Linux server integration through Home Assistant or database systems.
 
-Current implementation includes complete integration of all five subsystems with centralized FLUCTUS power management, comprehensive load shedding communication, and thread-safe operation across concurrent FreeRTOS tasks.
+Current implementation includes complete integration of all four subsystems with centralized FLUCTUS power management, comprehensive load shedding communication, and thread-safe operation across concurrent FreeRTOS tasks.
 
 ## Work in progres...
 
