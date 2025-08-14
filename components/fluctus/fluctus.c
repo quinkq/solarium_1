@@ -51,6 +51,9 @@ static bool overcurrent_timer_active = false;
 // System initialization flag
 static bool fluctus_initialized = false;
 
+// Hardware state cache to avoid redundant GPIO operations
+static bool hardware_bus_state[POWER_BUS_COUNT] = {false, false, false, false};
+
 // ########################## Private Function Declarations ##########################
 
 // Initialization functions
@@ -127,6 +130,8 @@ static esp_err_t fluctus_gpio_init(void)
                 gpio_set_level(FLUCTUS_BUCK_12V_ENABLE_GPIO, 1);
                 break;
         }
+        // Initialize hardware state cache to disabled
+        hardware_bus_state[i] = false;
     }
     
     ESP_LOGI(TAG, "Power control GPIOs initialized (all buses disabled)");
@@ -314,6 +319,13 @@ static esp_err_t fluctus_update_bus_hardware(power_bus_t bus)
     }
     
     bool enable = system_status.bus_enabled[bus] && !system_status.safety_shutdown;
+    
+    // Check if hardware state actually needs to change
+    if (hardware_bus_state[bus] == enable) {
+        ESP_LOGV(TAG, "Bus %d hardware already in correct state: %s", bus, enable ? "ENABLED" : "DISABLED");
+        return ESP_OK;  // No change needed
+    }
+    
     int gpio_level = enable ? 0 : 1;  // 0 = enabled (low), 1 = disabled (float high)
     
     switch (bus) {
@@ -333,6 +345,8 @@ static esp_err_t fluctus_update_bus_hardware(power_bus_t bus)
             return ESP_ERR_INVALID_ARG;
     }
     
+    // Update hardware state cache
+    hardware_bus_state[bus] = enable;
     ESP_LOGD(TAG, "Bus %d hardware updated: %s", bus, enable ? "ENABLED" : "DISABLED");
     return ESP_OK;
 }
@@ -500,6 +514,7 @@ static void fluctus_handle_power_state_change(fluctus_power_state_t new_state)
             break;
         case FLUCTUS_POWER_STATE_SHUTDOWN:
             // Emergency shutdown - disable all buses
+            ESP_LOGI(TAG, "Power state: SHUTDOWN - disabling all power buses");
             for (int i = 0; i < POWER_BUS_COUNT; i++) {
                 system_status.bus_enabled[i] = false;
                 fluctus_update_bus_hardware(i);
@@ -1293,6 +1308,17 @@ esp_err_t fluctus_get_servo_positions(uint32_t *yaw_duty, uint32_t *pitch_duty)
     return ESP_FAIL;
 }
 
+const fluctus_monitoring_data_t* fluctus_get_monitoring_data_ptr(void)
+{
+    if (!fluctus_initialized) {
+        return NULL;
+    }
+    
+    // Note: Caller must handle mutex if needed for thread safety
+    // For most read-only access, the risk is minimal with atomic reads
+    return &monitoring_data;
+}
+
 esp_err_t fluctus_get_monitoring_data(fluctus_monitoring_data_t *data)
 {
     if (data == NULL || !fluctus_initialized) {
@@ -1336,6 +1362,17 @@ float fluctus_get_total_current(void)
     }
     
     return current;
+}
+
+const fluctus_power_status_t* fluctus_get_system_status_ptr(void)
+{
+    if (!fluctus_initialized) {
+        return NULL;
+    }
+    
+    // Note: Caller must handle mutex if needed for thread safety
+    // For most read-only access, the risk is minimal with atomic reads
+    return &system_status;
 }
 
 esp_err_t fluctus_get_system_status(fluctus_power_status_t *status)

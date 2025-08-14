@@ -105,16 +105,16 @@ typedef enum {
 } fluctus_power_state_t;
 
 typedef struct {
-    bool bus_enabled[POWER_BUS_COUNT];  // Individual bus states
-    uint8_t bus_ref_count[POWER_BUS_COUNT]; // Reference counting for consumers
+    bool bus_enabled[POWER_BUS_COUNT];          // Individual bus states
+    uint8_t bus_ref_count[POWER_BUS_COUNT];     // Reference counting for consumers
     char bus_consumers[POWER_BUS_COUNT][8][16]; // Consumer names per bus (max 8 per bus)
-    fluctus_power_state_t power_state;  // Current power management state
-    bool solar_tracking_enabled;       // Solar tracking system state
-    uint32_t current_yaw_duty;         // Current yaw servo position
-    uint32_t current_pitch_duty;       // Current pitch servo position
-    bool safety_shutdown;              // Overcurrent safety shutdown flag
-    bool manual_reset_required;        // Manual reset flag for safety
-    time_t last_activity_time;         // Last consumer activity timestamp
+    fluctus_power_state_t power_state;          // Current power management state
+    bool solar_tracking_enabled;                // Solar tracking system state
+    uint32_t current_yaw_duty;                  // Current yaw servo position
+    uint32_t current_pitch_duty;                // Current pitch servo position
+    bool safety_shutdown;                       // Overcurrent safety shutdown flag
+    bool manual_reset_required;                 // Manual reset flag for safety
+    time_t last_activity_time;                  // Last consumer activity timestamp
 } fluctus_power_status_t;
 
 typedef struct {
@@ -244,7 +244,13 @@ esp_err_t fluctus_get_servo_positions(uint32_t *yaw_duty, uint32_t *pitch_duty);
 // ################ Power Monitoring Functions ################
 
 /**
- * @brief Get current power monitoring data
+ * @brief Get current power monitoring data (returns pointer to internal data)
+ * @return Pointer to fluctus_monitoring_data_t structure, or NULL on error
+ */
+const fluctus_monitoring_data_t* fluctus_get_monitoring_data_ptr(void);
+
+/**
+ * @brief Get current power monitoring data (legacy function with copy)
  * @param[out] data Pointer to fluctus_monitoring_data_t structure to fill
  * @return ESP_OK on success, ESP_ERR_INVALID_ARG on null pointer
  */
@@ -265,7 +271,13 @@ float fluctus_get_total_current(void);
 // ################ System Status Functions ################
 
 /**
- * @brief Get comprehensive system status
+ * @brief Get comprehensive system status (returns pointer to internal data)
+ * @return Pointer to fluctus_power_status_t structure, or NULL on error
+ */
+const fluctus_power_status_t* fluctus_get_system_status_ptr(void);
+
+/**
+ * @brief Get comprehensive system status (legacy function with copy)
  * @param[out] status Pointer to fluctus_power_status_t structure to fill
  * @return ESP_OK on success, ESP_ERR_INVALID_ARG on null pointer
  */

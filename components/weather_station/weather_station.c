@@ -25,6 +25,18 @@
 
 #define TAG "TEMPESTA"
 
+// Macro for updating weather data with mutex protection
+#define WEATHER_UPDATE_DATA_WITH_STATUS(field, value, status_field, status_value) do { \
+    if (xSemaphoreTake(xWeatherDataMutex, pdMS_TO_TICKS(WEATHER_MUTEX_TIMEOUT_UPDATE_MS)) == pdTRUE) { \
+        weather_data.field = (value); \
+        weather_data.status_field = (status_value); \
+        xSemaphoreGive(xWeatherDataMutex); \
+    } else { \
+        ESP_LOGW(TAG, "Failed to acquire mutex for " #field " data update"); \
+        return ESP_FAIL; \
+    } \
+} while(0)
+
 // ########################## Global Variables ##########################
 
 // Thread-safe data protection
@@ -85,14 +97,14 @@ static esp_err_t weather_sensors_init(void);
 static esp_err_t weather_rainfall_sensor_init(void);
 static esp_err_t weather_pms5003_init(void);
 
-// Consolidated sensor reading functions
+// Low level sensor reading functions
 static esp_err_t weather_read_env_sensors(consolidated_sensor_data_t *sensor_data);
 static esp_err_t weather_read_sht4x_all(consolidated_sensor_data_t *sensor_data);
 static esp_err_t weather_read_bmp280_all(consolidated_sensor_data_t *sensor_data);
 static esp_err_t weather_read_pms5003(pms5003_data_t *data, weather_sensor_status_t *status);
 static esp_err_t weather_read_and_process_rainfall(void);
 
-// Processing functions (with integrated averaging and data updates)
+// Data processing functions
 static esp_err_t weather_process_temperature(const consolidated_sensor_data_t *sensor_data);
 static esp_err_t weather_process_humidity(const consolidated_sensor_data_t *sensor_data);
 static esp_err_t weather_process_pressure(const consolidated_sensor_data_t *sensor_data);
@@ -103,22 +115,27 @@ static float weather_process_sensor_averaging(float new_value,
                                               uint8_t *history_index,
                                               uint8_t *history_count);
 
-// Helper functions for main task
-static void weather_log_summary(void);
-static bool weather_should_collect_data(bool *reduced_functionality);
+// Power management functions
 static esp_err_t weather_request_power_buses(bool requires_5v);
 static void weather_release_power_buses(bool had_5v);
+static bool weather_should_collect_data(bool *reduced_functionality);
+static void weather_update_timer_period(void);
+
+// Task helper functions
+static void weather_log_summary(void);
 static void weather_handle_pms5003_reading(TickType_t warmup_start_time, bool should_read_pms5003);
 
 // Utility functions
 static void weather_timer_callback(TimerHandle_t xTimer);
 static uint32_t weather_calculate_time_to_next_quarter_hour(void);
+static float weather_convert_pulses_to_rainfall_mm(int pulse_count);
+static esp_err_t weather_get_rainfall_pulse_count(int *pulse_count);
 
 // Task functions
 static void weather_main_task(void *pvParameters);
 static void weather_as5600_sampling_task(void *pvParameters);
 
-// ########################## Implementation ##########################
+// ########################## Initialization Functions ##########################
 
 /**
  * @brief Initialize weather station component
@@ -167,6 +184,12 @@ esp_err_t weather_station_init(void)
     calculation_data.humidity_history_index = 0;
     calculation_data.humidity_history_count = 0;
 
+    // Initialize temperature averaging data
+    for (int i = 0; i < WEATHER_AVERAGING_SAMPLES; i++) {
+        calculation_data.temperature_history[i] = WEATHER_INVALID_VALUE;
+    }
+    calculation_data.temp_history_index = 0;
+    calculation_data.temp_history_count = 0;
 
     // Initialize rainfall tracking for hourly calculations
     calculation_data.last_rainfall_reset_time = time(NULL);
@@ -454,43 +477,7 @@ static esp_err_t weather_pms5003_init(void)
     return ESP_OK;
 }
 
-/**
- * @brief Calculate milliseconds until next quarter-hour boundary
- */
-static uint32_t weather_calculate_time_to_next_quarter_hour(void)
-{
-    time_t now;
-    struct tm timeinfo;
-    time(&now);
-    localtime_r(&now, &timeinfo);
-
-    // Calculate minutes until next quarter-hour (00, 15, 30, 45)
-    int current_min = timeinfo.tm_min;
-    int current_sec = timeinfo.tm_sec;
-    
-    int next_quarter = ((current_min / 15) + 1) * 15;
-    int minutes_to_wait = (next_quarter <= 60) ? (next_quarter - current_min) : (60 - current_min);
-    
-    // Convert to milliseconds, subtract current seconds
-    uint32_t delay_ms = (minutes_to_wait * 60 - current_sec) * 1000;
-    
-    ESP_LOGI(TAG, "Current: %02d:%02d:%02d, next quarter-hour in %" PRIu32 "ms", 
-             timeinfo.tm_hour, current_min, current_sec, delay_ms);
-    
-    return delay_ms;
-}
-
-
-/**
- * @brief Timer callback to trigger data collection cycle
- */
-static void weather_timer_callback(TimerHandle_t xTimer)
-{
-    // Notify main task to start collection cycle
-    if (xWeatherMainTaskHandle != NULL) {
-        xTaskNotify(xWeatherMainTaskHandle, 1, eSetBits);
-    }
-}
+// ########################## Low Level Sensor Reading Functions ##########################
 
 /**
  * @brief Read all sensors once
@@ -563,392 +550,12 @@ static esp_err_t weather_read_bmp280_all(consolidated_sensor_data_t *sensor_data
 }
 
 /**
- * @brief Process temperature from sensors with integrated historical averaging and data update
- */
-static esp_err_t weather_process_temperature(const consolidated_sensor_data_t *sensor_data)
-{
-    bool sht4x_ok = sensor_data->sht4x.valid;
-    bool bmp280_ok = sensor_data->bmp280.valid;
-    float raw_temperature;
-    float averaged_temperature;
-    weather_sensor_status_t status;
-
-    // Use best available reading strategy
-    if (sht4x_ok && bmp280_ok) {
-        // Both sensors working - use averaged value
-        raw_temperature = (sensor_data->sht4x.temperature + sensor_data->bmp280.temperature) / 2.0f;
-        status = WEATHER_SENSOR_OK;
-        ESP_LOGD(TAG,
-                 "Temperature: SHT4x=%.1f°C, BME280=%.1f°C, Raw Average=%.1f°C",
-                 sensor_data->sht4x.temperature,
-                 sensor_data->bmp280.temperature,
-                 raw_temperature);
-    } else if (sht4x_ok) {
-        raw_temperature = sensor_data->sht4x.temperature;
-        status = WEATHER_SENSOR_OK;
-        ESP_LOGD(TAG, "Temperature: SHT4x=%.1f°C (BME280 unavailable)", sensor_data->sht4x.temperature);
-    } else if (bmp280_ok) {
-        raw_temperature = sensor_data->bmp280.temperature;
-        status = WEATHER_SENSOR_OK;
-        ESP_LOGD(TAG, "Temperature: BME280=%.1f°C (SHT4x unavailable)", sensor_data->bmp280.temperature);
-    } else {
-        averaged_temperature = WEATHER_INVALID_VALUE;
-        status = WEATHER_SENSOR_ERROR;
-        ESP_LOGW(TAG, "No temperature sensors available");
-
-        // Update weather data with error state
-        if (xSemaphoreTake(xWeatherDataMutex, pdMS_TO_TICKS(WEATHER_MUTEX_TIMEOUT_UPDATE_MS)) == pdTRUE) {
-            weather_data.temperature = WEATHER_INVALID_VALUE;
-            weather_data.temp_sensor_status = WEATHER_SENSOR_ERROR;
-            xSemaphoreGive(xWeatherDataMutex);
-        }
-        return ESP_FAIL;
-    }
-
-    // Apply historical averaging
-    averaged_temperature = weather_process_sensor_averaging(raw_temperature,
-                                                            calculation_data.temperature_history,
-                                                            WEATHER_AVERAGING_SAMPLES,
-                                                            &calculation_data.temp_history_index,
-                                                            &calculation_data.temp_history_count);
-
-    ESP_LOGD(TAG,
-             "Temperature final: raw=%.1f°C, averaged=%.1f°C (%d samples)",
-             raw_temperature,
-             averaged_temperature,
-             calculation_data.temp_history_count);
-
-    // Update weather data with successful reading
-    if (xSemaphoreTake(xWeatherDataMutex, pdMS_TO_TICKS(WEATHER_MUTEX_TIMEOUT_UPDATE_MS)) == pdTRUE) {
-        weather_data.temperature = averaged_temperature;
-        weather_data.temp_sensor_status = status;
-        xSemaphoreGive(xWeatherDataMutex);
-    } else {
-        ESP_LOGW(TAG, "Failed to acquire mutex for temperature data update");
-        return ESP_FAIL;
-    }
-
-    return ESP_OK;
-}
-
-// ########################## Public API Functions ##########################
-
-/**
- * @brief Get current temperature (thread-safe)
- * This function replaces latest_sht_temp for irrigation system
- */
-float weather_get_temperature(void)
-{
-    float temperature = WEATHER_INVALID_VALUE;
-    
-    if (xSemaphoreTake(xWeatherDataMutex, pdMS_TO_TICKS(WEATHER_MUTEX_TIMEOUT_QUICK_MS)) == pdTRUE) {
-        temperature = weather_data.temperature;
-        xSemaphoreGive(xWeatherDataMutex);
-    }
-    
-    return temperature;
-}
-
-/**
- * @brief Get current humidity (thread-safe)
- */
-float weather_get_humidity(void)
-{
-    float humidity = WEATHER_INVALID_VALUE;
-
-    if (xSemaphoreTake(xWeatherDataMutex, pdMS_TO_TICKS(WEATHER_MUTEX_TIMEOUT_QUICK_MS)) == pdTRUE) {
-        humidity = weather_data.humidity;
-        xSemaphoreGive(xWeatherDataMutex);
-    }
-
-    return humidity;
-}
-
-/**
- * @brief Get current pressure (thread-safe)
- */
-float weather_get_pressure(void)
-{
-    float pressure = WEATHER_INVALID_VALUE;
-
-    if (xSemaphoreTake(xWeatherDataMutex, pdMS_TO_TICKS(WEATHER_MUTEX_TIMEOUT_QUICK_MS)) == pdTRUE) {
-        pressure = weather_data.pressure;
-        xSemaphoreGive(xWeatherDataMutex);
-    }
-
-    return pressure;
-}
-
-/**
- * @brief Get current air quality readings (thread-safe)
- */
-esp_err_t weather_get_air_quality(float *pm25, float *pm10)
-{
-    if (!pm25 || !pm10) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    if (xSemaphoreTake(xWeatherDataMutex, pdMS_TO_TICKS(WEATHER_MUTEX_TIMEOUT_QUICK_MS)) == pdTRUE) {
-        *pm25 = weather_data.air_quality_pm25;
-        *pm10 = weather_data.air_quality_pm10;
-        xSemaphoreGive(xWeatherDataMutex);
-
-        // Return success only if air quality sensor is working
-        return (weather_data.air_quality_status == WEATHER_SENSOR_OK) ? ESP_OK : ESP_FAIL;
-    }
-
-    return ESP_ERR_TIMEOUT;
-}
-
-/**
- * @brief Get current wind speed in RPM (thread-safe)
- */
-float weather_get_wind_speed_rpm(void)
-{
-    float wind_speed = WEATHER_INVALID_VALUE;
-
-    if (xSemaphoreTake(xWeatherDataMutex, pdMS_TO_TICKS(WEATHER_MUTEX_TIMEOUT_QUICK_MS)) == pdTRUE) {
-        wind_speed = weather_data.wind_speed_rpm;
-        xSemaphoreGive(xWeatherDataMutex);
-    }
-
-    return wind_speed;
-}
-
-/**
- * @brief Get current wind speed in m/s (thread-safe)
- */
-float weather_get_wind_speed_ms(void)
-{
-    float wind_speed = WEATHER_INVALID_VALUE;
-
-    if (xSemaphoreTake(xWeatherDataMutex, pdMS_TO_TICKS(WEATHER_MUTEX_TIMEOUT_QUICK_MS)) == pdTRUE) {
-        wind_speed = weather_data.wind_speed_ms;
-        xSemaphoreGive(xWeatherDataMutex);
-    }
-
-    return wind_speed;
-}
-
-/**
- * @brief Get accumulated rainfall and optionally reset counter (thread-safe)
- */
-float weather_get_rainfall_mm(bool reset_counter)
-{
-    float rainfall = WEATHER_INVALID_VALUE;
-
-    if (xSemaphoreTake(xWeatherDataMutex, pdMS_TO_TICKS(WEATHER_MUTEX_TIMEOUT_QUICK_MS)) == pdTRUE) {
-        rainfall = weather_data.rainfall_mm;
-
-        if (reset_counter && rain_pcnt_unit_handle != NULL) {
-            // Reset the pulse counter
-            esp_err_t ret = pcnt_unit_clear_count(rain_pcnt_unit_handle);
-            if (ret == ESP_OK) {
-                weather_data.rainfall_mm = 0.0f;
-                ESP_LOGI(TAG, "Rainfall counter reset (was %.3f mm)", rainfall);
-            } else {
-                ESP_LOGW(TAG, "Failed to reset rainfall counter: %s", esp_err_to_name(ret));
-            }
-        }
-
-        xSemaphoreGive(xWeatherDataMutex);
-    }
-
-    return rainfall;
-}
-
-/**
- * @brief Get human-readable sensor status
- */
-esp_err_t weather_get_status_string(char *status_buffer, size_t buffer_size)
-{
-    if (!status_buffer || buffer_size < 200) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    if (xSemaphoreTake(xWeatherDataMutex, pdMS_TO_TICKS(WEATHER_MUTEX_TIMEOUT_QUICK_MS)) == pdTRUE) {
-        snprintf(status_buffer,
-                 buffer_size,
-                 "Weather Status: T:%s H:%s P:%s AQ:%s Wind:%s Rain:%s",
-                 (weather_data.temp_sensor_status == WEATHER_SENSOR_OK) ? "OK" : "ERR",
-                 (weather_data.humidity_sensor_status == WEATHER_SENSOR_OK) ? "OK" : "ERR",
-                 (weather_data.pressure_sensor_status == WEATHER_SENSOR_OK) ? "OK" : "ERR",
-                 (weather_data.air_quality_status == WEATHER_SENSOR_OK) ? "OK" : "ERR",
-                 (weather_data.wind_sensor_status == WEATHER_SENSOR_OK) ? "OK" : "ERR",
-                 (weather_data.rain_sensor_status == WEATHER_SENSOR_OK) ? "OK" : "ERR");
-
-        xSemaphoreGive(xWeatherDataMutex);
-        return ESP_OK;
-    }
-
-    return ESP_ERR_TIMEOUT;
-}
-
-// ########################## Missing Sensor Reading Functions ##########################
-
-/**
- * @brief Process humidity from sensors with integrated historical averaging and data update
- * Combines readings from both sensors when available for improved accuracy
- */
-static esp_err_t weather_process_humidity(const consolidated_sensor_data_t *sensor_data)
-{
-    bool sht4x_ok = sensor_data->sht4x.valid;
-    bool bme280_ok = sensor_data->bmp280.valid && sensor_data->bmp280.has_humidity;
-    float raw_humidity;
-    float averaged_humidity;
-    weather_sensor_status_t status;
-
-    // Use best available reading strategy
-    if (sht4x_ok && bme280_ok) {
-        // Both sensors working - use averaged value (SHT4x tends to read slightly higher)
-        raw_humidity = (sensor_data->sht4x.humidity + sensor_data->bmp280.humidity) / 2.0f;
-        status = WEATHER_SENSOR_OK;
-        ESP_LOGD(TAG,
-                 "Humidity: SHT4x=%.1f%%, BME280=%.1f%%, Raw Average=%.1f%%",
-                 sensor_data->sht4x.humidity,
-                 sensor_data->bmp280.humidity,
-                 raw_humidity);
-    } else if (sht4x_ok) {
-        raw_humidity = sensor_data->sht4x.humidity;
-        status = WEATHER_SENSOR_OK;
-        ESP_LOGD(TAG, "Humidity: SHT4x=%.1f%% (BME280 unavailable)", sensor_data->sht4x.humidity);
-    } else if (bme280_ok) {
-        raw_humidity = sensor_data->bmp280.humidity;
-        status = WEATHER_SENSOR_OK;
-        ESP_LOGD(TAG, "Humidity: BME280=%.1f%% (SHT4x unavailable)", sensor_data->bmp280.humidity);
-    } else {
-        averaged_humidity = WEATHER_INVALID_VALUE;
-        status = WEATHER_SENSOR_ERROR;
-        ESP_LOGW(TAG, "No humidity sensors available");
-
-        // Update weather data with error state
-        if (xSemaphoreTake(xWeatherDataMutex, pdMS_TO_TICKS(WEATHER_MUTEX_TIMEOUT_UPDATE_MS)) == pdTRUE) {
-            weather_data.humidity = WEATHER_INVALID_VALUE;
-            weather_data.humidity_sensor_status = WEATHER_SENSOR_ERROR;
-            xSemaphoreGive(xWeatherDataMutex);
-        }
-        return ESP_FAIL;
-    }
-
-    // Apply historical averaging
-    averaged_humidity = weather_process_sensor_averaging(raw_humidity,
-                                                         calculation_data.humidity_history,
-                                                         WEATHER_AVERAGING_SAMPLES,
-                                                         &calculation_data.humidity_history_index,
-                                                         &calculation_data.humidity_history_count);
-
-    ESP_LOGD(TAG,
-             "Humidity final: raw=%.1f%%, averaged=%.1f%% (%d samples)",
-             raw_humidity,
-             averaged_humidity,
-             calculation_data.humidity_history_count);
-
-    // Update weather data with successful reading
-    if (xSemaphoreTake(xWeatherDataMutex, pdMS_TO_TICKS(WEATHER_MUTEX_TIMEOUT_UPDATE_MS)) == pdTRUE) {
-        weather_data.humidity = averaged_humidity;
-        weather_data.humidity_sensor_status = status;
-        xSemaphoreGive(xWeatherDataMutex);
-    } else {
-        ESP_LOGW(TAG, "Failed to acquire mutex for humidity data update");
-        return ESP_FAIL;
-    }
-
-    return ESP_OK;
-}
-
-/**
- * @brief Process pressure from sensor data and update weather data
- */
-static esp_err_t weather_process_pressure(const consolidated_sensor_data_t *sensor_data)
-{
-    float pressure;
-    weather_sensor_status_t status;
-
-    if (sensor_data->bmp280.valid) {
-        pressure = sensor_data->bmp280.pressure;
-        status = WEATHER_SENSOR_OK;
-        ESP_LOGD(TAG, "Pressure: %.1f hPa", pressure);
-
-        // Update weather data with successful reading
-        if (xSemaphoreTake(xWeatherDataMutex, pdMS_TO_TICKS(WEATHER_MUTEX_TIMEOUT_UPDATE_MS)) == pdTRUE) {
-            weather_data.pressure = pressure;
-            weather_data.pressure_sensor_status = status;
-            xSemaphoreGive(xWeatherDataMutex);
-        } else {
-            ESP_LOGW(TAG, "Failed to acquire mutex for pressure data update");
-            return ESP_FAIL;
-        }
-        return ESP_OK;
-    }
-
-    // Handle error case
-    pressure = WEATHER_INVALID_VALUE;
-    status = WEATHER_SENSOR_ERROR;
-    ESP_LOGW(TAG, "Pressure sensor unavailable");
-
-    // Update weather data with error state
-    if (xSemaphoreTake(xWeatherDataMutex, pdMS_TO_TICKS(WEATHER_MUTEX_TIMEOUT_UPDATE_MS)) == pdTRUE) {
-        weather_data.pressure = WEATHER_INVALID_VALUE;
-        weather_data.pressure_sensor_status = WEATHER_SENSOR_ERROR;
-        xSemaphoreGive(xWeatherDataMutex);
-    }
-
-    return ESP_FAIL;
-}
-
-/**
- * @brief Process air quality with PMS5003 warmup handling and data update
- */
-static esp_err_t weather_process_air_quality(void)
-{
-    // Check if PMS5003 is disabled for load shedding
-    if (!weather_pms5003_enabled) {
-        ESP_LOGD(TAG, "PMS5003 sensor disabled for load shedding - skipping air quality reading");
-        if (xSemaphoreTake(xWeatherDataMutex, pdMS_TO_TICKS(WEATHER_MUTEX_TIMEOUT_UPDATE_MS)) == pdTRUE) {
-            weather_data.air_quality_status = WEATHER_SENSOR_UNAVAILABLE;
-            xSemaphoreGive(xWeatherDataMutex);
-        }
-        return ESP_OK; // Not an error, just skipped
-    }
-
-    // Note: This function assumes the warmup time has already been handled by the caller
-    // or that the sensor has been powered on for sufficient time
-
-    pms5003_data_t air_quality;
-    weather_sensor_status_t air_quality_status;
-
-    esp_err_t ret = weather_read_pms5003(&air_quality, &air_quality_status);
-    if (ret == ESP_OK) {
-        // Update weather data with successful reading
-        if (xSemaphoreTake(xWeatherDataMutex, pdMS_TO_TICKS(WEATHER_MUTEX_TIMEOUT_UPDATE_MS)) == pdTRUE) {
-            weather_data.air_quality_pm25 = (float) air_quality.pm2_5_atm;
-            weather_data.air_quality_pm10 = (float) air_quality.pm10_atm;
-            weather_data.air_quality_status = air_quality_status;
-            xSemaphoreGive(xWeatherDataMutex);
-        } else {
-            ESP_LOGW(TAG, "Failed to acquire mutex for air quality data update");
-            return ESP_FAIL;
-        }
-    } else {
-        // Update weather data with error state
-        if (xSemaphoreTake(xWeatherDataMutex, pdMS_TO_TICKS(WEATHER_MUTEX_TIMEOUT_UPDATE_MS)) == pdTRUE) {
-            weather_data.air_quality_pm25 = WEATHER_INVALID_VALUE;
-            weather_data.air_quality_pm10 = WEATHER_INVALID_VALUE;
-            weather_data.air_quality_status = WEATHER_SENSOR_ERROR;
-            xSemaphoreGive(xWeatherDataMutex);
-        }
-    }
-
-    return ret;
-}
-
-/**
- * @brief Read and parse PMS5003 data frame (low-level function)
+ * @brief Read and parse PMS5003 data frame
  */
 static esp_err_t weather_read_pms5003(pms5003_data_t *data, weather_sensor_status_t *status)
 {
     // Simple retry logic for UART communication issues
-    for (int retry = 0; retry < 3; retry++) {
+    for (int retry = 0; retry < WEATHER_PMS5003_RETRY_COUNT; retry++) {
         uint8_t buffer[32];
 
         // Read data with timeout
@@ -1028,47 +635,6 @@ static esp_err_t weather_read_pms5003(pms5003_data_t *data, weather_sensor_statu
 }
 
 /**
- * @brief Convert pulse count to rainfall depth in mm using physical tipbucket parameters
- */
-float weather_convert_pulses_to_rainfall_mm(int pulse_count)
-{
-    if (pulse_count < 0) {
-        return 0.0f;
-    }
-
-    // Calculate rainfall depth: volume / area
-    // Depth(mm) = (pulses * volume_per_pulse_mm3) / collection_area_mm2
-    float total_volume_mm3 = (float) pulse_count * WEATHER_RAIN_MM3_PER_PULSE;
-    float rainfall_depth_mm = total_volume_mm3 / WEATHER_RAIN_COLLECTION_AREA_MM2;
-
-    return rainfall_depth_mm;
-}
-
-/**
- * @brief Get current pulse count from rainfall sensor
- */
-esp_err_t weather_get_rainfall_pulse_count(int *pulse_count)
-{
-    if (!pulse_count) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    if (rain_pcnt_unit_handle == NULL) {
-        *pulse_count = 0;
-        return ESP_FAIL;
-    }
-
-    esp_err_t ret = pcnt_unit_get_count(rain_pcnt_unit_handle, pulse_count);
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to read rainfall pulse count: %s", esp_err_to_name(ret));
-        *pulse_count = 0;
-        return ret;
-    }
-
-    return ESP_OK;
-}
-
-/**
  * @brief Process rainfall accumulation with hourly calculations and data update
  */
 static esp_err_t weather_read_and_process_rainfall(void)
@@ -1077,11 +643,7 @@ static esp_err_t weather_read_and_process_rainfall(void)
     esp_err_t ret = weather_get_rainfall_pulse_count(&pulse_count);
     if (ret != ESP_OK) {
         // Update weather data with error state
-        if (xSemaphoreTake(xWeatherDataMutex, pdMS_TO_TICKS(WEATHER_MUTEX_TIMEOUT_UPDATE_MS)) == pdTRUE) {
-            weather_data.rainfall_mm = WEATHER_INVALID_VALUE;
-            weather_data.rain_sensor_status = WEATHER_SENSOR_ERROR;
-            xSemaphoreGive(xWeatherDataMutex);
-        }
+        WEATHER_UPDATE_DATA_WITH_STATUS(rainfall_mm, WEATHER_INVALID_VALUE, rain_sensor_status, WEATHER_SENSOR_ERROR);
         return ret;
     }
 
@@ -1114,21 +676,205 @@ static esp_err_t weather_read_and_process_rainfall(void)
     }
 
     // Update weather data with successful reading
-    if (xSemaphoreTake(xWeatherDataMutex, pdMS_TO_TICKS(WEATHER_MUTEX_TIMEOUT_UPDATE_MS)) == pdTRUE) {
-        weather_data.rainfall_mm = rainfall_mm;
-        weather_data.rain_sensor_status = WEATHER_SENSOR_OK;
-        xSemaphoreGive(xWeatherDataMutex);
-    } else {
-        ESP_LOGW(TAG, "Failed to acquire mutex for rainfall data update");
-        return ESP_FAIL;
-    }
+    WEATHER_UPDATE_DATA_WITH_STATUS(rainfall_mm, rainfall_mm, rain_sensor_status, WEATHER_SENSOR_OK);
 
     ESP_LOGD(TAG, "Rainfall: Total=%.3f mm, Hourly rate=%.3f mm/hr", rainfall_mm, hourly_rate);
     return ESP_OK;
 }
 
+// ########################## Data Processing Functions ##########################
 
-// ########################## Missing Implementations ##########################
+/**
+ * @brief Process temperature from sensors with integrated historical averaging and data update
+ */
+static esp_err_t weather_process_temperature(const consolidated_sensor_data_t *sensor_data)
+{
+    bool sht4x_ok = sensor_data->sht4x.valid;
+    bool bmp280_ok = sensor_data->bmp280.valid;
+    float raw_temperature;
+    float averaged_temperature;
+    weather_sensor_status_t status;
+
+    // Use best available reading strategy
+    if (sht4x_ok && bmp280_ok) {
+        // Both sensors working - use averaged value
+        raw_temperature = (sensor_data->sht4x.temperature + sensor_data->bmp280.temperature) / 2.0f;
+        status = WEATHER_SENSOR_OK;
+        ESP_LOGD(TAG,
+                 "Temperature: SHT4x=%.1f°C, BME280=%.1f°C, Raw Average=%.1f°C",
+                 sensor_data->sht4x.temperature,
+                 sensor_data->bmp280.temperature,
+                 raw_temperature);
+    } else if (sht4x_ok) {
+        raw_temperature = sensor_data->sht4x.temperature;
+        status = WEATHER_SENSOR_OK;
+        ESP_LOGD(TAG, "Temperature: SHT4x=%.1f°C (BME280 unavailable)", sensor_data->sht4x.temperature);
+    } else if (bmp280_ok) {
+        raw_temperature = sensor_data->bmp280.temperature;
+        status = WEATHER_SENSOR_OK;
+        ESP_LOGD(TAG, "Temperature: BME280=%.1f°C (SHT4x unavailable)", sensor_data->bmp280.temperature);
+    } else {
+        averaged_temperature = WEATHER_INVALID_VALUE;
+        status = WEATHER_SENSOR_ERROR;
+        ESP_LOGW(TAG, "No temperature sensors available");
+
+        // Update weather data with error state
+        WEATHER_UPDATE_DATA_WITH_STATUS(temperature, WEATHER_INVALID_VALUE, temp_sensor_status, WEATHER_SENSOR_ERROR);
+        return ESP_FAIL;
+    }
+
+    // Apply historical averaging
+    averaged_temperature = weather_process_sensor_averaging(raw_temperature,
+                                                            calculation_data.temperature_history,
+                                                            WEATHER_AVERAGING_SAMPLES,
+                                                            &calculation_data.temp_history_index,
+                                                            &calculation_data.temp_history_count);
+
+    ESP_LOGD(TAG,
+             "Temperature final: raw=%.1f°C, averaged=%.1f°C (%d samples)",
+             raw_temperature,
+             averaged_temperature,
+             calculation_data.temp_history_count);
+
+    // Update weather data with successful reading
+    WEATHER_UPDATE_DATA_WITH_STATUS(temperature, averaged_temperature, temp_sensor_status, status);
+
+    return ESP_OK;
+}
+
+/**
+ * @brief Process humidity from sensors with integrated historical averaging and data update
+ * Combines readings from both sensors when available for improved accuracy
+ */
+static esp_err_t weather_process_humidity(const consolidated_sensor_data_t *sensor_data)
+{
+    bool sht4x_ok = sensor_data->sht4x.valid;
+    bool bme280_ok = sensor_data->bmp280.valid && sensor_data->bmp280.has_humidity;
+    float raw_humidity;
+    float averaged_humidity;
+    weather_sensor_status_t status;
+
+    // Use best available reading strategy
+    if (sht4x_ok && bme280_ok) {
+        // Both sensors working - use averaged value (SHT4x tends to read slightly higher)
+        raw_humidity = (sensor_data->sht4x.humidity + sensor_data->bmp280.humidity) / 2.0f;
+        status = WEATHER_SENSOR_OK;
+        ESP_LOGD(TAG,
+                 "Humidity: SHT4x=%.1f%%, BME280=%.1f%%, Raw Average=%.1f%%",
+                 sensor_data->sht4x.humidity,
+                 sensor_data->bmp280.humidity,
+                 raw_humidity);
+    } else if (sht4x_ok) {
+        raw_humidity = sensor_data->sht4x.humidity;
+        status = WEATHER_SENSOR_OK;
+        ESP_LOGD(TAG, "Humidity: SHT4x=%.1f%% (BME280 unavailable)", sensor_data->sht4x.humidity);
+    } else if (bme280_ok) {
+        raw_humidity = sensor_data->bmp280.humidity;
+        status = WEATHER_SENSOR_OK;
+        ESP_LOGD(TAG, "Humidity: BME280=%.1f%% (SHT4x unavailable)", sensor_data->bmp280.humidity);
+    } else {
+        averaged_humidity = WEATHER_INVALID_VALUE;
+        status = WEATHER_SENSOR_ERROR;
+        ESP_LOGW(TAG, "No humidity sensors available");
+
+        // Update weather data with error state
+        WEATHER_UPDATE_DATA_WITH_STATUS(humidity, WEATHER_INVALID_VALUE, humidity_sensor_status, WEATHER_SENSOR_ERROR);
+        return ESP_FAIL;
+    }
+
+    // Apply historical averaging
+    averaged_humidity = weather_process_sensor_averaging(raw_humidity,
+                                                         calculation_data.humidity_history,
+                                                         WEATHER_AVERAGING_SAMPLES,
+                                                         &calculation_data.humidity_history_index,
+                                                         &calculation_data.humidity_history_count);
+
+    ESP_LOGD(TAG,
+             "Humidity final: raw=%.1f%%, averaged=%.1f%% (%d samples)",
+             raw_humidity,
+             averaged_humidity,
+             calculation_data.humidity_history_count);
+
+    // Update weather data with successful reading
+    WEATHER_UPDATE_DATA_WITH_STATUS(humidity, averaged_humidity, humidity_sensor_status, status);
+
+    return ESP_OK;
+}
+
+/**
+ * @brief Process pressure from sensor data and update weather data
+ */
+static esp_err_t weather_process_pressure(const consolidated_sensor_data_t *sensor_data)
+{
+    float pressure;
+    weather_sensor_status_t status;
+
+    if (sensor_data->bmp280.valid) {
+        pressure = sensor_data->bmp280.pressure;
+        status = WEATHER_SENSOR_OK;
+        ESP_LOGD(TAG, "Pressure: %.1f hPa", pressure);
+
+        // Update weather data with successful reading
+        WEATHER_UPDATE_DATA_WITH_STATUS(pressure, pressure, pressure_sensor_status, status);
+        return ESP_OK;
+    }
+
+    // Handle error case
+    pressure = WEATHER_INVALID_VALUE;
+    status = WEATHER_SENSOR_ERROR;
+    ESP_LOGW(TAG, "Pressure sensor unavailable");
+
+    // Update weather data with error state
+    WEATHER_UPDATE_DATA_WITH_STATUS(pressure, WEATHER_INVALID_VALUE, pressure_sensor_status, WEATHER_SENSOR_ERROR);
+
+    return ESP_FAIL;
+}
+
+/**
+ * @brief Process air quality with PMS5003 warmup handling and data update
+ */
+static esp_err_t weather_process_air_quality(void)
+{
+    // Check if PMS5003 is disabled for load shedding
+    if (!weather_pms5003_enabled) {
+        ESP_LOGD(TAG, "PMS5003 sensor disabled for load shedding - skipping air quality reading");
+        if (xSemaphoreTake(xWeatherDataMutex, pdMS_TO_TICKS(WEATHER_MUTEX_TIMEOUT_UPDATE_MS)) == pdTRUE) {
+            weather_data.air_quality_status = WEATHER_SENSOR_UNAVAILABLE;
+            xSemaphoreGive(xWeatherDataMutex);
+        }
+        return ESP_OK; // Not an error, just skipped
+    }
+
+    // Note: This function assumes the warmup time has already been handled by the caller
+    // or that the sensor has been powered on for sufficient time
+
+    pms5003_data_t air_quality;
+    weather_sensor_status_t air_quality_status;
+
+    esp_err_t ret = weather_read_pms5003(&air_quality, &air_quality_status);
+    if (ret == ESP_OK) {
+        // Update weather data with successful reading
+        if (xSemaphoreTake(xWeatherDataMutex, pdMS_TO_TICKS(WEATHER_MUTEX_TIMEOUT_UPDATE_MS)) == pdTRUE) {
+            weather_data.air_quality_pm25 = (float) air_quality.pm2_5_atm;
+            weather_data.air_quality_pm10 = (float) air_quality.pm10_atm;
+            weather_data.air_quality_status = air_quality_status;
+            xSemaphoreGive(xWeatherDataMutex);
+        } else {
+            ESP_LOGW(TAG, "Failed to acquire mutex for air quality data update");
+            return ESP_FAIL;
+        }
+    } else {
+        // Update weather data with error state
+        if (xSemaphoreTake(xWeatherDataMutex, pdMS_TO_TICKS(WEATHER_MUTEX_TIMEOUT_UPDATE_MS)) == pdTRUE) {
+            weather_data.air_quality_pm25 = WEATHER_INVALID_VALUE;
+            weather_data.air_quality_pm10 = WEATHER_INVALID_VALUE;
+            weather_data.air_quality_status = WEATHER_SENSOR_ERROR;
+            xSemaphoreGive(xWeatherDataMutex);
+        }
+    }
+
+    return ret;
+}
 
 /**
  * @brief Unified sensor averaging algorithm for temperature and humidity
@@ -1168,6 +914,85 @@ static float weather_process_sensor_averaging(float new_value,
     return weighted_sum / total_weight;
 }
 
+// ########################## Power Management Functions ##########################
+
+/**
+ * @brief Unified power management for weather station based on sensor requirements
+ * @param requires_5v Whether 5V bus is needed (for PMS5003)
+ * @return ESP_OK on success, error code on failure
+ */
+static esp_err_t weather_request_power_buses(bool requires_5v)
+{
+    // Always request 3V3 for basic sensors
+    FLUCTUS_REQUEST_BUS_OR_FAIL(POWER_BUS_3V3, "TEMPESTA", return ESP_FAIL);
+    
+    // Request 5V only if needed (PMS5003 enabled)
+    if (requires_5v && weather_pms5003_enabled) {
+        FLUCTUS_REQUEST_BUS_OR_FAIL(POWER_BUS_5V, "TEMPESTA", {
+            fluctus_release_bus_power(POWER_BUS_3V3, "TEMPESTA");
+            return ESP_FAIL;
+        });
+    }
+    
+    return ESP_OK;
+}
+
+/**
+ * @brief Release power buses based on what was requested
+ * @param had_5v Whether 5V bus was previously requested
+ */
+static void weather_release_power_buses(bool had_5v)
+{
+    if (had_5v && weather_pms5003_enabled) {
+        fluctus_release_bus_power(POWER_BUS_5V, "TEMPESTA");
+    }
+    fluctus_release_bus_power(POWER_BUS_3V3, "TEMPESTA");
+}
+
+/**
+ * @brief Check if weather collection should proceed based on power state
+ * @param[out] reduced_functionality Set to true if only essential sensors should be read
+ * @return true if collection should proceed, false if should be skipped
+ */
+static bool weather_should_collect_data(bool *reduced_functionality)
+{
+    // Check for load shedding shutdown
+    if (weather_load_shed_shutdown) {
+        ESP_LOGD(TAG, "Load shedding shutdown active - skipping weather collection");
+        return false;
+    }
+
+    // Check FLUCTUS power state
+    fluctus_power_state_t power_state = fluctus_get_power_state();
+    if (power_state == FLUCTUS_POWER_STATE_CRITICAL) {
+        ESP_LOGW(TAG, "Critical power state - skipping weather collection cycle");
+        return false;
+    }
+
+    // Determine functionality level
+    *reduced_functionality = (power_state >= FLUCTUS_POWER_STATE_LOW_POWER);
+    if (*reduced_functionality) {
+        ESP_LOGI(TAG, "Low power mode - collecting essential sensors only");
+    }
+
+    return true;
+}
+
+/**
+ * @brief Helper function to update timer period based on power save mode
+ */
+static void weather_update_timer_period(void)
+{
+    if (xWeatherCollectionTimer != NULL) {
+        TickType_t new_period = weather_power_save_mode ?
+            pdMS_TO_TICKS(WEATHER_COLLECTION_INTERVAL_POWER_SAVE_MS) :
+            pdMS_TO_TICKS(WEATHER_COLLECTION_INTERVAL_MS);
+        
+        xTimerChangePeriod(xWeatherCollectionTimer, new_period, portMAX_DELAY);
+    }
+}
+
+// ########################## Task Helper Functions ##########################
 
 /**
  * @brief Log comprehensive weather summary with sensor status
@@ -1194,6 +1019,180 @@ static void weather_log_summary(void)
             ESP_LOGW(TAG, "Weather station is not fully operational, check sensor status");
         }
         xSemaphoreGive(xWeatherDataMutex);
+    }
+}
+
+/**
+ * @brief Handle PMS5003 warmup and reading
+ * @param warmup_start_time Tick count when power was applied
+ * @param should_read_pms5003 Whether PMS5003 should be read this cycle
+ */
+static void weather_handle_pms5003_reading(TickType_t warmup_start_time, bool should_read_pms5003)
+{
+    if (!should_read_pms5003) {
+        ESP_LOGI(TAG, "Skipping air quality measurement (PMS5003 disabled or low power mode)");
+        return;
+    }
+
+    // Calculate remaining warmup time
+    TickType_t elapsed_time = xTaskGetTickCount() - warmup_start_time;
+    TickType_t elapsed_ms = pdTICKS_TO_MS(elapsed_time);
+
+    if (elapsed_ms < WEATHER_PMS5003_WARMUP_TIME_MS) {
+        uint32_t remaining_warmup_ms = WEATHER_PMS5003_WARMUP_TIME_MS - elapsed_ms;
+        ESP_LOGI(TAG, "Waiting additional %" PRIu32 "ms for PMS5003 warmup", remaining_warmup_ms);
+        vTaskDelay(pdMS_TO_TICKS(remaining_warmup_ms));
+    }
+
+    // Read air quality sensor
+    weather_process_air_quality();
+}
+
+// ########################## Utility Functions ##########################
+
+/**
+ * @brief Timer callback to trigger data collection cycle
+ */
+static void weather_timer_callback(TimerHandle_t xTimer)
+{
+    // Notify main task to start collection cycle
+    if (xWeatherMainTaskHandle != NULL) {
+        xTaskNotify(xWeatherMainTaskHandle, 1, eSetBits);
+    }
+}
+
+/**
+ * @brief Calculate milliseconds until next quarter-hour boundary
+ */
+static uint32_t weather_calculate_time_to_next_quarter_hour(void)
+{
+    time_t now;
+    struct tm timeinfo;
+    time(&now);
+    localtime_r(&now, &timeinfo);
+
+    // Calculate minutes until next quarter-hour (00, 15, 30, 45)
+    int current_min = timeinfo.tm_min;
+    int current_sec = timeinfo.tm_sec;
+    
+    int next_quarter = ((current_min / 15) + 1) * 15;
+    int minutes_to_wait = (next_quarter <= 60) ? (next_quarter - current_min) : (60 - current_min);
+    
+    // Convert to milliseconds, subtract current seconds
+    uint32_t delay_ms = (minutes_to_wait * 60 - current_sec) * 1000;
+    
+    ESP_LOGI(TAG, "Current: %02d:%02d:%02d, next quarter-hour in %" PRIu32 "ms", 
+             timeinfo.tm_hour, current_min, current_sec, delay_ms);
+    
+    return delay_ms;
+}
+
+/**
+ * @brief Convert pulse count to rainfall depth in mm using physical tipbucket parameters
+ */
+static float weather_convert_pulses_to_rainfall_mm(int pulse_count)
+{
+    if (pulse_count < 0) {
+        return 0.0f;
+    }
+
+    // Calculate rainfall depth: volume / area
+    // Depth(mm) = (pulses * volume_per_pulse_mm3) / collection_area_mm2
+    float total_volume_mm3 = (float) pulse_count * WEATHER_RAIN_MM3_PER_PULSE;
+    float rainfall_depth_mm = total_volume_mm3 / WEATHER_RAIN_COLLECTION_AREA_MM2;
+
+    return rainfall_depth_mm;
+}
+
+/**
+ * @brief Get current pulse count from rainfall sensor
+ */
+static esp_err_t weather_get_rainfall_pulse_count(int *pulse_count)
+{
+    if (!pulse_count) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (rain_pcnt_unit_handle == NULL) {
+        *pulse_count = 0;
+        return ESP_FAIL;
+    }
+
+    esp_err_t ret = pcnt_unit_get_count(rain_pcnt_unit_handle, pulse_count);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to read rainfall pulse count: %s", esp_err_to_name(ret));
+        *pulse_count = 0;
+        return ret;
+    }
+
+    return ESP_OK;
+}
+
+// ########################## Task Functions ##########################
+
+/**
+ * @brief Main weather station coordination task
+ */
+static void weather_main_task(void *pvParameters)
+{
+    const char *task_tag = "WeatherMain";
+    ESP_LOGI(task_tag, "Weather station main task started");
+
+    // Wait for system initialization
+    vTaskDelay(pdMS_TO_TICKS(3000));
+
+    while (1) {
+        // Wait for collection cycle notification
+        uint32_t notification_value = 0;
+        xTaskNotifyWait(0x00, ULONG_MAX, &notification_value, portMAX_DELAY);
+
+        // Check if collection should proceed and determine functionality level
+        bool reduced_functionality = false;
+        if (!weather_should_collect_data(&reduced_functionality)) {
+            continue; // Skip this cycle
+        }
+
+        ESP_LOGI(task_tag, "Starting weather data collection cycle");
+
+        // Determine if PMS5003 should be read this cycle
+        bool should_read_pms5003 = weather_pms5003_enabled && !reduced_functionality;
+        esp_err_t ret = weather_request_power_buses(should_read_pms5003);
+        if (ret != ESP_OK) {
+            ESP_LOGE(task_tag, "Failed to request power buses");
+            continue;
+        }
+
+        ESP_LOGI(task_tag, "Sensor buses powered (%s), starting measurements", 
+                 should_read_pms5003 ? "3V3+5V" : "3V3 only");
+
+        // Record start time for PMS5003 warmup tracking
+        TickType_t warmup_start_time = xTaskGetTickCount();
+
+        // Allow I2C sensors brief stabilization and trigger wind sampling
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        xTaskNotify(xWeatherAS5600TaskHandle, 1, eSetBits);
+
+        // Read and process essential I2C sensors
+        consolidated_sensor_data_t sensor_data;
+        weather_read_env_sensors(&sensor_data);
+        weather_process_temperature(&sensor_data);
+        weather_process_humidity(&sensor_data);
+        weather_process_pressure(&sensor_data);
+        weather_read_and_process_rainfall();
+
+        // Handle PMS5003 air quality sensor (with warmup management)
+        weather_handle_pms5003_reading(warmup_start_time, should_read_pms5003);
+
+        // Update timestamp and power down
+        if (xSemaphoreTake(xWeatherDataMutex, pdMS_TO_TICKS(WEATHER_MUTEX_TIMEOUT_UPDATE_MS)) == pdTRUE) {
+            weather_data.timestamp = time(NULL);
+            xSemaphoreGive(xWeatherDataMutex);
+        }
+
+        weather_release_power_buses(should_read_pms5003);
+        
+        ESP_LOGI(task_tag, "Weather data collection cycle completed");
+        weather_log_summary();
     }
 }
 
@@ -1286,176 +1285,163 @@ static void weather_as5600_sampling_task(void *pvParameters)
     }
 }
 
+// ########################## Public API Functions ##########################
 
 /**
- * @brief Main weather station coordination task
+ * @brief Get current temperature (thread-safe)
+ * This function replaces latest_sht_temp for irrigation system
  */
-static void weather_main_task(void *pvParameters)
+float weather_get_temperature(void)
 {
-    const char *task_tag = "WeatherMain";
-    ESP_LOGI(task_tag, "Weather station main task started");
-
-    // Wait for system initialization
-    vTaskDelay(pdMS_TO_TICKS(3000));
-
-    while (1) {
-        // Wait for collection cycle notification
-        uint32_t notification_value = 0;
-        xTaskNotifyWait(0x00, ULONG_MAX, &notification_value, portMAX_DELAY);
-
-        // Check if collection should proceed and determine functionality level
-        bool reduced_functionality = false;
-        if (!weather_should_collect_data(&reduced_functionality)) {
-            continue; // Skip this cycle
-        }
-
-        ESP_LOGI(task_tag, "Starting weather data collection cycle");
-
-        // Determine if PMS5003 should be read this cycle
-        bool should_read_pms5003 = weather_pms5003_enabled && !reduced_functionality;
-        esp_err_t ret = weather_request_power_buses(should_read_pms5003);
-        if (ret != ESP_OK) {
-            ESP_LOGE(task_tag, "Failed to request power buses");
-            continue;
-        }
-
-        ESP_LOGI(task_tag, "Sensor buses powered (%s), starting measurements", 
-                 should_read_pms5003 ? "3V3+5V" : "3V3 only");
-
-        // Record start time for PMS5003 warmup tracking
-        TickType_t warmup_start_time = xTaskGetTickCount();
-
-        // Allow I2C sensors brief stabilization and trigger wind sampling
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        xTaskNotify(xWeatherAS5600TaskHandle, 1, eSetBits);
-
-        // Read and process essential I2C sensors
-        consolidated_sensor_data_t sensor_data;
-        weather_read_env_sensors(&sensor_data);
-        weather_process_temperature(&sensor_data);
-        weather_process_humidity(&sensor_data);
-        weather_process_pressure(&sensor_data);
-        weather_read_and_process_rainfall();
-
-        // Handle PMS5003 air quality sensor (with warmup management)
-        weather_handle_pms5003_reading(warmup_start_time, should_read_pms5003);
-
-        // Update timestamp and power down
-        if (xSemaphoreTake(xWeatherDataMutex, pdMS_TO_TICKS(WEATHER_MUTEX_TIMEOUT_UPDATE_MS)) == pdTRUE) {
-            weather_data.timestamp = time(NULL);
-            xSemaphoreGive(xWeatherDataMutex);
-        }
-
-        weather_release_power_buses(should_read_pms5003);
-        
-        ESP_LOGI(task_tag, "Weather data collection cycle completed");
-        weather_log_summary();
+    float temperature = WEATHER_INVALID_VALUE;
+    
+    if (xSemaphoreTake(xWeatherDataMutex, pdMS_TO_TICKS(WEATHER_MUTEX_TIMEOUT_QUICK_MS)) == pdTRUE) {
+        temperature = weather_data.temperature;
+        xSemaphoreGive(xWeatherDataMutex);
     }
+    
+    return temperature;
+}
+
+/**
+ * @brief Get current humidity (thread-safe)
+ */
+float weather_get_humidity(void)
+{
+    float humidity = WEATHER_INVALID_VALUE;
+
+    if (xSemaphoreTake(xWeatherDataMutex, pdMS_TO_TICKS(WEATHER_MUTEX_TIMEOUT_QUICK_MS)) == pdTRUE) {
+        humidity = weather_data.humidity;
+        xSemaphoreGive(xWeatherDataMutex);
+    }
+
+    return humidity;
+}
+
+/**
+ * @brief Get current pressure (thread-safe)
+ */
+float weather_get_pressure(void)
+{
+    float pressure = WEATHER_INVALID_VALUE;
+
+    if (xSemaphoreTake(xWeatherDataMutex, pdMS_TO_TICKS(WEATHER_MUTEX_TIMEOUT_QUICK_MS)) == pdTRUE) {
+        pressure = weather_data.pressure;
+        xSemaphoreGive(xWeatherDataMutex);
+    }
+
+    return pressure;
+}
+
+/**
+ * @brief Get current air quality readings (thread-safe)
+ */
+esp_err_t weather_get_air_quality(float *pm25, float *pm10)
+{
+    if (!pm25 || !pm10) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (xSemaphoreTake(xWeatherDataMutex, pdMS_TO_TICKS(WEATHER_MUTEX_TIMEOUT_QUICK_MS)) == pdTRUE) {
+        *pm25 = weather_data.air_quality_pm25;
+        *pm10 = weather_data.air_quality_pm10;
+        
+        // Check sensor status while still holding mutex
+        weather_sensor_status_t status = weather_data.air_quality_status;
+        xSemaphoreGive(xWeatherDataMutex);
+
+        // Return success only if air quality sensor is working
+        return (status == WEATHER_SENSOR_OK) ? ESP_OK : ESP_FAIL;
+    }
+
+    return ESP_ERR_TIMEOUT;
+}
+
+/**
+ * @brief Get current wind speed in RPM (thread-safe)
+ */
+float weather_get_wind_speed_rpm(void)
+{
+    float wind_speed = WEATHER_INVALID_VALUE;
+
+    if (xSemaphoreTake(xWeatherDataMutex, pdMS_TO_TICKS(WEATHER_MUTEX_TIMEOUT_QUICK_MS)) == pdTRUE) {
+        wind_speed = weather_data.wind_speed_rpm;
+        xSemaphoreGive(xWeatherDataMutex);
+    }
+
+    return wind_speed;
+}
+
+/**
+ * @brief Get current wind speed in m/s (thread-safe)
+ */
+float weather_get_wind_speed_ms(void)
+{
+    float wind_speed = WEATHER_INVALID_VALUE;
+
+    if (xSemaphoreTake(xWeatherDataMutex, pdMS_TO_TICKS(WEATHER_MUTEX_TIMEOUT_QUICK_MS)) == pdTRUE) {
+        wind_speed = weather_data.wind_speed_ms;
+        xSemaphoreGive(xWeatherDataMutex);
+    }
+
+    return wind_speed;
+}
+
+/**
+ * @brief Get accumulated rainfall and optionally reset counter (thread-safe)
+ */
+float weather_get_rainfall_mm(bool reset_counter)
+{
+    float rainfall = WEATHER_INVALID_VALUE;
+
+    if (xSemaphoreTake(xWeatherDataMutex, pdMS_TO_TICKS(WEATHER_MUTEX_TIMEOUT_QUICK_MS)) == pdTRUE) {
+        rainfall = weather_data.rainfall_mm;
+
+        if (reset_counter && rain_pcnt_unit_handle != NULL) {
+            // Reset the pulse counter
+            esp_err_t ret = pcnt_unit_clear_count(rain_pcnt_unit_handle);
+            if (ret == ESP_OK) {
+                weather_data.rainfall_mm = 0.0f;
+                ESP_LOGI(TAG, "Rainfall counter reset (was %.3f mm)", rainfall);
+            } else {
+                ESP_LOGW(TAG, "Failed to reset rainfall counter: %s", esp_err_to_name(ret));
+            }
+        }
+
+        xSemaphoreGive(xWeatherDataMutex);
+    }
+
+    return rainfall;
+}
+
+/**
+ * @brief Get human-readable sensor status
+ */
+esp_err_t weather_get_status_string(char *status_buffer, size_t buffer_size)
+{
+    if (!status_buffer || buffer_size < 200) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (xSemaphoreTake(xWeatherDataMutex, pdMS_TO_TICKS(WEATHER_MUTEX_TIMEOUT_QUICK_MS)) == pdTRUE) {
+        snprintf(status_buffer,
+                 buffer_size,
+                 "Weather Status: T:%s H:%s P:%s AQ:%s Wind:%s Rain:%s",
+                 (weather_data.temp_sensor_status == WEATHER_SENSOR_OK) ? "OK" : "ERR",
+                 (weather_data.humidity_sensor_status == WEATHER_SENSOR_OK) ? "OK" : "ERR",
+                 (weather_data.pressure_sensor_status == WEATHER_SENSOR_OK) ? "OK" : "ERR",
+                 (weather_data.air_quality_status == WEATHER_SENSOR_OK) ? "OK" : "ERR",
+                 (weather_data.wind_sensor_status == WEATHER_SENSOR_OK) ? "OK" : "ERR",
+                 (weather_data.rain_sensor_status == WEATHER_SENSOR_OK) ? "OK" : "ERR");
+
+        xSemaphoreGive(xWeatherDataMutex);
+        return ESP_OK;
+    }
+
+    return ESP_ERR_TIMEOUT;
 }
 
 // ########################## Load Shedding Functions ##########################
-
-/**
- * @brief Unified power management for weather station based on sensor requirements
- * @param requires_5v Whether 5V bus is needed (for PMS5003)
- * @return ESP_OK on success, error code on failure
- */
-static esp_err_t weather_request_power_buses(bool requires_5v)
-{
-    // Always request 3V3 for basic sensors
-    FLUCTUS_REQUEST_BUS_OR_FAIL(POWER_BUS_3V3, "TEMPESTA", return ESP_FAIL);
-    
-    // Request 5V only if needed (PMS5003 enabled)
-    if (requires_5v && weather_pms5003_enabled) {
-        FLUCTUS_REQUEST_BUS_OR_FAIL(POWER_BUS_5V, "TEMPESTA", {
-            fluctus_release_bus_power(POWER_BUS_3V3, "TEMPESTA");
-            return ESP_FAIL;
-        });
-    }
-    
-    return ESP_OK;
-}
-
-/**
- * @brief Release power buses based on what was requested
- * @param had_5v Whether 5V bus was previously requested
- */
-static void weather_release_power_buses(bool had_5v)
-{
-    if (had_5v && weather_pms5003_enabled) {
-        fluctus_release_bus_power(POWER_BUS_5V, "TEMPESTA");
-    }
-    fluctus_release_bus_power(POWER_BUS_3V3, "TEMPESTA");
-}
-
-/**
- * @brief Check if weather collection should proceed based on power state
- * @param[out] reduced_functionality Set to true if only essential sensors should be read
- * @return true if collection should proceed, false if should be skipped
- */
-static bool weather_should_collect_data(bool *reduced_functionality)
-{
-    // Check for load shedding shutdown
-    if (weather_load_shed_shutdown) {
-        ESP_LOGD(TAG, "Load shedding shutdown active - skipping weather collection");
-        return false;
-    }
-
-    // Check FLUCTUS power state
-    fluctus_power_state_t power_state = fluctus_get_power_state();
-    if (power_state == FLUCTUS_POWER_STATE_CRITICAL) {
-        ESP_LOGW(TAG, "Critical power state - skipping weather collection cycle");
-        return false;
-    }
-
-    // Determine functionality level
-    *reduced_functionality = (power_state >= FLUCTUS_POWER_STATE_LOW_POWER);
-    if (*reduced_functionality) {
-        ESP_LOGI(TAG, "Low power mode - collecting essential sensors only");
-    }
-
-    return true;
-}
-
-/**
- * @brief Handle PMS5003 warmup and reading
- * @param warmup_start_time Tick count when power was applied
- * @param should_read_pms5003 Whether PMS5003 should be read this cycle
- */
-static void weather_handle_pms5003_reading(TickType_t warmup_start_time, bool should_read_pms5003)
-{
-    if (!should_read_pms5003) {
-        ESP_LOGI(TAG, "Skipping air quality measurement (PMS5003 disabled or low power mode)");
-        return;
-    }
-
-    // Calculate remaining warmup time
-    TickType_t elapsed_time = xTaskGetTickCount() - warmup_start_time;
-    TickType_t elapsed_ms = pdTICKS_TO_MS(elapsed_time);
-
-    if (elapsed_ms < WEATHER_PMS5003_WARMUP_TIME_MS) {
-        uint32_t remaining_warmup_ms = WEATHER_PMS5003_WARMUP_TIME_MS - elapsed_ms;
-        ESP_LOGI(TAG, "Waiting additional %" PRIu32 "ms for PMS5003 warmup", remaining_warmup_ms);
-        vTaskDelay(pdMS_TO_TICKS(remaining_warmup_ms));
-    }
-
-    // Read air quality sensor
-    weather_process_air_quality();
-}
-
-/**
- * @brief Helper function to update timer period based on power save mode
- */
-static void weather_update_timer_period(void)
-{
-    if (xWeatherCollectionTimer != NULL) {
-        TickType_t new_period = weather_power_save_mode ?
-            pdMS_TO_TICKS(WEATHER_COLLECTION_INTERVAL_POWER_SAVE_MS) :
-            pdMS_TO_TICKS(WEATHER_COLLECTION_INTERVAL_MS);
-        
-        xTimerChangePeriod(xWeatherCollectionTimer, new_period, portMAX_DELAY);
-    }
-}
 
 /**
  * @brief Set power saving mode for TEMPESTA weather station

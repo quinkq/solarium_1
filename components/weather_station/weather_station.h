@@ -33,7 +33,6 @@
 #define WEATHER_PMS5003_UART_NUM UART_NUM_1 // Use UART1
 #define WEATHER_PMS5003_RETRY_COUNT 3       // Count of retries for PMS5003
 
-
 // Rain Sensor Configuration
 #define WEATHER_RAIN_MM3_PER_PULSE 0.2f         // Volume per tip in cubic mm (to be calibrated)
 #define WEATHER_RAIN_COLLECTION_AREA_MM2 78.54f // Collection area in mm² (to be measured)

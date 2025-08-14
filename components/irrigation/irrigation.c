@@ -58,14 +58,23 @@ static esp_err_t irrigation_read_moisture_sensor(uint8_t zone_id, float *moistur
 static esp_err_t irrigation_read_pressure(float *pressure_bar);
 static esp_err_t irrigation_read_water_level(float *water_level_percent);
 
+// ------------------------ Power Bus Helper Functions ------------------------
+typedef enum {
+    POWER_LEVEL_SENSORS = 0,    // 3V3 + 5V buses (measuring)
+    POWER_LEVEL_WATERING = 1,   // 3V3 + 5V + 12V buses (watering)
+} irrigation_power_level_t;
+
+static esp_err_t irrigation_request_power_buses(irrigation_power_level_t level, const char *tag);
+static void irrigation_release_power_buses(irrigation_power_level_t level, const char *tag);
+
 // ------------------------ Pump Control Functions ------------------------
 static esp_err_t irrigation_set_pump_speed(uint32_t pwm_duty);
 static esp_err_t irrigation_pump_ramp_up(uint8_t zone_id);
 static void irrigation_pump_adaptive_control(float current_gain_rate, float target_gain_rate);
 
 // ------------------------ Learning and Prediction Functions ------------------------
-static esp_err_t irrigation_calc_zone_watering_predictions(void);
-static esp_err_t irrigation_log_zone_watering_data(uint8_t zone_id,
+static esp_err_t irrigation_calculate_zone_watering_predictions(void);
+static esp_err_t irrigation_process_zone_watering_data(uint8_t zone_id,
                                                    uint32_t pulses_used,
                                                    float moisture_increase_percent,
                                                    bool learning_valid);
@@ -160,7 +169,7 @@ static esp_err_t irrigation_system_init(void)
         irrigation_zones[i].valve_gpio = zone_valve_gpios[i];
         irrigation_zones[i].target_moisture_percent = 40.0f;  // 40% default target
         irrigation_zones[i].moisture_deadband_percent = 5.0f; // +/- 5% deadband
-        irrigation_zones[i].enabled = true;
+        irrigation_zones[i].watering_enabled = true;
 
         // Set ADS1115 device and channel mapping
         // Dev#1: Moisture sensors Zone 1-4, Dev#2: Moisture sensor Zone 5
@@ -174,8 +183,8 @@ static esp_err_t irrigation_system_init(void)
 
         // Initialize learning algorithm data
         // no memset - static variables are zero-initialized
-        irrigation_zones[i].learning.current_pulses_per_percent = 8.0f; // Default: 8 pulses per 1% moisture
-        irrigation_zones[i].learning.learned_pump_duty_cycle = PUMP_DEFAULT_DUTY;
+        irrigation_zones[i].learning.calculated_ppmp_ratio = DEFAULT_PULSES_PER_PERCENT; // Default pulses per 1% moisture
+        irrigation_zones[i].learning.calculated_pump_duty_cycle = PUMP_DEFAULT_DUTY;
         irrigation_zones[i].learning.target_moisture_gain_rate = TARGET_MOISTURE_GAIN_RATE;
     }
     // Initialize hardware
@@ -407,54 +416,27 @@ static esp_err_t irrigation_read_moisture_sensor(uint8_t zone_id, float *moistur
     float voltage;
     esp_err_t ret = ESP_FAIL;
 
-    for (uint8_t attempt = 0; attempt < SENSOR_READ_MAX_RETRIES; attempt++) {
-        ret = ads1115_read_channel(zone->moisture_ads_device, zone->moisture_channel, &raw, &voltage);
+    SENSOR_READ_WITH_RETRY(
+        ads1115_read_channel(zone->moisture_ads_device, zone->moisture_channel, &raw, &voltage),
+        "moisture sensor zone", zone_id
+    );
 
-        if (ret == ESP_OK) {
-            // Success - convert voltage to percentage
-            // Clamp voltage to calibrated range
-            float clamped_voltage = voltage;
-            if (clamped_voltage < MOISTURE_SENSOR_DRY_V)
-                clamped_voltage = MOISTURE_SENSOR_DRY_V;
-            if (clamped_voltage > MOISTURE_SENSOR_WET_V)
-                clamped_voltage = MOISTURE_SENSOR_WET_V;
+    if (ret == ESP_OK) {
+        // Success - convert voltage to percentage
+        // Clamp voltage to calibrated range
+        float clamped_voltage = voltage;
+        if (clamped_voltage < MOISTURE_SENSOR_DRY_V)
+            clamped_voltage = MOISTURE_SENSOR_DRY_V;
+        if (clamped_voltage > MOISTURE_SENSOR_WET_V)
+            clamped_voltage = MOISTURE_SENSOR_WET_V;
 
-            // Linear mapping to percentage
-            *moisture_percent =
-                ((clamped_voltage - MOISTURE_SENSOR_DRY_V) / (MOISTURE_SENSOR_WET_V - MOISTURE_SENSOR_DRY_V)) * 100.0f;
+        // Linear mapping to percentage
+        *moisture_percent =
+            ((clamped_voltage - MOISTURE_SENSOR_DRY_V) / (MOISTURE_SENSOR_WET_V - MOISTURE_SENSOR_DRY_V)) * 100.0f;
 
-            // Voltage reading successful - ads1115_helper manages display data automatically
-
-            if (attempt > 0) {
-                ESP_LOGD(TAG,
-                         "Zone %d moisture sensor read succeeded on attempt %d: %.1f%% (%.3fV)",
-                         zone_id,
-                         attempt + 1,
-                         *moisture_percent,
-                         voltage);
-            } else {
-                ESP_LOGD(TAG, "Zone %d moisture sensor read: %.1f%% (%.3fV)", zone_id, *moisture_percent, voltage);
-            }
-            return ESP_OK;
-        }
-
-        // Failed - try again if we have retries left
-        if (attempt < SENSOR_READ_MAX_RETRIES - 1) {
-            ESP_LOGD(TAG,
-                     "Zone %d moisture read attempt %d failed: %s, retrying...",
-                     zone_id,
-                     attempt + 1,
-                     esp_err_to_name(ret));
-            vTaskDelay(pdMS_TO_TICKS(SENSOR_READ_RETRY_DELAY_MS));
-        }
+        ESP_LOGD(TAG, "Zone %d moisture sensor read: %.1f%% (%.3fV)", zone_id, *moisture_percent, voltage);
     }
 
-    // All retries exhausted
-    ESP_LOGW(TAG,
-             "Failed to read moisture sensor zone %d after %d attempts: %s",
-             zone_id,
-             SENSOR_READ_MAX_RETRIES,
-             esp_err_to_name(ret));
     return ret;
 }
 
@@ -485,39 +467,20 @@ static esp_err_t irrigation_read_pressure(float *pressure_bar)
     float voltage;
     esp_err_t ret = ESP_FAIL;
 
-    for (uint8_t attempt = 0; attempt < SENSOR_READ_MAX_RETRIES; attempt++) {
-        ret = ads1115_read_channel(2, ADS111X_MUX_1_GND, &raw, &voltage);
+    SENSOR_READ_WITH_RETRY(
+        ads1115_read_channel(2, ADS111X_MUX_1_GND, &raw, &voltage),
+        "pressure sensor", 0
+    );
 
-        if (ret == ESP_OK) {
-            // Success - convert voltage to pressure
-            // TODO: calibration needed
-            // Assuming linear conversion for now
-            *pressure_bar = voltage * 3.0f; // For implementation time/tests: 3 bar per volt
-
-            if (attempt > 0) {
-                ESP_LOGD(TAG,
-                         "System pressure read succeeded on attempt %d: %.2f bar (%.3fV)",
-                         attempt + 1,
-                         *pressure_bar,
-                         voltage);
-            } else {
-                ESP_LOGD(TAG, "System pressure: %.2f bar (%.3fV)", *pressure_bar, voltage);
-            }
-            return ESP_OK;
-        }
-
-        // Failed - try again if we have retries left
-        if (attempt < SENSOR_READ_MAX_RETRIES - 1) {
-            ESP_LOGD(TAG, "Pressure read attempt %d failed: %s, retrying...", attempt + 1, esp_err_to_name(ret));
-            vTaskDelay(pdMS_TO_TICKS(SENSOR_READ_RETRY_DELAY_MS));
-        }
+    if (ret == ESP_OK) {
+        // Success - convert voltage to pressure
+        // TODO: calibration needed
+        // Assuming linear conversion for now
+        *pressure_bar = voltage * 3.0f; // For implementation time/tests: 3 bar per volt
+        
+        ESP_LOGD(TAG, "System pressure: %.2f bar (%.3fV)", *pressure_bar, voltage);
     }
 
-    // All retries exhausted
-    ESP_LOGW(TAG,
-             "Failed to read pressure sensor after %d attempts: %s",
-             SENSOR_READ_MAX_RETRIES,
-             esp_err_to_name(ret));
     return ret;
 }
 
@@ -537,17 +500,13 @@ static esp_err_t irrigation_read_water_level(float *water_level_percent)
         return ESP_ERR_INVALID_ARG;
     }
 
-    float water_level_pressure_mbar = 0.0f; // Placeholder value
+    float water_level_pressure_mbar = 0.0f;
     esp_err_t ret = ESP_FAIL;
 
-    for (uint8_t attempt = 0; attempt < SENSOR_READ_MAX_RETRIES; attempt++) {
-        ret = abp_read_pressure_mbar(&abp_dev, &water_level_pressure_mbar);
-        if (ret == ESP_OK)
-            break;
-        if (attempt < SENSOR_READ_MAX_RETRIES - 1) {
-            vTaskDelay(pdMS_TO_TICKS(SENSOR_READ_RETRY_DELAY_MS));
-        }
-    }
+    SENSOR_READ_WITH_RETRY(
+        abp_read_pressure_mbar(&abp_dev, &water_level_pressure_mbar),
+        "water level sensor", 0
+    );
 
     if (ret == ESP_OK) {
         // Clamp pressure to calibrated range
@@ -562,11 +521,80 @@ static esp_err_t irrigation_read_water_level(float *water_level_percent)
             100.0f;
 
         ESP_LOGD(TAG, "Water level: %.1f%% (%.1f mbar)", *water_level_percent, water_level_pressure_mbar);
-    } else {
-        ESP_LOGW(TAG, "Failed to read water level sensor: %s", esp_err_to_name(ret));
     }
 
     return ret;
+}
+
+// Sensor retry helper macro - eliminates duplicated retry logic
+#define SENSOR_READ_WITH_RETRY(read_operation, sensor_name, context_id) do { \
+    esp_err_t _ret = ESP_FAIL; \
+    for (uint8_t _attempt = 0; _attempt < SENSOR_READ_MAX_RETRIES; _attempt++) { \
+        _ret = (read_operation); \
+        if (_ret == ESP_OK) { \
+            if (_attempt > 0) { \
+                ESP_LOGD(TAG, "%s %d succeeded on attempt %d", sensor_name, context_id, _attempt + 1); \
+            } \
+            break; \
+        } \
+        if (_attempt < SENSOR_READ_MAX_RETRIES - 1) { \
+            ESP_LOGD(TAG, "%s %d attempt %d failed: %s, retrying...", \
+                     sensor_name, context_id, _attempt + 1, esp_err_to_name(_ret)); \
+            vTaskDelay(pdMS_TO_TICKS(SENSOR_READ_RETRY_DELAY_MS)); \
+        } \
+    } \
+    if (_ret != ESP_OK) { \
+        ESP_LOGW(TAG, "Failed to read %s %d after %d attempts: %s", \
+                 sensor_name, context_id, SENSOR_READ_MAX_RETRIES, esp_err_to_name(_ret)); \
+    } \
+    ret = _ret; \
+} while(0)
+
+/**
+ * @brief Request power buses for irrigation operations
+ *
+ * @param[in] level Power level (sensors or watering)
+ * @param[in] tag Tag for power bus requests (e.g., "IMPLUVIUM", "IMPLUVIUM_DIAG")
+ * @return ESP_OK on success, ESP_FAIL on any bus request failure
+ */
+static esp_err_t irrigation_request_power_buses(irrigation_power_level_t level, const char *tag)
+{
+    // Always request sensor buses first
+    FLUCTUS_REQUEST_BUS_OR_FAIL(POWER_BUS_3V3, tag, {
+        return ESP_FAIL;
+    });
+    
+    FLUCTUS_REQUEST_BUS_OR_FAIL(POWER_BUS_5V, tag, {
+        fluctus_release_bus_power(POWER_BUS_3V3, tag);
+        return ESP_FAIL;
+    });
+
+    // Request 12V bus for watering operations
+    if (level == POWER_LEVEL_WATERING) {
+        FLUCTUS_REQUEST_BUS_OR_FAIL(POWER_BUS_12V, tag, {
+            fluctus_release_bus_power(POWER_BUS_5V, tag);
+            fluctus_release_bus_power(POWER_BUS_3V3, tag);
+            return ESP_FAIL;
+        });
+    }
+
+    return ESP_OK;
+}
+
+/**
+ * @brief Release power buses for irrigation operations
+ *
+ * @param[in] level Power level (sensors or watering) 
+ * @param[in] tag Tag used for power bus requests
+ */
+static void irrigation_release_power_buses(irrigation_power_level_t level, const char *tag)
+{
+    // Release in reverse order
+    if (level == POWER_LEVEL_WATERING) {
+        fluctus_release_bus_power(POWER_BUS_12V, tag);
+    }
+    fluctus_release_bus_power(POWER_BUS_5V, tag);
+    fluctus_release_bus_power(POWER_BUS_3V3, tag);
 }
 
 // ########################## Irrigation System ##########################
@@ -621,7 +649,7 @@ static esp_err_t irrigation_pump_ramp_up(uint8_t zone_id)
     ESP_LOGI(TAG, "Ramping up pump for zone %d...", zone_id);
 
     uint32_t start_duty = PUMP_MIN_DUTY;
-    uint32_t target_duty = irrigation_zones[zone_id].learning.learned_pump_duty_cycle;
+    uint32_t target_duty = irrigation_zones[zone_id].learning.calculated_pump_duty_cycle;
     uint32_t ramp_duration_ms = PUMP_RAMP_UP_TIME_MS;
     int steps = 50; // 50 steps for a smooth ramp
     uint32_t step_delay = ramp_duration_ms / steps;
@@ -714,7 +742,7 @@ static uint32_t irrigation_calc_moisture_check_interval(float current_temperatur
  * @param[in] zone_learning Zone learning data structure
  * @return Temperature correction factor (typically 0.8 - 1.2)
  */
-static float irrigation_calc_temperature_correction(zone_learning_t *learning)
+static float irrigation_calculate_temperature_correction(zone_learning_t *learning)
 {
     // Calculate temperature correction factor
     // Formula: 1.0 + (current_temperature - baseline_temp) * correction_factor
@@ -728,10 +756,10 @@ static float irrigation_calc_temperature_correction(zone_learning_t *learning)
         return 1.0f;
     }
 
-    float temp_correction = 1.0f + ((current_temperature - TEMPERATURE_BASELINE) * TEMP_CORRECTION_FACTOR);
-    learning->last_temperature_correction = temp_correction;
-    ESP_LOGD(TAG, "Temp %.1f°C, correction factor %.2f", current_temperature, temp_correction);
-    return temp_correction;
+    float calculated_temp_correction = 1.0f + ((current_temperature - TEMPERATURE_BASELINE) * TEMP_CORRECTION_FACTOR);
+    learning->last_temperature_correction = calculated_temp_correction;
+    ESP_LOGD(TAG, "Temp %.1f°C, correction factor %.2f", current_temperature, calculated_temp_correction);
+    return calculated_temp_correction;
 }
 
 /**
@@ -741,7 +769,7 @@ static float irrigation_calc_temperature_correction(zone_learning_t *learning)
  * @param[out] valid_cycles Number of valid historical cycles found
  * @return Calculated pulses per percent ratio, or 0.0 if insufficient data
  */
-static float irrigation_calc_weighted_learning_ratio(zone_learning_t *learning, uint8_t *valid_cycles)
+static float irrigation_calculate_pulse_per_moisture_percent(zone_learning_t *learning, uint8_t *valid_cycles)
 {
     float weighted_ratio = 0.0f;
     float total_weight = 0.0f;
@@ -750,21 +778,23 @@ static float irrigation_calc_weighted_learning_ratio(zone_learning_t *learning, 
     for (uint8_t h = 0; h < learning->history_entry_count; h++) {
         // Skip anomalous cycles (rain, manual watering, etc.)
         if (!learning->anomaly_flags[h] && learning->moisture_increase_percent_history[h] > 0) {
-            // Recent cycles (last 3) get higher weight
-            float weight =
-                (h >= learning->history_entry_count - 3) ? LEARNING_WEIGHT_RECENT : (1.0f - LEARNING_WEIGHT_RECENT);
+            // Calculate recency: most recent entries get higher weight
+            // Recent entries are at (history_index - 1), (history_index - 2), etc. with wraparound
+            uint8_t relative_age = (learning->history_index - h - 1 + LEARNING_HISTORY_SIZE) % LEARNING_HISTORY_SIZE;
+            float weight = (relative_age < 3) ? LEARNING_WEIGHT_RECENT : (1.0f - LEARNING_WEIGHT_RECENT);
 
             // Calculate pulses per moisture percent for this cycle
-            float ratio = learning->pulse_amount_history[h] / learning->moisture_increase_percent_history[h];
+            float ratio = learning->pulses_used_history[h] / learning->moisture_increase_percent_history[h];
 
             weighted_ratio += ratio * weight;
             total_weight += weight;
             (*valid_cycles)++;
 
             ESP_LOGD(TAG,
-                     "Cycle %d: %d pulses, %.2f%% increase, ratio %.1f, weight %.2f",
+                     "Cycle %d (age %d): %d pulses, %.2f%% increase, ratio %.1f, weight %.2f",
                      h,
-                     (int) learning->pulse_amount_history[h],
+                     relative_age,
+                     (int) learning->pulses_used_history[h],
                      learning->moisture_increase_percent_history[h],
                      ratio,
                      weight);
@@ -781,25 +811,51 @@ static float irrigation_calc_weighted_learning_ratio(zone_learning_t *learning, 
  * @param[in] queue_index Index in watering queue
  * @return ESP_OK on success
  */
-static esp_err_t irrigation_calc_zone_target_pulses(uint8_t zone_id, uint8_t queue_index)
+static esp_err_t irrigation_calculate_zone_target_pulses(uint8_t zone_id, uint8_t queue_index)
 {
     irrigation_zone_t *zone = &irrigation_zones[zone_id];
     zone_learning_t *learning = &zone->learning;
 
     // Calculate temperature correction
-    float temp_correction = irrigation_calc_temperature_correction(learning);
+    float calculated_temp_correction = irrigation_calculate_temperature_correction(learning);
 
     // Check if we have sufficient learning data
     if (learning->history_entry_count >= LEARNING_MIN_CYCLES) {
         uint8_t valid_cycles;
-        float learned_ratio = irrigation_calc_weighted_learning_ratio(learning, &valid_cycles);
+        float calculated_ppmp_ratio = irrigation_calculate_pulse_per_moisture_percent(learning, &valid_cycles);
 
-        if (learned_ratio > 0.0f) {
-            learning->current_pulses_per_percent = learned_ratio;
+        if (calculated_ppmp_ratio > 0.0f) {
+            learning->calculated_ppmp_ratio = calculated_ppmp_ratio;
 
-            // Calculate predicted pulses needed for current moisture deficit
-            float target_pulses = irrigation_system.watering_queue[queue_index].moisture_deficit_percent *
-                                  learned_ratio * temp_correction;
+            // Calculate learned prediction
+            float learned_target_pulses = irrigation_system.watering_queue[queue_index].moisture_deficit_percent *
+                                         calculated_ppmp_ratio * calculated_temp_correction;
+
+            // Calculate default prediction for blending
+            float default_target_pulses = irrigation_system.watering_queue[queue_index].moisture_deficit_percent *
+                                        DEFAULT_PULSES_PER_PERCENT * calculated_temp_correction;
+
+            // Apply confidence-based blending
+            float target_pulses;
+            float confidence = learning->confidence_level;
+            
+            if (confidence >= 0.70f) {
+                // High confidence: Use full learned prediction
+                target_pulses = learned_target_pulses;
+                ESP_LOGI(TAG, "Zone %d: High confidence (%.0f%%), using learned prediction", 
+                        zone_id, confidence * 100.0f);
+            } else if (confidence >= 0.40f) {
+                // Medium confidence: Blend learned + default
+                float blend_factor = (confidence - 0.40f) / 0.30f; // 0.0 to 1.0 scale
+                target_pulses = (learned_target_pulses * blend_factor) + (default_target_pulses * (1.0f - blend_factor));
+                ESP_LOGI(TAG, "Zone %d: Medium confidence (%.0f%%), blending predictions (%.0f%% learned)", 
+                        zone_id, confidence * 100.0f, blend_factor * 100.0f);
+            } else {
+                // Low confidence: Use mostly default with slight learned influence
+                target_pulses = (default_target_pulses * 0.8f) + (learned_target_pulses * 0.2f);
+                ESP_LOGI(TAG, "Zone %d: Low confidence (%.0f%%), using mostly default prediction", 
+                        zone_id, confidence * 100.0f);
+            }
 
             // Limit to reasonable range
             if (target_pulses < MINIMUM_TARGET_PULSES)
@@ -810,11 +866,12 @@ static esp_err_t irrigation_calc_zone_target_pulses(uint8_t zone_id, uint8_t que
             irrigation_system.watering_queue[queue_index].target_pulses = (uint16_t) target_pulses;
 
             ESP_LOGI(TAG,
-                     "Zone %d: Learned %.1f pulses/%%, predicted %d pulses (%.2f°C correction)",
+                     "Zone %d: Final prediction %d pulses (learned: %.1f, default: %.1f pulses/%%, temp: %.2f°C)",
                      zone_id,
-                     learned_ratio,
                      irrigation_system.watering_queue[queue_index].target_pulses,
-                     temp_correction);
+                     calculated_ppmp_ratio,
+                     DEFAULT_PULSES_PER_PERCENT,
+                     calculated_temp_correction);
         } else {
             // Not enough valid learning data
             irrigation_system.watering_queue[queue_index].target_pulses = DEFAULT_TARGET_PULSES;
@@ -853,13 +910,13 @@ static esp_err_t irrigation_calc_zone_target_pulses(uint8_t zone_id, uint8_t que
  *
  * @return ESP_OK on success, ESP_ERR_* on failure
  */
-static esp_err_t irrigation_calc_zone_watering_predictions(void)
+static esp_err_t irrigation_calculate_zone_watering_predictions(void)
 {
     ESP_LOGI(TAG, "Calculating watering predictions for %d zones", irrigation_system.watering_queue_size);
 
     for (uint8_t i = 0; i < irrigation_system.watering_queue_size; i++) {
         uint8_t zone_id = irrigation_system.watering_queue[i].zone_id;
-        esp_err_t ret = irrigation_calc_zone_target_pulses(zone_id, i);
+        esp_err_t ret = irrigation_calculate_zone_target_pulses(zone_id, i);
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "Failed to calculate target pulses for zone %d: %s", zone_id, esp_err_to_name(ret));
             return ret;
@@ -890,7 +947,7 @@ static esp_err_t irrigation_calc_zone_watering_predictions(void)
  * @param learning_valid Whether this cycle should be used for learning
  * @return ESP_OK on success, ESP_ERR_INVALID_ARG on invalid parameters
  */
-static esp_err_t irrigation_log_zone_watering_data(uint8_t zone_id,
+static esp_err_t irrigation_process_zone_watering_data(uint8_t zone_id,
                                                    uint32_t pulses_used,
                                                    float moisture_increase_percent,
                                                    bool learning_valid)
@@ -907,9 +964,9 @@ static esp_err_t irrigation_log_zone_watering_data(uint8_t zone_id,
     uint8_t index = learning->history_index;
 
     // Store the learning data
-    learning->pulse_amount_history[index] = pulses_used;
+    learning->pulses_used_history[index] = pulses_used;
     learning->moisture_increase_percent_history[index] = moisture_increase_percent;
-    learning->anomaly_flags[index] = !learning_valid; // Invert: true = anomaly
+    learning->anomaly_flags[index] = !learning_valid; // Invert: true = anomaly (stored for future calculations)
 
     // Advance circular buffer index
     learning->history_index = (learning->history_index + 1) % LEARNING_HISTORY_SIZE;
@@ -919,23 +976,34 @@ static esp_err_t irrigation_log_zone_watering_data(uint8_t zone_id,
         learning->history_entry_count++;
     }
 
-    // Calculate basic statistics for this cycle
-    float efficiency = (moisture_increase_percent > 0) ? (pulses_used / moisture_increase_percent) : 0;
+    // Calculate basic statistics for this cycle (pulses per 1% moisture)
+    float measured_ppmp_ratio = (moisture_increase_percent > 0) ? (pulses_used / moisture_increase_percent) : 0;
 
     ESP_LOGI(TAG,
              "Zone %d learning update: %lu pulses → %.2f%% increase (%.1f pulses/%%), %s",
              zone_id,
              pulses_used,
              moisture_increase_percent,
-             efficiency,
+             measured_ppmp_ratio,
              learning_valid ? "valid" : "anomaly");
 
-    // Update confidence tracking
-    learning->total_predictions++;
+    // Real-time learning updates (only for valid cycles)
+    if (learning_valid && measured_ppmp_ratio > 0.1f && measured_ppmp_ratio < 50.0f) { // Reasonable measured_ppmp_ratio range
+        // Update learned measured_ppmp_ratio with exponential moving average (10% new, 90% old)
+        learning->calculated_ppmp_ratio = 
+            (learning->calculated_ppmp_ratio * 0.9f) + (measured_ppmp_ratio * 0.1f);
+
+        ESP_LOGD(TAG, "Zone %d: Real-time measured_ppmp_ratio update: %.1f pulses/%% (was %.1f)", 
+                 zone_id, learning->calculated_ppmp_ratio, measured_ppmp_ratio);
+    }
+
+    // ### Confidence tracking calculations (only for valid predictions)
     if (learning_valid) {
+        learning->total_predictions++;
+        
         // Check if prediction was reasonably accurate (within 20% of expected)
-        if (learning->total_predictions > 0) {
-            float expected_increase = (pulses_used / learning->current_pulses_per_percent);
+        if (learning->calculated_ppmp_ratio > 0) {
+            float expected_increase = (pulses_used / learning->calculated_ppmp_ratio);
             float accuracy = fabs(moisture_increase_percent - expected_increase) / expected_increase;
             if (accuracy <= 0.20f) { // Within 20% tolerance
                 learning->successful_predictions++;
@@ -948,27 +1016,28 @@ static esp_err_t irrigation_log_zone_watering_data(uint8_t zone_id,
         }
     }
 
-    // Log learning progress
-    if (learning_valid && learning->history_entry_count >= LEARNING_MIN_CYCLES) {
-        // Simple moving average to update the learned pump duty cycle for the next run.
-        // We use the final duty cycle from the completed session as the basis for the next.
-        learning->learned_pump_duty_cycle =
-            (learning->learned_pump_duty_cycle * (LEARNING_HISTORY_SIZE - 1) + irrigation_system.pump_pwm_duty) /
-            LEARNING_HISTORY_SIZE;
-
-        ESP_LOGI(TAG,
-                 "Zone %d: Updated learned pump duty cycle to %" PRIu32 ", confidence %.2f",
-                 zone_id,
-                 learning->learned_pump_duty_cycle,
-                 learning->confidence_level);
-    }
-
+    // Update learned parameters and log progress (only after sufficient learning cycles)
     if (learning->history_entry_count >= LEARNING_MIN_CYCLES) {
+        // Update pump duty cycle (only for valid cycles)
+        if (learning_valid) {
+            // Exponential moving average for pump duty cycle (10% new, 90% old)
+            learning->calculated_pump_duty_cycle =
+                (uint32_t)((learning->calculated_pump_duty_cycle * 0.9f) + (irrigation_system.pump_pwm_duty * 0.1f));
+
+            ESP_LOGI(TAG,
+                     "Zone %d: Updated learned pump duty cycle to %" PRIu32 ", confidence %.2f",
+                     zone_id,
+                     learning->calculated_pump_duty_cycle,
+                     learning->confidence_level);
+        }
+
+        // Count valid entries for logging (cached calculation instead of loop each time)
         uint8_t valid_entries = 0;
         for (uint8_t i = 0; i < learning->history_entry_count; i++) {
             if (!learning->anomaly_flags[i])
                 valid_entries++;
         }
+        
         ESP_LOGI(TAG,
                  "Zone %d learning: %d total cycles, %d valid, %lu/%lu predictions successful (%.1f%% confidence)",
                  zone_id,
@@ -1068,31 +1137,24 @@ static esp_err_t irrigation_state_measuring(void)
     }
 
     // Power on sensors (3V3 for sensors, 5V for pressure transmitter)
-    FLUCTUS_REQUEST_BUS_OR_FAIL(POWER_BUS_3V3, "IMPLUVIUM", {
+    if (irrigation_request_power_buses(POWER_LEVEL_SENSORS, "IMPLUVIUM") != ESP_OK) {
         irrigation_change_state(IRRIGATION_MAINTENANCE);
         return ESP_FAIL;
-    });
-    
-    FLUCTUS_REQUEST_BUS_OR_FAIL(POWER_BUS_5V, "IMPLUVIUM", {
-        fluctus_release_bus_power(POWER_BUS_3V3, "IMPLUVIUM");
-        irrigation_change_state(IRRIGATION_MAINTENANCE);
-        return ESP_FAIL;
-    });
+    }
     
     vTaskDelay(pdMS_TO_TICKS(1000));
 
     // Perform pre-start safety checks directly
     if (irrigation_pre_check() != ESP_OK) {
         ESP_LOGE(TAG, "Pre-start safety check failed.");
-        fluctus_release_bus_power(POWER_BUS_5V, "IMPLUVIUM");
-        fluctus_release_bus_power(POWER_BUS_3V3, "IMPLUVIUM");
+        irrigation_release_power_buses(POWER_LEVEL_SENSORS, "IMPLUVIUM");
         irrigation_change_state(IRRIGATION_MAINTENANCE);
         return ESP_FAIL;
     }
 
     // Check each zone for watering needs
     for (uint8_t zone_id = 0; zone_id < IRRIGATION_ZONE_COUNT; zone_id++) {
-        if (!irrigation_zones[zone_id].enabled)
+        if (!irrigation_zones[zone_id].watering_enabled)
             continue;
 
         float moisture_percent;
@@ -1119,10 +1181,10 @@ static esp_err_t irrigation_state_measuring(void)
                     if (irrigation_system.watering_queue_size < IRRIGATION_ZONE_COUNT) {
                         irrigation_system.watering_queue[irrigation_system.watering_queue_size].zone_id = zone_id;
                         irrigation_system.watering_queue[irrigation_system.watering_queue_size]
-                            .current_moisture_percent = moisture_percent;
+                            .measured_moisture_percent = moisture_percent;
                         irrigation_system.watering_queue[irrigation_system.watering_queue_size]
                             .moisture_deficit_percent = moisture_deficit_percent;
-                        irrigation_system.watering_queue[irrigation_system.watering_queue_size].completed = false;
+                        irrigation_system.watering_queue[irrigation_system.watering_queue_size].watering_completed = false;
                         irrigation_system.watering_queue_size++;
                     }
                 }
@@ -1147,7 +1209,7 @@ static esp_err_t irrigation_state_measuring(void)
         }
 
         // Calculate predicted pulses for each zone using learning algorithm
-        irrigation_calc_zone_watering_predictions();
+        irrigation_calculate_zone_watering_predictions();
 
         // Start watering queue - keep sensors powered
         irrigation_system.queue_index = 0;
@@ -1155,8 +1217,7 @@ static esp_err_t irrigation_state_measuring(void)
         irrigation_change_state(IRRIGATION_WATERING);
     } else {
         // No zones need watering - power off sensors and return to idle
-        fluctus_release_bus_power(POWER_BUS_5V, "IMPLUVIUM");
-        fluctus_release_bus_power(POWER_BUS_3V3, "IMPLUVIUM");
+        irrigation_release_power_buses(POWER_LEVEL_SENSORS, "IMPLUVIUM");
         irrigation_system.last_moisture_check = xTaskGetTickCount() * portTICK_PERIOD_MS;
         irrigation_change_state(IRRIGATION_IDLE);
     }
@@ -1188,11 +1249,10 @@ static esp_err_t irrigation_state_watering(void)
     irrigation_zone_t *zone = &irrigation_zones[zone_id];
     ESP_LOGI(TAG, "Watering sequence started for zone %d", zone_id);
     
-    // Request 12V power for valve & pump operation
+    // Request 12V power for valve & pump operation (sensors already powered from measuring state)
     FLUCTUS_REQUEST_BUS_OR_FAIL(POWER_BUS_12V, "IMPLUVIUM", {
         gpio_set_level(zone->valve_gpio, 0);
-        fluctus_release_bus_power(POWER_BUS_5V, "IMPLUVIUM");
-        fluctus_release_bus_power(POWER_BUS_3V3, "IMPLUVIUM");
+        irrigation_release_power_buses(POWER_LEVEL_SENSORS, "IMPLUVIUM");
         irrigation_change_state(IRRIGATION_MAINTENANCE);
         return ESP_FAIL;
     });
@@ -1205,9 +1265,7 @@ static esp_err_t irrigation_state_watering(void)
     if (irrigation_pump_ramp_up(zone_id) != ESP_OK) {
         ESP_LOGE(TAG, "Pump ramp-up failed for zone %d, turning off power buses", zone_id);
         gpio_set_level(zone->valve_gpio, 0);
-        fluctus_release_bus_power(POWER_BUS_12V, "IMPLUVIUM");
-        fluctus_release_bus_power(POWER_BUS_5V, "IMPLUVIUM");
-        fluctus_release_bus_power(POWER_BUS_3V3, "IMPLUVIUM");
+        irrigation_release_power_buses(POWER_LEVEL_WATERING, "IMPLUVIUM");
         irrigation_change_state(IRRIGATION_MAINTENANCE);
         return ESP_FAIL;
     }
@@ -1216,13 +1274,13 @@ static esp_err_t irrigation_state_watering(void)
     pcnt_unit_clear_count(flow_pcnt_unit);
     pcnt_unit_get_count(flow_pcnt_unit, (int *) &irrigation_system.watering_start_pulses);
     irrigation_system.active_zone = zone_id;
-    zone->currently_watering = true;
+    zone->watering_in_progress = true;
     zone->last_watered_timestamp = time(NULL);
-    zone->watering_start_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    irrigation_system.watering_start_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
 
     // Store starting moisture for learning algorithm
     irrigation_system.watering_queue[irrigation_system.queue_index].moisture_at_start_percent =
-        irrigation_system.watering_queue[irrigation_system.queue_index].current_moisture_percent;
+        irrigation_system.watering_queue[irrigation_system.queue_index].measured_moisture_percent;
 
     // Notify monitoring task to start continuous monitoring
     xTaskNotify(xIrrigationMonitoringTaskHandle, MONITORING_TASK_NOTIFY_START_MONITORING, eSetBits);
@@ -1244,13 +1302,13 @@ static esp_err_t irrigation_state_stopping(void)
 
     // Stop pump
     irrigation_set_pump_speed(0);
-    ESP_LOGI(TAG, "Pump stopped - waiting %dms for pressure equalization", PRESSURE_EQUALIZE_DELAY_MS);
+    ESP_LOGI(TAG, "Pump stopped - delaying %dms for pressure equalization", PRESSURE_EQUALIZE_DELAY_MS);
     vTaskDelay(pdMS_TO_TICKS(PRESSURE_EQUALIZE_DELAY_MS));
 
     // Close current zone valve
     if (active_zone < IRRIGATION_ZONE_COUNT) {
         gpio_set_level(irrigation_zones[active_zone].valve_gpio, 0);
-        irrigation_zones[active_zone].currently_watering = false;
+        irrigation_zones[active_zone].watering_in_progress = false;
     } else {
         ESP_LOGE(TAG, "Invalid active zone in STOPPING state: %d", active_zone);
     }
@@ -1270,22 +1328,41 @@ static esp_err_t irrigation_state_stopping(void)
             watering_queue_item_t *queue_item = &irrigation_system.watering_queue[irrigation_system.queue_index];
             float moisture_increase_percent = final_moisture_percent - queue_item->moisture_at_start_percent;
 
-            // Check for anomalies that would invalidate learning
+            // Check for anomalies that would invalidate learning data
+            // Note: Temperature check is for learning validity only - safety was already verified before watering
             float current_temperature = weather_get_temperature();
 
             if (irrigation_system.current_anomaly.type != ANOMALY_NONE ||
-                current_temperature == WEATHER_INVALID_VALUE || current_temperature < TEMP_EXTREME_LOW ||
-                current_temperature > TEMP_EXTREME_HIGH) {
+                current_temperature == WEATHER_INVALID_VALUE || 
+                current_temperature < TEMP_EXTREME_LOW || current_temperature > TEMP_EXTREME_HIGH) {
                 learning_valid = false;
-                ESP_LOGW(TAG,
-                         "Zone %d: Anomaly detected (type=%d, temp=%.1f°C), not using for learning",
+                ESP_LOGD(TAG,
+                         "Zone %d: Learning data invalidated (anomaly=%d, temp=%.1f°C) - extreme conditions affect soil behavior",
                          active_zone,
                          irrigation_system.current_anomaly.type,
                          current_temperature);
             }
 
+            // Calculate watering duration for gain rate learning
+            uint32_t current_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
+            uint32_t watering_duration_ms = current_time - irrigation_system.watering_start_time;
+            
             // Update learning algorithm with results
-            irrigation_log_zone_watering_data(active_zone, pulses_used, moisture_increase_percent, learning_valid);
+            irrigation_process_zone_watering_data(active_zone, pulses_used, moisture_increase_percent, learning_valid);
+            
+            // Learn optimal target moisture gain rate (only for valid, reasonable cycles)
+            if (learning_valid && watering_duration_ms > 5000 && watering_duration_ms < 60000) { // 5s to 60s range
+                float actual_gain_rate = moisture_increase_percent / (watering_duration_ms / 1000.0f);
+                if (actual_gain_rate > 0.1f && actual_gain_rate < 2.0f) { // Reasonable gain rate range
+                    zone_learning_t *learning = &irrigation_zones[active_zone].learning;
+                    // Update target gain rate with exponential moving average (5% new, 95% old for slower adaptation)
+                    learning->target_moisture_gain_rate = 
+                        (learning->target_moisture_gain_rate * 0.95f) + (actual_gain_rate * 0.05f);
+                    
+                    ESP_LOGI(TAG, "Zone %d: Updated target gain rate: %.2f %%/sec (measured %.2f %%/sec over %lu s)", 
+                             active_zone, learning->target_moisture_gain_rate, actual_gain_rate, watering_duration_ms / 1000);
+                }
+            }
 
             ESP_LOGI(TAG,
                      "Zone %d: Used %lu pulses, %.1fmL, moisture %.1f%%->%.1f%% (+%.1f%%)",
@@ -1298,7 +1375,7 @@ static esp_err_t irrigation_state_stopping(void)
         }
 
         // Mark current queue item as completed
-        irrigation_system.watering_queue[irrigation_system.queue_index].completed = true;
+        irrigation_system.watering_queue[irrigation_system.queue_index].watering_completed = true;
     }
 
     // Reset anomaly detection for next zone
@@ -1431,9 +1508,23 @@ static esp_err_t irrigation_pre_check(void)
     if (current_temperature == WEATHER_INVALID_VALUE) {
         ESP_LOGE(TAG, "Pre-check failed: Temperature sensors unavailable");
         return ESP_FAIL;
-    } else if (current_temperature < MIN_TEMPERATURE_WATERING) {
+    }
+    
+    // Global temperature safety limits (wider range for system protection)
+    if (current_temperature < MIN_TEMPERATURE_GLOBAL || current_temperature > MAX_TEMPERATURE_GLOBAL) {
+        ESP_LOGE(TAG,
+                 "Pre-check failed: Temperature %.1f°C outside global safety range (%.1f°C to %.1f°C)",
+                 current_temperature,
+                 MIN_TEMPERATURE_GLOBAL,
+                 MAX_TEMPERATURE_GLOBAL);
+        irrigation_emergency_stop("Temperature outside global safety range");
+        return ESP_FAIL;
+    }
+    
+    // Watering-specific temperature limits (narrower range for optimal operation)
+    if (current_temperature < MIN_TEMPERATURE_WATERING) {
         ESP_LOGW(TAG,
-                 "Pre-check failed: Temperature %.1f°C is below minimum %.1f°C",
+                 "Pre-check failed: Temperature %.1f°C is below watering minimum %.1f°C",
                  current_temperature,
                  MIN_TEMPERATURE_WATERING);
         return ESP_FAIL;
@@ -1525,9 +1616,9 @@ static esp_err_t irrigation_watering_cutoffs_check(const char *task_tag, uint32_
     }
 
     // Check if target pulses reached
-    int current_pulses;
-    if (pcnt_unit_get_count(flow_pcnt_unit, &current_pulses) == ESP_OK) {
-        uint32_t pulses_used = current_pulses - irrigation_system.watering_start_pulses;
+    int pulse_count;
+    if (pcnt_unit_get_count(flow_pcnt_unit, &pulse_count) == ESP_OK) {
+        uint32_t pulses_used = pulse_count - irrigation_system.watering_start_pulses;
 
         if (pulses_used >= queue_item->target_pulses) {
             ESP_LOGI(task_tag,
@@ -1541,10 +1632,10 @@ static esp_err_t irrigation_watering_cutoffs_check(const char *task_tag, uint32_
     }
 
     // Check moisture level and safety margin
-    float current_moisture_percent;
-    if (irrigation_read_moisture_sensor(irrigation_system.active_zone, &current_moisture_percent) == ESP_OK) {
+    float measured_moisture_percent;
+    if (irrigation_read_moisture_sensor(irrigation_system.active_zone, &measured_moisture_percent) == ESP_OK) {
         // Calculate, store, and check the current moisture gain rate
-        float moisture_increase = current_moisture_percent - queue_item->moisture_at_start_percent;
+        float moisture_increase = measured_moisture_percent - queue_item->moisture_at_start_percent;
 
         if (time_since_start_ms > 1000) { // Calculate after 1 second to get a meaningful rate
             irrigation_system.current_moisture_gain_rate = (moisture_increase / (time_since_start_ms / 1000.0f));
@@ -1566,20 +1657,20 @@ static esp_err_t irrigation_watering_cutoffs_check(const char *task_tag, uint32_
             irrigation_system.current_moisture_gain_rate = 0.0f;
         }
 
-        // Check safety margin (target - 2%)
+        // Check if moisture reached target - with safety margin (target - 2%)
         float safety_target = active_zone->target_moisture_percent - 2.0f;
-        if (current_moisture_percent >= safety_target) {
+        if (measured_moisture_percent >= safety_target) {
             ESP_LOGI(task_tag,
                      "Zone %d safety margin reached: %.1f%% >= %.1f%%",
                      irrigation_system.active_zone,
-                     current_moisture_percent,
+                     measured_moisture_percent,
                      safety_target);
             xTaskNotify(xIrrigationTaskHandle, IRRIGATION_TASK_NOTIFY_WATERING_CUTOFF, eSetBits);
             return ESP_OK;
         }
 
         // Store for anomaly detection
-        irrigation_system.last_moisture_reading_percent = current_moisture_percent;
+        irrigation_system.last_moisture_reading_percent = measured_moisture_percent;
     }
 
     return ESP_FAIL; // Continue watering
@@ -1591,7 +1682,7 @@ static esp_err_t irrigation_watering_cutoffs_check(const char *task_tag, uint32_
  */
 static bool irrigation_periodic_safety_check(uint32_t *error_count, uint32_t time_since_start_ms)
 {
-    // Allow 4 consecutive errors before emergency stop (immediate if current exceeds MAX_OUTPUT_CURRENT_AMPS)
+    // Allow 4 consecutive errors before emergency stop (immediate if current exceeds limits set in FLUCTUS)
     const uint32_t MAX_ERROR_COUNT = 4;
     const char *failure_reason = NULL;
 
@@ -1725,7 +1816,7 @@ static esp_err_t emergency_diagnostics_check_moisture_levels(void)
     irrigation_system.emergency.eligible_zones_mask = 0;
 
     for (uint8_t zone_id = 0; zone_id < IRRIGATION_ZONE_COUNT; zone_id++) {
-        if (!irrigation_zones[zone_id].enabled)
+        if (!irrigation_zones[zone_id].watering_enabled)
             continue;
 
         float moisture_percent;
@@ -1956,7 +2047,7 @@ static esp_err_t emergency_diagnostics_analyze_results(void)
             ESP_LOGI(TAG, "Disabling failed zones and continuing operation");
             for (uint8_t i = 0; i < IRRIGATION_ZONE_COUNT; i++) {
                 if (irrigation_system.emergency.failed_zones_mask & (1 << i)) {
-                    irrigation_zones[i].enabled = false;
+                    irrigation_zones[i].watering_enabled = false;
                     ESP_LOGW(TAG, "Zone %d disabled due to diagnostic failure", i);
                 }
             }
@@ -1987,7 +2078,7 @@ static esp_err_t emergency_diagnostics_resolve(void)
     // Log detailed results for maintenance records
     ESP_LOGI(TAG, "Diagnostic test results:");
     for (uint8_t i = 0; i < IRRIGATION_ZONE_COUNT; i++) {
-        if (irrigation_zones[i].enabled || (irrigation_system.emergency.failed_zones_mask & (1 << i))) {
+        if (irrigation_zones[i].watering_enabled || (irrigation_system.emergency.failed_zones_mask & (1 << i))) {
             ESP_LOGI(TAG,
                      "  Zone %d: Flow %.1f L/h, Pressure %.2f bar, %s",
                      i,
@@ -2205,7 +2296,7 @@ static void irrigation_monitoring_task(void *pvParameters)
         if (continuous_monitoring && irrigation_system.state == IRRIGATION_WATERING) {
             uint32_t current_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
             uint32_t time_since_start_ms =
-                current_time - irrigation_zones[irrigation_system.active_zone].watering_start_time;
+                current_time - irrigation_system.watering_start_time;
 
 
             // Update flow rate

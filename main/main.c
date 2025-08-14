@@ -14,8 +14,6 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 
-#include "bmp280.h"
-#include "sht4x.h"
 #include "ads1115_helper.h"
 #include "irrigation.h"
 #include "weather_station.h"
@@ -35,13 +33,12 @@
 #include "esp_sntp.h"
 #include <time.h>
 
-
 #include "main.h"
 #include "wifi_credentials.h"
 
 
 // ########################## Global Variable Definitions ##########################
-#define TAG "WS_SOLARIUM_1"
+#define TAG "SOLARIUM_1"
 
 // Mutex for protecting shared display data
 SemaphoreHandle_t xDisplayDataMutex = NULL;
@@ -64,9 +61,9 @@ static bool g_time_synced = false;
 
 
 // ########################## FUNCTION DECLARATIONS ################################
-// No ADS1115 functions needed - handled by ads1115_helper component
 
-// ########################## FUNCTIONS ################################
+
+// ################################ FUNCTIONS ######################################
 // ------- WiFI and Simple Network Time Protocol Synchronization -------
 
 // Wi-Fi credentials are in wifi_credentials.h
@@ -280,9 +277,9 @@ void serial_debug_display_task(void *pvParameters)
     }
 }
 
-// -----------------##############################-----------------
-// -----------------############# MAIN ###########-----------------
-// -----------------##############################-----------------
+// -----------------##########################################-----------------
+// -----------------################### MAIN #################-----------------
+// -----------------##########################################-----------------
 
 void app_main(void)
 {
@@ -375,7 +372,7 @@ void app_main(void)
 
     // Initialize IMPLUVIUM irrigation system
     // TODO: create init function to start task
-    ESP_LOGI(TAG, "Initializing IMPLUVIUM ambient lighting...");
+    ESP_LOGI(TAG, "Initializing IMPLUVIUM irrigation system...");
     esp_err_t impluvium_ret = impluvium_init();
     if (impluvium_ret != ESP_OK) {
         ESP_LOGE(TAG, "IMPLUVIUM initialization failed: %s", esp_err_to_name(impluvium_ret));

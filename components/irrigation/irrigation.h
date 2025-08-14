@@ -23,6 +23,8 @@
 #define MAX_PRESSURE_BAR 2.5f                     // 3 bar pressure limit
 #define MIN_FLOW_RATE_LH 15.0f                    // 15 L/h minimum flow
 #define MIN_TEMPERATURE_WATERING 10.0f            // 10°C minimum temp
+#define MIN_TEMPERATURE_GLOBAL 0.0f               // 0°C global system safety limit
+#define MAX_TEMPERATURE_GLOBAL 50.0f              // 50°C global system safety limit
 #define MIN_WATER_LEVEL_MBAR 15.0f                // 15 mbar minimum level // Use percentage??
 #define MIN_WATER_LEVEL_PERCENT 5.0f              // % minimum level
 
@@ -84,6 +86,7 @@
 #define LEARNING_MIN_CYCLES 3                                                     // Start predictions after 3 cycles
 #define LEARNING_WEIGHT_RECENT 0.7f                                               // Weight recent cycles more
 #define DEFAULT_TARGET_PULSES 80                                                  // Default starting target (200mL)
+#define DEFAULT_PULSES_PER_PERCENT 8.0f                                           // Default pulses per 1% moisture gain
 #define MINIMUM_TARGET_PULSES 20                                                  // Minimum target pulses
 #define MAXIMUM_TARGET_PULSES 300                                                 // Maximum target pulses
 
@@ -131,14 +134,14 @@ typedef enum {
 
 // Learning Algorithm Data Structures
 typedef struct {
-    float pulse_amount_history[LEARNING_HISTORY_SIZE];              // Last 15 cycles of pulses used
+    float pulses_used_history[LEARNING_HISTORY_SIZE];               // Last 15 cycles of pulses used
     float moisture_increase_percent_history[LEARNING_HISTORY_SIZE]; // Corresponding moisture increases in percent
     bool anomaly_flags[LEARNING_HISTORY_SIZE];                      // Mark anomalous cycles
     uint8_t history_entry_count;                                    // Valid entries (0-15)
     uint8_t history_index;                                          // Current write position
     float last_temperature_correction;                              // Last used temperature factor
-    float current_pulses_per_percent;                               // Current learned ratio
-    uint32_t learned_pump_duty_cycle;                               // Optimal pump speed for this zone
+    float calculated_ppmp_ratio;                                    // Most recent learned pulses per moisture percent ratio
+    uint32_t calculated_pump_duty_cycle;                            // Optimal pump speed for this zone
     float target_moisture_gain_rate;                                // Learned optimal moisture gain rate (%/sec)
     float confidence_level;                                         // Learning confidence (0.0-1.0)
     uint32_t successful_predictions;                                // Count of accurate predictions
@@ -148,10 +151,10 @@ typedef struct {
 // Watering Queue Item
 typedef struct {
     uint8_t zone_id;                 // Zone to water
-    float current_moisture_percent;  // Current moisture level (%)
+    float measured_moisture_percent; // Current moisture level (%)
     float moisture_deficit_percent;  // How much below target (%)
     uint16_t target_pulses;          // Predicted pulses needed
-    bool completed;                  // Whether this zone has been watered
+    bool watering_completed;         // Whether this zone has been watered
     float moisture_at_start_percent; // Moisture when watering started (%)
 } watering_queue_item_t;
 
@@ -178,11 +181,10 @@ typedef struct {
     ads111x_mux_t moisture_channel;  // Channel on ADS device
     float target_moisture_percent;   // Desired moisture level (0-100%)
     float moisture_deadband_percent; // Tolerance around target (±%)
-    bool enabled;                    // Zone active/disabled
+    bool watering_enabled;           // Zone active/disabled
     time_t last_watered_timestamp;   // Last watering timestamp
     float volume_used_today;         // Daily water usage (mL)
-    bool currently_watering;         // Watering in progress flag
-    uint32_t watering_start_time;    // When current watering started
+    bool watering_in_progress;       // Watering in progress flag
     zone_learning_t learning;        // Learning algorithm data
 } irrigation_zone_t;
 
@@ -239,6 +241,7 @@ typedef struct {
     bool load_shed_shutdown;                                     // Load shedding shutdown flag
     uint32_t state_start_time;                                   // When current state started
     uint32_t system_start_time;                                  // System startup timestamp
+    uint32_t watering_start_time;                                // When current watering started (global, only one zone waters at a time)
     uint32_t last_moisture_check;                                // Last time all zones were checked
     float last_moisture_reading_percent;                         // For anomaly detection
     watering_anomaly_t current_anomaly;                          // Current watering anomaly status
