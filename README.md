@@ -3,7 +3,8 @@
 ![solarium Diagram drawio](https://github.com/user-attachments/assets/f8a33487-a0ce-4170-98f9-2d25f3874cc6)
 
 ## TOPO / Work in progres...
-![solarium_topo](https://github.com/user-attachments/assets/280681a4-334b-440a-87eb-2bbc38d0e573)
+![solarium_topo](https://github.com/user-attachments/assets/24fc8973-ec19-44c9-9583-1ec91f9fd074)
+
 
 ## Overview
 
