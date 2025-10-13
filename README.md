@@ -6,10 +6,6 @@
 
 Solarium is an ESP32-S3 based garden automation system that combines intelligent irrigation, weather monitoring, solar tracking, and power management. The system is designed with a modular architecture using ESP-IDF and FreeRTOS, with each major subsystem implemented as separate components that can operate independently or as part of a distributed network.
 
-![solarium_topo-1](https://github.com/user-attachments/assets/5801f9b7-c7d6-40f8-a188-8f4dde045b36)
-
-![20251013_135107](https://github.com/user-attachments/assets/67a5d10f-e1c2-459f-9a77-ee2e89fb2cb5)
-
 ## System Architecture
 
 The current Alpha implementation runs on a single ESP32-S3 managing four main subsystems.
@@ -27,6 +23,8 @@ The current Alpha implementation runs on a single ESP32-S3 managing four main su
 
 
 ## Technical Features
+
+![solarium_topo-1](https://github.com/user-attachments/assets/5801f9b7-c7d6-40f8-a188-8f4dde045b36)
 
 ### Power Management
 - Battery monitoring with voltage-based load shedding
@@ -70,6 +68,9 @@ All components implement coordinated load shedding APIs:
 This Alpha stage focuses on single-node operation with integrated power management and a temporary blackbox MPPT. The planned Beta architecture will transition to a distributed multi-node system with dedicated controllers for power management, RS485/ESP-NOW communication, and Linux server integration through Home Assistant or database systems.
 
 Current implementation includes complete integration of all four subsystems with centralized FLUCTUS power management, comprehensive load shedding communication, and thread-safe operation across concurrent FreeRTOS tasks.
+
+
+![20251013_135107](https://github.com/user-attachments/assets/67a5d10f-e1c2-459f-9a77-ee2e89fb2cb5)
 
 ## Work in progres...
 
