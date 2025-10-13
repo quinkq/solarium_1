@@ -1,17 +1,21 @@
 # Solarium - Solar-Powered Garden Automation System
 
-![solarium Diagram drawio](https://github.com/user-attachments/assets/f8a33487-a0ce-4170-98f9-2d25f3874cc6)
 
-## TOPO / Work in progres...
-![solarium_topo](https://github.com/user-attachments/assets/d714897d-26e3-4068-8028-b2d3f63f3308)
 
 ## Overview
 
 Solarium is an ESP32-S3 based garden automation system that combines intelligent irrigation, weather monitoring, solar tracking, and power management. The system is designed with a modular architecture using ESP-IDF and FreeRTOS, with each major subsystem implemented as separate components that can operate independently or as part of a distributed network.
 
+![topo_solarium2](https://github.com/user-attachments/assets/df71ecff-5c8a-4e83-9b31-8531c0178018)
+
+
+![20251013_135107](https://github.com/user-attachments/assets/67a5d10f-e1c2-459f-9a77-ee2e89fb2cb5)
+
 ## System Architecture
 
-The current Alpha implementation runs on a single ESP32-S3 with four main subsystems:
+The current Alpha implementation runs on a single ESP32-S3 managing four main subsystems.
+
+![solarium Diagram drawio](https://github.com/user-attachments/assets/f8a33487-a0ce-4170-98f9-2d25f3874cc6)
 
 **IMPLUVIUM (Irrigation)**: Multi-zone irrigation controller with learning algorithms that adjust watering based on historical data and temperature readings. Implements safety interlocks including over-pressure, low-flow, and empty tank detection. Features emergency diagnostics to isolate faults between system-wide (pump/filter) and zone-specific (valve) issues.
 
@@ -20,6 +24,8 @@ The current Alpha implementation runs on a single ESP32-S3 with four main subsys
 **TEMPESTA (Weather Station)**: Environmental monitoring using SHT4x (temperature/humidity), BME280 (t/h/pressure), AS5600 (wind speed via rotary encoder), and PMS5003 (air quality). Will feature custom wind measurement with triple-cup anemometer, rainfall detection via tipping bucket HAL sensor, and sensor fusion with historical averaging.
 
 **STELLARIA (Ambient Lighting)**: LED lighting control with constant current driver, PWM intensity control, and automatic light sensing with hysteresis. Integrates with power management for load shedding support.
+
+
 
 ## Technical Features
 
@@ -58,7 +64,7 @@ All components implement coordinated load shedding APIs:
 
 **Power**: Solar panel input, battery bank, multi-stage voltage regulation, INA219 power monitoring
 
-**Communication**: I2C, SPI, UART, GPIO, PWM interfaces
+**Communication**: I2C, SPI, UART, GPIO, 1Wire, PWM interfaces
 
 ## Development Status
 
@@ -68,4 +74,3 @@ Current implementation includes complete integration of all four subsystems with
 
 ## Work in progres...
 
-![Zdjęcie WhatsApp 2025-05-09 o 20 46 51_e84f5e36](https://github.com/user-attachments/assets/1abb4618-83d8-4f8f-a14d-57da2c8549b5)
