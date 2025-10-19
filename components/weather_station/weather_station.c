@@ -1,6 +1,7 @@
 #include "weather_station.h"
 #include "main.h"
 #include "fluctus.h"
+#include "telemetry.h"
 
 #include <string.h>
 #include <math.h>
@@ -41,7 +42,7 @@
 
 // Thread-safe data protection
 static SemaphoreHandle_t xWeatherDataMutex = NULL;
-static WeatherData weather_data = {0};
+static tempesta_snapshot_t weather_data = {0};
 static weather_calculation_data_t calculation_data = {0};
 
 // Load shedding state variables
@@ -93,7 +94,7 @@ typedef struct {
 
 // Initialization functions
 static esp_err_t weather_hardware_init(void);
-static esp_err_t weather_sensors_init(void);
+static esp_err_t weather_i2c_sensors_init(void);
 static esp_err_t weather_rainfall_sensor_init(void);
 static esp_err_t weather_pms5003_init(void);
 
@@ -191,8 +192,8 @@ esp_err_t weather_station_init(void)
     calculation_data.temp_history_index = 0;
     calculation_data.temp_history_count = 0;
 
-    // Initialize rainfall tracking for hourly calculations
-    calculation_data.last_rainfall_reset_time = time(NULL);
+    // Initialize rainfall tracking for hourly calculations (using monotonic time)
+    calculation_data.last_rainfall_reset_time_ms = esp_timer_get_time() / 1000;
     calculation_data.rainfall_last_hour = 0.0f;
 
     // Initialize hardware and sensors
@@ -202,7 +203,7 @@ esp_err_t weather_station_init(void)
         goto cleanup_mutex;
     }
 
-    ret = weather_sensors_init();
+    ret = weather_i2c_sensors_init();
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Some sensors failed to initialize: %s", esp_err_to_name(ret));
         // Continue anyway - individual sensors will be marked as unavailable
@@ -311,7 +312,7 @@ static esp_err_t weather_hardware_init(void)
 /**
  * @brief Initialize I2C sensors (SHT4x, BME280, AS5600)
  */
-static esp_err_t weather_sensors_init(void)
+static esp_err_t weather_i2c_sensors_init(void)
 {
     esp_err_t ret;
     bool any_sensor_ok = false;
@@ -558,6 +559,9 @@ static esp_err_t weather_read_pms5003(pms5003_data_t *data, weather_sensor_statu
     for (int retry = 0; retry < WEATHER_PMS5003_RETRY_COUNT; retry++) {
         uint8_t buffer[32];
 
+        // Clear any stale data from UART buffer before reading
+        uart_flush_input(WEATHER_PMS5003_UART_NUM);
+
         // Read data with timeout
         int len = uart_read_bytes(WEATHER_PMS5003_UART_NUM, buffer, sizeof(buffer), pdMS_TO_TICKS(1000));
         if (len <= 0) {
@@ -655,16 +659,17 @@ static esp_err_t weather_read_and_process_rainfall(void)
              WEATHER_RAIN_MM3_PER_PULSE,
              WEATHER_RAIN_COLLECTION_AREA_MM2);
 
-    // Calculate hourly rainfall rate
-    time_t current_time = time(NULL);
+    // Calculate hourly rainfall rate using monotonic time
+    int64_t current_time_ms = esp_timer_get_time() / 1000;
     float hourly_rate = 0.0f;
 
-    if (calculation_data.last_rainfall_reset_time > 0) {
-        uint32_t time_diff_seconds = current_time - calculation_data.last_rainfall_reset_time;
+    if (calculation_data.last_rainfall_reset_time_ms > 0) {
+        int64_t time_diff_ms = current_time_ms - calculation_data.last_rainfall_reset_time_ms;
+        uint32_t time_diff_seconds = time_diff_ms / 1000;
         if (time_diff_seconds >= 3600) { // If an hour has passed
             hourly_rate = calculation_data.rainfall_last_hour;
             calculation_data.rainfall_last_hour = 0.0f; // Reset for next hour
-            calculation_data.last_rainfall_reset_time = current_time;
+            calculation_data.last_rainfall_reset_time_ms = current_time_ms;
         } else {
             // Calculate current hourly rate based on accumulation
             if (time_diff_seconds > 0) {
@@ -672,7 +677,7 @@ static esp_err_t weather_read_and_process_rainfall(void)
             }
         }
     } else {
-        calculation_data.last_rainfall_reset_time = current_time;
+        calculation_data.last_rainfall_reset_time_ms = current_time_ms;
     }
 
     // Update weather data with successful reading
@@ -1189,8 +1194,11 @@ static void weather_main_task(void *pvParameters)
             xSemaphoreGive(xWeatherDataMutex);
         }
 
+        // Inject data to TELEMETRY central hub
+        telemetry_update_tempesta();
+
         weather_release_power_buses(should_read_pms5003);
-        
+
         ESP_LOGI(task_tag, "Weather data collection cycle completed");
         weather_log_summary();
     }
@@ -1288,157 +1296,38 @@ static void weather_as5600_sampling_task(void *pvParameters)
 // ########################## Public API Functions ##########################
 
 /**
- * @brief Get current temperature (thread-safe)
- * This function replaces latest_sht_temp for irrigation system
+ * @brief Get comprehensive weather data snapshot (single mutex operation)
  */
-float weather_get_temperature(void)
+esp_err_t tempesta_get_data_snapshot(tempesta_snapshot_t *data)
 {
-    float temperature = WEATHER_INVALID_VALUE;
-    
-    if (xSemaphoreTake(xWeatherDataMutex, pdMS_TO_TICKS(WEATHER_MUTEX_TIMEOUT_QUICK_MS)) == pdTRUE) {
-        temperature = weather_data.temperature;
-        xSemaphoreGive(xWeatherDataMutex);
-    }
-    
-    return temperature;
-}
-
-/**
- * @brief Get current humidity (thread-safe)
- */
-float weather_get_humidity(void)
-{
-    float humidity = WEATHER_INVALID_VALUE;
-
-    if (xSemaphoreTake(xWeatherDataMutex, pdMS_TO_TICKS(WEATHER_MUTEX_TIMEOUT_QUICK_MS)) == pdTRUE) {
-        humidity = weather_data.humidity;
-        xSemaphoreGive(xWeatherDataMutex);
-    }
-
-    return humidity;
-}
-
-/**
- * @brief Get current pressure (thread-safe)
- */
-float weather_get_pressure(void)
-{
-    float pressure = WEATHER_INVALID_VALUE;
-
-    if (xSemaphoreTake(xWeatherDataMutex, pdMS_TO_TICKS(WEATHER_MUTEX_TIMEOUT_QUICK_MS)) == pdTRUE) {
-        pressure = weather_data.pressure;
-        xSemaphoreGive(xWeatherDataMutex);
-    }
-
-    return pressure;
-}
-
-/**
- * @brief Get current air quality readings (thread-safe)
- */
-esp_err_t weather_get_air_quality(float *pm25, float *pm10)
-{
-    if (!pm25 || !pm10) {
+    if (data == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
 
     if (xSemaphoreTake(xWeatherDataMutex, pdMS_TO_TICKS(WEATHER_MUTEX_TIMEOUT_QUICK_MS)) == pdTRUE) {
-        *pm25 = weather_data.air_quality_pm25;
-        *pm10 = weather_data.air_quality_pm10;
-        
-        // Check sensor status while still holding mutex
-        weather_sensor_status_t status = weather_data.air_quality_status;
-        xSemaphoreGive(xWeatherDataMutex);
-
-        // Return success only if air quality sensor is working
-        return (status == WEATHER_SENSOR_OK) ? ESP_OK : ESP_FAIL;
-    }
-
-    return ESP_ERR_TIMEOUT;
-}
-
-/**
- * @brief Get current wind speed in RPM (thread-safe)
- */
-float weather_get_wind_speed_rpm(void)
-{
-    float wind_speed = WEATHER_INVALID_VALUE;
-
-    if (xSemaphoreTake(xWeatherDataMutex, pdMS_TO_TICKS(WEATHER_MUTEX_TIMEOUT_QUICK_MS)) == pdTRUE) {
-        wind_speed = weather_data.wind_speed_rpm;
-        xSemaphoreGive(xWeatherDataMutex);
-    }
-
-    return wind_speed;
-}
-
-/**
- * @brief Get current wind speed in m/s (thread-safe)
- */
-float weather_get_wind_speed_ms(void)
-{
-    float wind_speed = WEATHER_INVALID_VALUE;
-
-    if (xSemaphoreTake(xWeatherDataMutex, pdMS_TO_TICKS(WEATHER_MUTEX_TIMEOUT_QUICK_MS)) == pdTRUE) {
-        wind_speed = weather_data.wind_speed_ms;
-        xSemaphoreGive(xWeatherDataMutex);
-    }
-
-    return wind_speed;
-}
-
-/**
- * @brief Get accumulated rainfall and optionally reset counter (thread-safe)
- */
-float weather_get_rainfall_mm(bool reset_counter)
-{
-    float rainfall = WEATHER_INVALID_VALUE;
-
-    if (xSemaphoreTake(xWeatherDataMutex, pdMS_TO_TICKS(WEATHER_MUTEX_TIMEOUT_QUICK_MS)) == pdTRUE) {
-        rainfall = weather_data.rainfall_mm;
-
-        if (reset_counter && rain_pcnt_unit_handle != NULL) {
-            // Reset the pulse counter
-            esp_err_t ret = pcnt_unit_clear_count(rain_pcnt_unit_handle);
-            if (ret == ESP_OK) {
-                weather_data.rainfall_mm = 0.0f;
-                ESP_LOGI(TAG, "Rainfall counter reset (was %.3f mm)", rainfall);
-            } else {
-                ESP_LOGW(TAG, "Failed to reset rainfall counter: %s", esp_err_to_name(ret));
-            }
-        }
-
-        xSemaphoreGive(xWeatherDataMutex);
-    }
-
-    return rainfall;
-}
-
-/**
- * @brief Get human-readable sensor status
- */
-esp_err_t weather_get_status_string(char *status_buffer, size_t buffer_size)
-{
-    if (!status_buffer || buffer_size < 200) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    if (xSemaphoreTake(xWeatherDataMutex, pdMS_TO_TICKS(WEATHER_MUTEX_TIMEOUT_QUICK_MS)) == pdTRUE) {
-        snprintf(status_buffer,
-                 buffer_size,
-                 "Weather Status: T:%s H:%s P:%s AQ:%s Wind:%s Rain:%s",
-                 (weather_data.temp_sensor_status == WEATHER_SENSOR_OK) ? "OK" : "ERR",
-                 (weather_data.humidity_sensor_status == WEATHER_SENSOR_OK) ? "OK" : "ERR",
-                 (weather_data.pressure_sensor_status == WEATHER_SENSOR_OK) ? "OK" : "ERR",
-                 (weather_data.air_quality_status == WEATHER_SENSOR_OK) ? "OK" : "ERR",
-                 (weather_data.wind_sensor_status == WEATHER_SENSOR_OK) ? "OK" : "ERR",
-                 (weather_data.rain_sensor_status == WEATHER_SENSOR_OK) ? "OK" : "ERR");
-
+        // Single efficient copy of entire structure
+        memcpy(data, &weather_data, sizeof(tempesta_snapshot_t));
         xSemaphoreGive(xWeatherDataMutex);
         return ESP_OK;
     }
 
-    return ESP_ERR_TIMEOUT;
+    return ESP_FAIL;
+}
+
+/**
+ * @brief Get current temperature for IMPLUVIUM integration (thread-safe)
+ * @note This is a legacy function for irrigation temperature correction
+ */
+float weather_get_temperature(void)
+{
+    float temperature = WEATHER_INVALID_VALUE;
+
+    if (xSemaphoreTake(xWeatherDataMutex, pdMS_TO_TICKS(WEATHER_MUTEX_TIMEOUT_QUICK_MS)) == pdTRUE) {
+        temperature = weather_data.temperature;
+        xSemaphoreGive(xWeatherDataMutex);
+    }
+
+    return temperature;
 }
 
 // ########################## Load Shedding Functions ##########################

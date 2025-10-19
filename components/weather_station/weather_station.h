@@ -27,7 +27,7 @@
 #define WEATHER_MUTEX_TIMEOUT_UPDATE_MS 1000 // For data updates/init
 
 // GPIO Configuration
-#define WEATHER_RAINFALL_GPIO 4             // Hall sensor for rainfall (GPIO4)
+#define WEATHER_RAINFALL_GPIO 19             // Hall sensor for rainfall (GPIO4)
 #define WEATHER_PMS5003_TX_GPIO 43          // PMS5003 UART TX (GPIO43)
 #define WEATHER_PMS5003_RX_GPIO 44          // PMS5003 UART RX (GPIO44)
 #define WEATHER_PMS5003_UART_NUM UART_NUM_1 // Use UART1
@@ -67,7 +67,7 @@ typedef struct {
     weather_sensor_status_t air_quality_status;
     weather_sensor_status_t wind_sensor_status;
     weather_sensor_status_t rain_sensor_status;
-} WeatherData;
+} tempesta_snapshot_t;
 
 typedef struct {
     // Temperature averaging
@@ -81,7 +81,7 @@ typedef struct {
     uint8_t humidity_history_count;
 
     // Rainfall tracking for hourly calculations
-    time_t last_rainfall_reset_time;
+    int64_t last_rainfall_reset_time_ms;  // Monotonic time in milliseconds
     float rainfall_last_hour;
 } weather_calculation_data_t;
 
@@ -94,79 +94,18 @@ typedef struct {
 esp_err_t weather_station_init(void);
 
 /**
- * @brief Get current weather data (thread-safe)
- * @param[out] data Pointer to WeatherData structure to fill
+ * @brief Get comprehensive weather data snapshot (single mutex operation)
+ * @param[out] data Pointer to tempesta_snapshot_t structure to fill
  * @return ESP_OK on success, ESP_ERR_INVALID_ARG on null pointer
  */
-esp_err_t weather_get_data(WeatherData *data);
+esp_err_t tempesta_get_data_snapshot(tempesta_snapshot_t *data);
 
 /**
- * @brief Get current temperature (thread-safe)
+ * @brief Get current temperature for IMPLUVIUM integration (thread-safe)
+ * @note This is a legacy function for irrigation temperature correction
  * @return Current averaged temperature in °C, or WEATHER_INVALID_VALUE on error
  */
 float weather_get_temperature(void);
-
-/**
- * @brief Get current humidity (thread-safe)
- * @return Current humidity in %, or WEATHER_INVALID_VALUE on error
- */
-float weather_get_humidity(void);
-
-/**
- * @brief Get current pressure (thread-safe)
- * @return Current pressure in hPa, or WEATHER_INVALID_VALUE on error
- */
-float weather_get_pressure(void);
-
-/**
- * @brief Get current air quality readings (thread-safe)
- * @param[out] pm25 PM2.5 in ug/m3
- * @param[out] pm10 PM10 in ug/m3
- * @return ESP_OK on success, ESP_FAIL if air quality sensor unavailable
- */
-esp_err_t weather_get_air_quality(float *pm25, float *pm10);
-
-/**
- * @brief Get current wind speed in RPM (thread-safe)
- * @return Wind speed in RPM, or WEATHER_INVALID_VALUE on error
- */
-float weather_get_wind_speed_rpm(void);
-
-/**
- * @brief Get current wind speed in m/s (thread-safe)
- * @return Wind speed in m/s, or WEATHER_INVALID_VALUE on error
- */
-float weather_get_wind_speed_ms(void);
-
-/**
- * @brief Get accumulated rainfall and optionally reset counter (thread-safe)
- * @param reset_counter If true, reset the rainfall accumulator after reading
- * @return Accumulated rainfall in mm, or WEATHER_INVALID_VALUE on error
- */
-float weather_get_rainfall_mm(bool reset_counter);
-
-/**
- * @brief Convert pulse count to rainfall depth in mm
- * Uses tipbucket volume and collection area to calculate accurate rainfall
- * @param pulse_count Number of tipbucket pulses recorded
- * @return Rainfall depth in mm
- */
-float weather_convert_pulses_to_rainfall_mm(int pulse_count);
-
-/**
- * @brief Get human-readable sensor status
- * @param[out] status_buffer Buffer to write status string
- * @param buffer_size Size of status buffer
- * @return ESP_OK on success
- */
-esp_err_t weather_get_status_string(char *status_buffer, size_t buffer_size);
-
-/**
- * @brief Get current pulse count from rainfall sensor (for diagnostics)
- * @param[out] pulse_count Current pulse counter value
- * @return ESP_OK on success, ESP_FAIL on sensor error
- */
-esp_err_t weather_get_rainfall_pulse_count(int *pulse_count);
 
 /**
  * @brief Set power saving mode for TEMPESTA weather station

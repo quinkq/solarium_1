@@ -31,7 +31,7 @@
 #define IRRIGATION_ZONE_COUNT 5
 
 // GPIO Pin Assignments
-#define FLOW_SENSOR_GPIO GPIO_NUM_6
+#define FLOW_SENSOR_GPIO GPIO_NUM_21
 #define VALVE_GPIO_ZONE_1 GPIO_NUM_37
 #define VALVE_GPIO_ZONE_2 GPIO_NUM_38
 #define VALVE_GPIO_ZONE_3 GPIO_NUM_39
@@ -41,10 +41,10 @@
 
 // ABP Pin definitions
 #define ABP_SPI_HOST SPI2_HOST
-#define ABP_MOSI_PIN GPIO_NUM_11 // Not used but required for SPI bus
-#define ABP_SCLK_PIN GPIO_NUM_12
-#define ABP_MISO_PIN GPIO_NUM_13
-#define ABP_CS_PIN GPIO_NUM_14
+#define ABP_MOSI_PIN GPIO_NUM_9 // Not used but required for SPI bus
+#define ABP_MISO_PIN GPIO_NUM_10
+#define ABP_SCLK_PIN GPIO_NUM_11
+#define ABP_CS_PIN GPIO_NUM_12
 
 // Power Management
 #define MAX_OUTPUT_CURRENT_AMPS 1.25f // Total system current limit (immediate emergency stop)
@@ -182,7 +182,7 @@ typedef struct {
     float target_moisture_percent;   // Desired moisture level (0-100%)
     float moisture_deadband_percent; // Tolerance around target (±%)
     bool watering_enabled;           // Zone active/disabled
-    time_t last_watered_timestamp;   // Last watering timestamp
+    int64_t last_watered_time_ms;    // Last watering time (monotonic milliseconds)
     float volume_used_today;         // Daily water usage (mL)
     bool watering_in_progress;       // Watering in progress flag
     zone_learning_t learning;        // Learning algorithm data
@@ -216,7 +216,7 @@ typedef struct {
     uint8_t eligible_zones_mask;                  // Bitmask of zones eligible for testing
     uint8_t test_cycle_count;                     // Number of test cycles completed
     uint8_t failed_zones_mask;                    // Bitmask of zones that failed tests
-    time_t diagnostic_start_timestamp;            // When diagnostics started
+    int64_t diagnostic_start_time_ms;             // When diagnostics started (monotonic milliseconds)
     uint32_t test_start_time;                     // When current test cycle started
     bool initial_moisture_check_passed;           // Did initial moisture levels pass?
     float test_flow_rates[IRRIGATION_ZONE_COUNT]; // Flow rates measured per zone
@@ -229,7 +229,7 @@ typedef struct {
 typedef struct {
     irrigation_state_t state;                                    // Current system state
     uint8_t active_zone;                                         // Currently watering zone (255 = none)
-    float pressure;                                              // System pressure (bar)
+    float outlet_pressure;                                       // System pressure (bar)
     float water_level;                                           // Tank level (%)
     uint32_t pump_pwm_duty;                                      // Current pump speed (0-1023)
     uint32_t watering_start_pulses;                              // Pulse count when watering started
@@ -264,15 +264,93 @@ typedef struct {
 extern irrigation_zone_t irrigation_zones[IRRIGATION_ZONE_COUNT];
 extern irrigation_system_t irrigation_system;
 
+// ########################## Snapshot Structure ##########################
+
+/**
+ * @brief Comprehensive irrigation system snapshot (single mutex operation)
+ *
+ * Provides complete system state for HMI display and MQTT telemetry.
+ * All zone data, learning algorithm state, sensors, and diagnostics in one call.
+ */
+typedef struct {
+    // System state
+    irrigation_state_t state;
+    uint8_t active_zone;                 // NO_ACTIVE_ZONE_ID if none
+    bool emergency_stop;
+    bool sensors_powered;
+    bool power_save_mode;
+    bool load_shed_shutdown;
+    time_t snapshot_timestamp;
+
+    // Physical sensors
+    float outlet_pressure_bar;
+    float water_level_percent;
+    float current_flow_rate_lh;
+    bool sensor_data_valid;
+
+    // Pump status
+    uint32_t pump_pwm_duty;
+    uint8_t pump_duty_percent;           // 0-100%
+    float current_moisture_gain_rate;
+
+    // Per-zone data (5 zones)
+    struct {
+        bool watering_enabled;
+        float current_moisture_percent;
+        float target_moisture_percent;
+        float moisture_deadband_percent;
+        float volume_used_today_ml;
+        time_t last_watered_time;
+        bool watering_in_progress;
+
+        // Learning algorithm data
+        float calculated_ppmp_ratio;         // Pulses per moisture percent
+        uint32_t calculated_pump_duty;       // Learned optimal pump speed
+        float target_moisture_gain_rate;     // Learned gain rate (%/sec)
+        float confidence_level;              // 0.0-1.0
+        uint32_t successful_predictions;
+        uint32_t total_predictions;
+        uint8_t history_entry_count;         // 0-15
+    } zones[IRRIGATION_ZONE_COUNT];
+
+    // Emergency diagnostics
+    emergency_state_t emergency_state;
+    uint8_t emergency_test_zone;
+    uint8_t emergency_failed_zones_mask;
+    uint8_t consecutive_failures;
+    const char *emergency_failure_reason;
+
+    // Watering queue
+    uint8_t watering_queue_size;
+    uint8_t queue_index;
+    struct {
+        uint8_t zone_id;
+        float measured_moisture_percent;
+        float moisture_deficit_percent;
+        uint16_t target_pulses;
+        bool watering_completed;
+    } queue[IRRIGATION_ZONE_COUNT];
+
+    // Anomaly tracking
+    anomaly_type_t current_anomaly_type;
+    time_t anomaly_timestamp;
+} impluvium_snapshot_t;
 
 // ########################## FUNCTION DECLARATIONS ################################
 
 /**
+ * @brief Get comprehensive irrigation system snapshot (single mutex operation)
+ * @param[out] snapshot Pointer to impluvium_snapshot_t structure to fill
+ * @return ESP_OK on success, ESP_ERR_INVALID_ARG on null pointer
+ */
+esp_err_t impluvium_get_data_snapshot(impluvium_snapshot_t *snapshot);
+
+/**
  * @brief Initialize the IMPLUVIUM irrigation system
- * 
+ *
  * Initializes the irrigation system hardware, creates required tasks,
  * and loads configuration from NVS. Must be called before any irrigation operations.
- * 
+ *
  * @return ESP_OK on successful initialization
  * @return ESP_FAIL on initialization failure
  */

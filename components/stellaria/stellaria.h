@@ -2,6 +2,7 @@
 #define STELLARIA_H
 
 #include <stdbool.h>
+#include <time.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "esp_err.h"
@@ -11,8 +12,7 @@
 // ########################## STELLARIA Configuration ##########################
 
 // GPIO Configuration
-#define STELLARIA_ENABLE_GPIO       GPIO_NUM_0   // Driver enable signal
-#define STELLARIA_PWM_GPIO          GPIO_NUM_45  // PWM intensity control
+#define STELLARIA_PWM_GPIO          GPIO_NUM_2   // PWM intensity control (external 100kΩ pull-down)
 
 // PWM Configuration
 #define STELLARIA_PWM_FREQUENCY     1000         // 1kHz PWM frequency
@@ -21,18 +21,23 @@
 #define STELLARIA_PWM_CHANNEL       LEDC_CHANNEL_0
 #define STELLARIA_PWM_SPEED_MODE    LEDC_LOW_SPEED_MODE
 
-// Intensity Limits
-#define STELLARIA_MIN_INTENSITY     0            // Minimum intensity (0%)
-#define STELLARIA_MAX_INTENSITY     1023         // Maximum intensity (100%)
-#define STELLARIA_POWER_SAVE_LIMIT  205          // 20% intensity for power saving mode
+// Intensity Limits (10-bit PWM: 0-1023)
+#define STELLARIA_MIN_INTENSITY     51           // Minimum intensity (5% duty cycle - driver turn-on threshold)
+#define STELLARIA_MAX_INTENSITY     512          // Maximum intensity (50%)
+#define STELLARIA_POWER_SAVE_LIMIT  128          // 12.5% intensity for power saving mode
 
 // Mutex timeout constants
 #define STELLARIA_MUTEX_TIMEOUT_MS  100          // Mutex timeout for operations
 
-// Light Sensing Configuration
-#define STELLARIA_LIGHT_TURN_ON_THRESHOLD   0.4f  // Turn ON when light < 0.4V (dark)
-#define STELLARIA_LIGHT_TURN_OFF_THRESHOLD  0.3f  // Turn OFF when light > 0.3V (bright)
-#define STELLARIA_LIGHT_CHECK_INTERVAL_MS   30000 // Check light every 30 seconds
+// Intensity Ramping Configuration
+#define STELLARIA_RAMP_RATE_PERCENT_PER_SEC  10.0f  // 10% per second ramping rate
+#define STELLARIA_RAMP_UPDATE_INTERVAL_MS    100    // Update PWM every 100ms during ramp
+#define STELLARIA_RAMP_STEP_SIZE             10     // ~10 intensity units per 100ms (10%/s for 1024 range)
+
+// Automatic Light Sensing Configuration (uses FLUCTUS photoresistor readings)
+#define STELLARIA_LIGHT_TURN_ON_THRESHOLD   0.4f  // Turn ON when light > 0.4V (dark conditions)
+#define STELLARIA_LIGHT_TURN_OFF_THRESHOLD  0.3f  // Turn OFF when light < 0.3V (bright conditions)
+// Note: Light readings are provided by FLUCTUS during solar tracking (every ~5s during tracking)
 
 // ########################## Data Structures ##########################
 
@@ -52,7 +57,8 @@ typedef struct {
     bool initialized;                // Component initialization status
     bool auto_mode_active;           // Auto light sensing mode active
     float last_light_reading;        // Last averaged light reading (V)
-} stellaria_status_t;
+    time_t snapshot_timestamp;       // Timestamp of snapshot
+} stellaria_snapshot_t;
 
 // ########################## Public API Functions ##########################
 
@@ -102,11 +108,11 @@ esp_err_t stellaria_set_power_save_mode(bool enable);
 esp_err_t stellaria_set_shutdown(bool shutdown);
 
 /**
- * @brief Get current system status (thread-safe)
- * @param[out] status Pointer to stellaria_status_t structure to fill
+ * @brief Get comprehensive STELLARIA data snapshot (single mutex operation)
+ * @param[out] snapshot Pointer to stellaria_snapshot_t structure to fill
  * @return ESP_OK on success, ESP_ERR_INVALID_ARG on null pointer
  */
-esp_err_t stellaria_get_status(stellaria_status_t *status);
+esp_err_t stellaria_get_data_snapshot(stellaria_snapshot_t *snapshot);
 
 /**
  * @brief Check if system is currently enabled
@@ -115,11 +121,22 @@ esp_err_t stellaria_get_status(stellaria_status_t *status);
 bool stellaria_is_enabled(void);
 
 /**
- * @brief Enable automatic light sensing mode
- * @param intensity_when_on Intensity to use when automatically turned on (0-1023)
+ * @brief Enable automatic light toggle mode using FLUCTUS photoresistor readings
+ *
+ * When enabled, STELLARIA will automatically turn ON/OFF based on ambient light levels
+ * detected by FLUCTUS photoresistors. Uses hysteresis to prevent rapid toggling:
+ * - Turns ON when voltage > 0.4V (dark conditions)
+ * - Turns OFF when voltage < 0.3V (bright conditions)
+ *
+ * Light readings are provided by FLUCTUS during solar tracking operations (~5s intervals).
+ * During nighttime when solar tracking stops, lights will remain in their last state (ON).
+ *
  * @return ESP_OK on success, ESP_ERR_INVALID_STATE if not initialized
+ *
+ * @note On initialization, uses power-save mode intensity (STELLARIA_POWER_SAVE_LIMIT).
+ *       After first manual intensity change, remembers and uses that value when auto-toggling ON.
  */
-esp_err_t stellaria_set_auto_mode(uint16_t intensity_when_on);
+esp_err_t stellaria_enable_auto_toggle(void);
 
 /**
  * @brief Update light reading for automatic control (called by FLUCTUS)
@@ -127,5 +144,22 @@ esp_err_t stellaria_set_auto_mode(uint16_t intensity_when_on);
  * @return ESP_OK on success, ESP_ERR_INVALID_STATE if not in auto mode
  */
 esp_err_t stellaria_update_light_reading(float averaged_light_voltage);
+
+/**
+ * @brief Request temporary dimming during irrigation for power management
+ *
+ * When irrigation pump/valves are active, this dims the ambient lights to minimum
+ * intensity (STELLARIA_MIN_INTENSITY) to reduce load on the 12V bus. When irrigation
+ * completes, intensity is restored to the user's preferred setting.
+ *
+ * This function is called by IMPLUVIUM component during watering operations.
+ * All transitions use gradual ramping (10%/second) for smooth changes.
+ *
+ * @param dim True to dim to minimum intensity, false to restore previous setting
+ * @return ESP_OK on success, ESP_ERR_INVALID_STATE if not initialized
+ *
+ * @note The restored intensity respects current power-save mode limits
+ */
+esp_err_t stellaria_request_irrigation_dim(bool dim);
 
 #endif // STELLARIA_H

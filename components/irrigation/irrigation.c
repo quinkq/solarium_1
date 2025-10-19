@@ -2,10 +2,13 @@
 #include "ads1115_helper.h"
 #include "weather_station.h"
 #include "fluctus.h"
+#include "stellaria.h"
+#include "telemetry.h"
 
 #include <string.h>
 #include <math.h>
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -14,6 +17,30 @@
 #define VALIDATE_PTR(ptr)                                                                                              \
     if (!ptr)                                                                                                          \
     return ESP_ERR_INVALID_ARG
+
+// Sensor retry helper macro - to reduce duplication in retry logic
+#define SENSOR_READ_WITH_RETRY(read_operation, sensor_name, context_id) do { \
+    esp_err_t _ret = ESP_FAIL; \
+    for (uint8_t _attempt = 0; _attempt < SENSOR_READ_MAX_RETRIES; _attempt++) { \
+        _ret = (read_operation); \
+        if (_ret == ESP_OK) { \
+            if (_attempt > 0) { \
+                ESP_LOGD(TAG, "%s %d succeeded on attempt %d", sensor_name, context_id, _attempt + 1); \
+            } \
+            break; \
+        } \
+        if (_attempt < SENSOR_READ_MAX_RETRIES - 1) { \
+            ESP_LOGD(TAG, "%s %d attempt %d failed: %s, retrying...", \
+                     sensor_name, context_id, _attempt + 1, esp_err_to_name(_ret)); \
+            vTaskDelay(pdMS_TO_TICKS(SENSOR_READ_RETRY_DELAY_MS)); \
+        } \
+    } \
+    if (_ret != ESP_OK) { \
+        ESP_LOGW(TAG, "Failed to read %s %d after %d attempts: %s", \
+                 sensor_name, context_id, SENSOR_READ_MAX_RETRIES, esp_err_to_name(_ret)); \
+    } \
+    ret = _ret; \
+} while(0)
 
 // ########################## Global Variable Definitions ##########################
 #define TAG "IMPLUVIUM"
@@ -36,12 +63,7 @@ static const gpio_num_t zone_valve_gpios[IRRIGATION_ZONE_COUNT] = {VALVE_GPIO_ZO
 // ABP sensor handle
 abp_t abp_dev = {0};
 
-// NVS Storage Keys
-static const char *NVS_NAMESPACE = "irrigation";
-static const char *NVS_ZONE_HISTORY_KEY = "zone_%d_hist";
-static const char *NVS_ZONE_CONFIG_KEY = "zone_%d_cfg";
-
-// ########################## Function Prototypes (internal) ##########################
+// ########################## Function Prototypes ##########################
 // -------------------------- System Initialization ---------------------------
 static esp_err_t irrigation_system_init(void);
 static esp_err_t irrigation_gpio_init(void);
@@ -55,13 +77,13 @@ static esp_err_t irrigation_save_learning_data(uint8_t zone_id, const watering_e
 
 // ------------------------ Sensor Reading Functions ------------------------
 static esp_err_t irrigation_read_moisture_sensor(uint8_t zone_id, float *moisture_percent);
-static esp_err_t irrigation_read_pressure(float *pressure_bar);
+static esp_err_t irrigation_read_pressure(float *outlet_pressure_bar);
 static esp_err_t irrigation_read_water_level(float *water_level_percent);
 
 // ------------------------ Power Bus Helper Functions ------------------------
 typedef enum {
-    POWER_LEVEL_SENSORS = 0,    // 3V3 + 5V buses (measuring)
-    POWER_LEVEL_WATERING = 1,   // 3V3 + 5V + 12V buses (watering)
+    POWER_ONLY_SENSORS = 0,    // 3V3 + 5V buses (measuring)
+    POWER_ALL_DEVICES = 1,   // 3V3 + 5V + 12V buses (watering)
 } irrigation_power_level_t;
 
 static esp_err_t irrigation_request_power_buses(irrigation_power_level_t level, const char *tag);
@@ -200,13 +222,8 @@ static esp_err_t irrigation_system_init(void)
     if (ret != ESP_OK)
         return ret;
 
-    // Initialize SPI bus for ABP sensor
-    ret = abp_spi_bus_init(ABP_SPI_HOST, ABP_MISO_PIN, ABP_MOSI_PIN, ABP_SCLK_PIN);
-    if (ret != ESP_OK) {
-        return ret;
-    }
-
     // Initialize ABP sensor for ±1 psi differential pressure
+    // SPI2 bus is initialized in main.c (shared with HMI display)
     ret = abp_init(&abp_dev, ABP_SPI_HOST, ABP_CS_PIN, ABP_RANGE_001PD);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to initialize ABP sensor: %s", esp_err_to_name(ret));
@@ -441,22 +458,22 @@ static esp_err_t irrigation_read_moisture_sensor(uint8_t zone_id, float *moistur
 }
 
 /**
- * @brief Read system pressure sensor
+ * @brief Read system outlet pressure sensor
  *
- * Reads pressure from ADS1115 #2 Ch1, converts to bar using calibration,
+ * Reads outlet pressure from ADS1115 #2 Ch2, converts to bar using calibration,
  * and updates debug display variables.
  *
- * @param[out] pressure_bar System pressure in bar (0-3.0)
+ * @param[out] outlet_pressure_bar System pressure in bar (0-3.0)
  * @return ESP_OK on success, ESP_ERR_INVALID_ARG on null pointer,
  *         ESP_ERR_INVALID_STATE if ADS1115 not available
  */
-static esp_err_t irrigation_read_pressure(float *pressure_bar)
+static esp_err_t irrigation_read_pressure(float *outlet_pressure_bar)
 {
-    if (!pressure_bar) {
+    if (!outlet_pressure_bar) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    // Read pump pressure from ADS1115 #2 Ch1
+    // Read pump pressure from ADS1115 #2 Ch2
     if (!ads1115_devices[2].initialized) {
         ESP_LOGD(TAG, "Pressure sensor ADS1115 #2 not available");
         return ESP_ERR_INVALID_STATE;
@@ -468,7 +485,7 @@ static esp_err_t irrigation_read_pressure(float *pressure_bar)
     esp_err_t ret = ESP_FAIL;
 
     SENSOR_READ_WITH_RETRY(
-        ads1115_read_channel(2, ADS111X_MUX_1_GND, &raw, &voltage),
+        ads1115_read_channel(2, ADS111X_MUX_1_GND, &raw, &voltage), // ADS111X_MUX_1_GND is 2nd channel on ADS1115
         "pressure sensor", 0
     );
 
@@ -476,9 +493,9 @@ static esp_err_t irrigation_read_pressure(float *pressure_bar)
         // Success - convert voltage to pressure
         // TODO: calibration needed
         // Assuming linear conversion for now
-        *pressure_bar = voltage * 3.0f; // For implementation time/tests: 3 bar per volt
+        *outlet_pressure_bar = voltage * 3.0f; // For development time/tests: 3 bar per volt
         
-        ESP_LOGD(TAG, "System pressure: %.2f bar (%.3fV)", *pressure_bar, voltage);
+        ESP_LOGD(TAG, "System pressure: %.2f bar (%.3fV)", *outlet_pressure_bar, voltage);
     }
 
     return ret;
@@ -526,30 +543,6 @@ static esp_err_t irrigation_read_water_level(float *water_level_percent)
     return ret;
 }
 
-// Sensor retry helper macro - eliminates duplicated retry logic
-#define SENSOR_READ_WITH_RETRY(read_operation, sensor_name, context_id) do { \
-    esp_err_t _ret = ESP_FAIL; \
-    for (uint8_t _attempt = 0; _attempt < SENSOR_READ_MAX_RETRIES; _attempt++) { \
-        _ret = (read_operation); \
-        if (_ret == ESP_OK) { \
-            if (_attempt > 0) { \
-                ESP_LOGD(TAG, "%s %d succeeded on attempt %d", sensor_name, context_id, _attempt + 1); \
-            } \
-            break; \
-        } \
-        if (_attempt < SENSOR_READ_MAX_RETRIES - 1) { \
-            ESP_LOGD(TAG, "%s %d attempt %d failed: %s, retrying...", \
-                     sensor_name, context_id, _attempt + 1, esp_err_to_name(_ret)); \
-            vTaskDelay(pdMS_TO_TICKS(SENSOR_READ_RETRY_DELAY_MS)); \
-        } \
-    } \
-    if (_ret != ESP_OK) { \
-        ESP_LOGW(TAG, "Failed to read %s %d after %d attempts: %s", \
-                 sensor_name, context_id, SENSOR_READ_MAX_RETRIES, esp_err_to_name(_ret)); \
-    } \
-    ret = _ret; \
-} while(0)
-
 /**
  * @brief Request power buses for irrigation operations
  *
@@ -570,7 +563,7 @@ static esp_err_t irrigation_request_power_buses(irrigation_power_level_t level, 
     });
 
     // Request 12V bus for watering operations
-    if (level == POWER_LEVEL_WATERING) {
+    if (level == POWER_ALL_DEVICES) {
         FLUCTUS_REQUEST_BUS_OR_FAIL(POWER_BUS_12V, tag, {
             fluctus_release_bus_power(POWER_BUS_5V, tag);
             fluctus_release_bus_power(POWER_BUS_3V3, tag);
@@ -590,7 +583,7 @@ static esp_err_t irrigation_request_power_buses(irrigation_power_level_t level, 
 static void irrigation_release_power_buses(irrigation_power_level_t level, const char *tag)
 {
     // Release in reverse order
-    if (level == POWER_LEVEL_WATERING) {
+    if (level == POWER_ALL_DEVICES) {
         fluctus_release_bus_power(POWER_BUS_12V, tag);
     }
     fluctus_release_bus_power(POWER_BUS_5V, tag);
@@ -1066,6 +1059,9 @@ static esp_err_t irrigation_change_state(irrigation_state_t new_state)
                  irrigation_state_name(new_state));
         irrigation_system.state = new_state;
         irrigation_system.state_start_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
+
+        // Inject state data to TELEMETRY central hub
+        telemetry_update_impluvium();
     }
     return ESP_OK;
 }
@@ -1137,7 +1133,7 @@ static esp_err_t irrigation_state_measuring(void)
     }
 
     // Power on sensors (3V3 for sensors, 5V for pressure transmitter)
-    if (irrigation_request_power_buses(POWER_LEVEL_SENSORS, "IMPLUVIUM") != ESP_OK) {
+    if (irrigation_request_power_buses(POWER_ONLY_SENSORS, "IMPLUVIUM") != ESP_OK) {
         irrigation_change_state(IRRIGATION_MAINTENANCE);
         return ESP_FAIL;
     }
@@ -1147,7 +1143,7 @@ static esp_err_t irrigation_state_measuring(void)
     // Perform pre-start safety checks directly
     if (irrigation_pre_check() != ESP_OK) {
         ESP_LOGE(TAG, "Pre-start safety check failed.");
-        irrigation_release_power_buses(POWER_LEVEL_SENSORS, "IMPLUVIUM");
+        irrigation_release_power_buses(POWER_ONLY_SENSORS, "IMPLUVIUM");
         irrigation_change_state(IRRIGATION_MAINTENANCE);
         return ESP_FAIL;
     }
@@ -1165,11 +1161,10 @@ static esp_err_t irrigation_state_measuring(void)
 
             // Check if watering is needed
             if (moisture_deficit_percent > zone->moisture_deadband_percent) {
-                // Check minimum interval since last watering
-                time_t current_time_seconds = time(NULL);
-                if (current_time_seconds != (time_t) -1 &&
-                    (zone->last_watered_timestamp == 0 ||
-                     (current_time_seconds - zone->last_watered_timestamp) >= (MIN_WATERING_INTERVAL_MS / 1000))) {
+                // Check minimum interval since last watering (using monotonic time)
+                int64_t current_time_ms = esp_timer_get_time() / 1000;
+                if (zone->last_watered_time_ms == 0 ||
+                    (current_time_ms - zone->last_watered_time_ms) >= MIN_WATERING_INTERVAL_MS) {
                     ESP_LOGI(TAG,
                              "Zone %d needs water: %.1f%% < %.1f%% (deficit: %.1f%%)",
                              zone_id,
@@ -1217,7 +1212,7 @@ static esp_err_t irrigation_state_measuring(void)
         irrigation_change_state(IRRIGATION_WATERING);
     } else {
         // No zones need watering - power off sensors and return to idle
-        irrigation_release_power_buses(POWER_LEVEL_SENSORS, "IMPLUVIUM");
+        irrigation_release_power_buses(POWER_ONLY_SENSORS, "IMPLUVIUM");
         irrigation_system.last_moisture_check = xTaskGetTickCount() * portTICK_PERIOD_MS;
         irrigation_change_state(IRRIGATION_IDLE);
     }
@@ -1252,10 +1247,13 @@ static esp_err_t irrigation_state_watering(void)
     // Request 12V power for valve & pump operation (sensors already powered from measuring state)
     FLUCTUS_REQUEST_BUS_OR_FAIL(POWER_BUS_12V, "IMPLUVIUM", {
         gpio_set_level(zone->valve_gpio, 0);
-        irrigation_release_power_buses(POWER_LEVEL_SENSORS, "IMPLUVIUM");
+        irrigation_release_power_buses(POWER_ONLY_SENSORS, "IMPLUVIUM");
         irrigation_change_state(IRRIGATION_MAINTENANCE);
         return ESP_FAIL;
     });
+
+    // Request STELLARIA to dim lights for power management during irrigation
+    stellaria_request_irrigation_dim(true);
 
     // Open valve
     gpio_set_level(zone->valve_gpio, 1);
@@ -1265,7 +1263,7 @@ static esp_err_t irrigation_state_watering(void)
     if (irrigation_pump_ramp_up(zone_id) != ESP_OK) {
         ESP_LOGE(TAG, "Pump ramp-up failed for zone %d, turning off power buses", zone_id);
         gpio_set_level(zone->valve_gpio, 0);
-        irrigation_release_power_buses(POWER_LEVEL_WATERING, "IMPLUVIUM");
+        irrigation_release_power_buses(POWER_ALL_DEVICES, "IMPLUVIUM");
         irrigation_change_state(IRRIGATION_MAINTENANCE);
         return ESP_FAIL;
     }
@@ -1275,7 +1273,7 @@ static esp_err_t irrigation_state_watering(void)
     pcnt_unit_get_count(flow_pcnt_unit, (int *) &irrigation_system.watering_start_pulses);
     irrigation_system.active_zone = zone_id;
     zone->watering_in_progress = true;
-    zone->last_watered_timestamp = time(NULL);
+    zone->last_watered_time_ms = esp_timer_get_time() / 1000;  // Monotonic time
     irrigation_system.watering_start_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
 
     // Store starting moisture for learning algorithm
@@ -1304,6 +1302,9 @@ static esp_err_t irrigation_state_stopping(void)
     irrigation_set_pump_speed(0);
     ESP_LOGI(TAG, "Pump stopped - delaying %dms for pressure equalization", PRESSURE_EQUALIZE_DELAY_MS);
     vTaskDelay(pdMS_TO_TICKS(PRESSURE_EQUALIZE_DELAY_MS));
+
+    // Restore STELLARIA to previous intensity (irrigation complete)
+    stellaria_request_irrigation_dim(false);
 
     // Close current zone valve
     if (active_zone < IRRIGATION_ZONE_COUNT) {
@@ -1541,25 +1542,25 @@ static esp_err_t irrigation_pre_check(void)
     }
 
     // Read current pressure
-    if (irrigation_read_pressure(&irrigation_system.pressure) != ESP_OK) {
-        ESP_LOGW(TAG, "Pre-check failed: Could not read system pressure.");
+    if (irrigation_read_pressure(&irrigation_system.outlet_pressure) != ESP_OK) {
+        ESP_LOGW(TAG, "Pre-check failed: Could not read system's outlet pressure.");
         return ESP_FAIL;
     }
 
-    if (irrigation_system.pressure > MAX_PRESSURE_BAR) {
+    if (irrigation_system.outlet_pressure > MAX_PRESSURE_BAR) {
         ESP_LOGE(TAG,
-                 "Pre-check failed: Pressure %.2f bar is above maximum %.2f bar",
-                 irrigation_system.pressure,
+                 "Pre-check failed: Outlet pressure %.2f bar is above maximum %.2f bar",
+                 irrigation_system.outlet_pressure,
                  MAX_PRESSURE_BAR);
-        irrigation_emergency_stop("System pressure too high");
+        irrigation_emergency_stop("System's outlet pressure too high");
         return ESP_FAIL;
     }
 
     ESP_LOGI(TAG,
-             "Safety pre-check complete: temp %.1f°C, water level %.1f %%, pressure %.2f bar, allowed YES",
+             "Safety pre-check complete: temp %.1f°C, water level %.1f %%, outlet pressure %.2f bar, allowed YES",
              current_temperature,
              irrigation_system.water_level,
-             irrigation_system.pressure);
+             irrigation_system.outlet_pressure);
 
     return ESP_OK; // All checks passed
 }
@@ -1686,11 +1687,11 @@ static bool irrigation_periodic_safety_check(uint32_t *error_count, uint32_t tim
     const uint32_t MAX_ERROR_COUNT = 4;
     const char *failure_reason = NULL;
 
-    // Read pressure and level sensors
-    esp_err_t ret = irrigation_read_pressure(&irrigation_system.pressure);
+    // Read outlet pressure and level sensors
+    esp_err_t ret = irrigation_read_pressure(&irrigation_system.outlet_pressure);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Safety check: Failed to read pressure sensor: %s", esp_err_to_name(ret));
-        failure_reason = "Pressure sensor read failed";
+        ESP_LOGE(TAG, "Safety check: Failed to read outlet pressure sensor: %s", esp_err_to_name(ret));
+        failure_reason = "Outlet pressure sensor read failed";
     }
     ret = irrigation_read_water_level(&irrigation_system.water_level);
     if (ret != ESP_OK) {
@@ -1702,9 +1703,9 @@ static bool irrigation_periodic_safety_check(uint32_t *error_count, uint32_t tim
 
     // Check safety parameters
     if (failure_reason == NULL) {
-        if (irrigation_system.pressure > MAX_PRESSURE_BAR) {
-            ESP_LOGW(TAG, "Pressure too high: %.2f > %.2f bar", irrigation_system.pressure, MAX_PRESSURE_BAR);
-            failure_reason = "Pressure too high";
+        if (irrigation_system.outlet_pressure > MAX_PRESSURE_BAR) {
+            ESP_LOGW(TAG, "Outlet pressure too high: %.2f > %.2f bar", irrigation_system.outlet_pressure, MAX_PRESSURE_BAR);
+            failure_reason = "Outlet pressure too high";
         }
         if (time_since_start_ms > 1000 && irrigation_system.current_flow_rate < MIN_FLOW_RATE_LH) {
             ESP_LOGW(TAG, "Flow rate too low: %.1f < %.1f L/h", irrigation_system.current_flow_rate, MIN_FLOW_RATE_LH);
@@ -1722,11 +1723,11 @@ static bool irrigation_periodic_safety_check(uint32_t *error_count, uint32_t tim
         (*error_count)++;
 
         ESP_LOGW(TAG,
-                 "Safety failure %" PRIu32 "/%" PRIu32 ": %s (Pressure: %.2f, Flow: %.1f)",
+                 "Safety failure %" PRIu32 "/%" PRIu32 ": %s (Outlet pressure: %.2f, Flow: %.1f)",
                  *error_count,
                  (uint32_t) MAX_ERROR_COUNT,
                  failure_reason,
-                 irrigation_system.pressure,
+                 irrigation_system.outlet_pressure,
                  irrigation_system.current_flow_rate);
 
         if (*error_count >= MAX_ERROR_COUNT) {
@@ -1795,7 +1796,7 @@ static esp_err_t emergency_diagnostics_start(const char *reason)
     // Reset diagnostics state
     memset(&irrigation_system.emergency, 0, sizeof(emergency_diagnostics_t));
     irrigation_system.emergency.state = EMERGENCY_TRIGGERED;
-    irrigation_system.emergency.diagnostic_start_timestamp = time(NULL);
+    irrigation_system.emergency.diagnostic_start_time_ms = esp_timer_get_time() / 1000;  // Monotonic time
     irrigation_system.emergency.failure_reason = reason;
 
     // Transition to maintenance state to handle diagnostics
@@ -1910,16 +1911,16 @@ static esp_err_t emergency_diagnostics_test_zone(uint8_t zone_id)
     float test_volume_ml = (test_pulses / FLOW_CALIBRATION_PULSES_PER_LITER) * 1000.0f;
     float test_flow_rate = (test_volume_ml / 1000.0f) * (3600.0f / (EMERGENCY_TEST_DURATION_MS / 1000.0f)); // L/h
 
-    // Read pressure
+    // Read outlet pressure
     float test_pressure;
     if (irrigation_read_pressure(&test_pressure) != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to read pressure during diagnostic test for zone %d", zone_id);
+        ESP_LOGW(TAG, "Failed to read outlet pressure during diagnostic test for zone %d", zone_id);
         test_pressure = -1.0f; // Indicate failure
     }
 
     // Stop pump and close valve
     irrigation_set_pump_speed(0);
-    vTaskDelay(pdMS_TO_TICKS(PRESSURE_EQUALIZE_DELAY_MS)); // Wait for pressure to drop
+    vTaskDelay(pdMS_TO_TICKS(PRESSURE_EQUALIZE_DELAY_MS)); // Wait for outlet pressure to drop
     gpio_set_level(zone->valve_gpio, 0);
     fluctus_release_bus_power(POWER_BUS_12V, "IMPLUVIUM_DIAG");
 
@@ -1943,9 +1944,9 @@ static esp_err_t emergency_diagnostics_test_zone(uint8_t zone_id)
 
     if (test_pressure > EMERGENCY_TEST_MAX_PRESSURE) {
         test_passed = false;
-        failure_reason = "High pressure";
+        failure_reason = "High outlet pressure";
         ESP_LOGW(TAG,
-                 "Zone %d FAILED: High pressure %.2f bar > %.2f bar",
+                 "Zone %d FAILED: High outlet pressure %.2f bar > %.2f bar",
                  zone_id,
                  test_pressure,
                  EMERGENCY_TEST_MAX_PRESSURE);
@@ -1953,14 +1954,14 @@ static esp_err_t emergency_diagnostics_test_zone(uint8_t zone_id)
 
     if (test_passed) {
         ESP_LOGI(TAG,
-                 "Zone %d PASSED: Flow %.1f L/h, Pressure %.2f bar, Volume %.1f mL",
+                 "Zone %d PASSED: Flow %.1f L/h, Outlet pressure %.2f bar, Volume %.1f mL",
                  zone_id,
                  test_flow_rate,
                  test_pressure,
                  test_volume_ml);
     } else {
         ESP_LOGE(TAG,
-                 "Zone %d FAILED: %s (Flow %.1f L/h, Pressure %.2f bar)",
+                 "Zone %d FAILED: %s (Flow %.1f L/h, Outlet pressure %.2f bar)",
                  zone_id,
                  failure_reason,
                  test_flow_rate,
@@ -1993,13 +1994,13 @@ static esp_err_t emergency_diagnostics_analyze_results(void)
             if (irrigation_system.emergency.failed_zones_mask & (1 << i)) {
                 failed_zones++;
                 ESP_LOGW(TAG,
-                         "Eligible Zone %d FAILED: Flow %.1f L/h, Pressure %.2f bar",
+                         "Eligible Zone %d FAILED: Flow %.1f L/h, Outlet pressure %.2f bar",
                          i,
                          irrigation_system.emergency.test_flow_rates[i],
                          irrigation_system.emergency.test_pressures[i]);
             } else {
                 ESP_LOGI(TAG,
-                         "Eligible Zone %d PASSED: Flow %.1f L/h, Pressure %.2f bar",
+                         "Eligible Zone %d PASSED: Flow %.1f L/h, Outlet pressure %.2f bar",
                          i,
                          irrigation_system.emergency.test_flow_rates[i],
                          irrigation_system.emergency.test_pressures[i]);
@@ -2068,11 +2069,12 @@ static esp_err_t emergency_diagnostics_analyze_results(void)
  */
 static esp_err_t emergency_diagnostics_resolve(void)
 {
-    time_t diagnostic_duration = time(NULL) - irrigation_system.emergency.diagnostic_start_timestamp;
+    int64_t diagnostic_duration_ms = (esp_timer_get_time() / 1000) - irrigation_system.emergency.diagnostic_start_time_ms;
+    int64_t diagnostic_duration_seconds = diagnostic_duration_ms / 1000;
 
     ESP_LOGW(TAG, "=== EMERGENCY DIAGNOSTICS COMPLETED ===");
     ESP_LOGI(TAG, "Resolution: %s", irrigation_system.emergency.failure_reason);
-    ESP_LOGI(TAG, "Duration: %ld seconds", (long) diagnostic_duration);
+    ESP_LOGI(TAG, "Duration: %lld seconds", (long long) diagnostic_duration_seconds);
     ESP_LOGI(TAG, "Failed zones mask: 0x%02X", irrigation_system.emergency.failed_zones_mask);
 
     // Log detailed results for maintenance records
@@ -2080,7 +2082,7 @@ static esp_err_t emergency_diagnostics_resolve(void)
     for (uint8_t i = 0; i < IRRIGATION_ZONE_COUNT; i++) {
         if (irrigation_zones[i].watering_enabled || (irrigation_system.emergency.failed_zones_mask & (1 << i))) {
             ESP_LOGI(TAG,
-                     "  Zone %d: Flow %.1f L/h, Pressure %.2f bar, %s",
+                     "  Zone %d: Flow %.1f L/h, Outlet pressure %.2f bar, %s",
                      i,
                      irrigation_system.emergency.test_flow_rates[i],
                      irrigation_system.emergency.test_pressures[i],
@@ -2373,6 +2375,105 @@ esp_err_t impluvium_init(void)
     }
 
     ESP_LOGI(TAG, "IMPLUVIUM irrigation system initialized successfully");
+    return ESP_OK;
+}
+
+/**
+ * @brief Get comprehensive irrigation system snapshot (single mutex operation)
+ */
+esp_err_t impluvium_get_data_snapshot(impluvium_snapshot_t *snapshot)
+{
+    if (snapshot == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (xSemaphoreTake(xIrrigationMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return ESP_FAIL;
+    }
+
+    // System state
+    snapshot->state = irrigation_system.state;
+    snapshot->active_zone = irrigation_system.active_zone;
+    snapshot->emergency_stop = irrigation_system.emergency_stop;
+    snapshot->sensors_powered = irrigation_system.sensors_powered;
+    snapshot->power_save_mode = irrigation_system.power_save_mode;
+    snapshot->load_shed_shutdown = irrigation_system.load_shed_shutdown;
+    snapshot->snapshot_timestamp = time(NULL);
+
+    // Physical sensors
+    snapshot->outlet_pressure_bar = irrigation_system.outlet_pressure;
+    snapshot->water_level_percent = irrigation_system.water_level;
+    snapshot->current_flow_rate_lh = irrigation_system.current_flow_rate;
+    snapshot->sensor_data_valid = irrigation_system.sensors_powered;
+
+    // Pump status
+    snapshot->pump_pwm_duty = irrigation_system.pump_pwm_duty;
+
+    // Calculate pump duty percentage (0-100%)
+    if (irrigation_system.pump_pwm_duty <= PUMP_MIN_DUTY) {
+        snapshot->pump_duty_percent = 0;
+    } else if (irrigation_system.pump_pwm_duty >= PUMP_MAX_DUTY) {
+        snapshot->pump_duty_percent = 100;
+    } else {
+        uint32_t range = PUMP_MAX_DUTY - PUMP_MIN_DUTY;
+        uint32_t offset = irrigation_system.pump_pwm_duty - PUMP_MIN_DUTY;
+        snapshot->pump_duty_percent = (uint8_t)(((float)offset / (float)range) * 100.0f);
+    }
+
+    snapshot->current_moisture_gain_rate = irrigation_system.current_moisture_gain_rate;
+
+    // Per-zone data (5 zones)
+    for (uint8_t i = 0; i < IRRIGATION_ZONE_COUNT; i++) {
+        snapshot->zones[i].watering_enabled = irrigation_zones[i].watering_enabled;
+
+        // Read current moisture (stored value from last read)
+        // Note: Actual sensor reading would require power buses to be active
+        snapshot->zones[i].current_moisture_percent = 0.0f; // TODO: Store last reading in zone structure
+
+        snapshot->zones[i].target_moisture_percent = irrigation_zones[i].target_moisture_percent;
+        snapshot->zones[i].moisture_deadband_percent = irrigation_zones[i].moisture_deadband_percent;
+        snapshot->zones[i].volume_used_today_ml = irrigation_zones[i].volume_used_today;
+
+        // Convert monotonic milliseconds to time_t
+        snapshot->zones[i].last_watered_time = (time_t)(irrigation_zones[i].last_watered_time_ms / 1000);
+
+        snapshot->zones[i].watering_in_progress = irrigation_zones[i].watering_in_progress;
+
+        // Learning algorithm data
+        snapshot->zones[i].calculated_ppmp_ratio = irrigation_zones[i].learning.calculated_ppmp_ratio;
+        snapshot->zones[i].calculated_pump_duty = irrigation_zones[i].learning.calculated_pump_duty_cycle;
+        snapshot->zones[i].target_moisture_gain_rate = irrigation_zones[i].learning.target_moisture_gain_rate;
+        snapshot->zones[i].confidence_level = irrigation_zones[i].learning.confidence_level;
+        snapshot->zones[i].successful_predictions = irrigation_zones[i].learning.successful_predictions;
+        snapshot->zones[i].total_predictions = irrigation_zones[i].learning.total_predictions;
+        snapshot->zones[i].history_entry_count = irrigation_zones[i].learning.history_entry_count;
+    }
+
+    // Emergency diagnostics
+    snapshot->emergency_state = irrigation_system.emergency.state;
+    snapshot->emergency_test_zone = irrigation_system.emergency.test_zone;
+    snapshot->emergency_failed_zones_mask = irrigation_system.emergency.failed_zones_mask;
+    snapshot->consecutive_failures = irrigation_system.emergency.consecutive_failures;
+    snapshot->emergency_failure_reason = irrigation_system.emergency.failure_reason;
+
+    // Watering queue
+    snapshot->watering_queue_size = irrigation_system.watering_queue_size;
+    snapshot->queue_index = irrigation_system.queue_index;
+
+    for (uint8_t i = 0; i < IRRIGATION_ZONE_COUNT && i < irrigation_system.watering_queue_size; i++) {
+        snapshot->queue[i].zone_id = irrigation_system.watering_queue[i].zone_id;
+        snapshot->queue[i].measured_moisture_percent = irrigation_system.watering_queue[i].measured_moisture_percent;
+        snapshot->queue[i].moisture_deficit_percent = irrigation_system.watering_queue[i].moisture_deficit_percent;
+        snapshot->queue[i].target_pulses = irrigation_system.watering_queue[i].target_pulses;
+        snapshot->queue[i].watering_completed = irrigation_system.watering_queue[i].watering_completed;
+    }
+
+    // Anomaly tracking
+    snapshot->current_anomaly_type = irrigation_system.current_anomaly.type;
+    snapshot->anomaly_timestamp = irrigation_system.current_anomaly.anomaly_timestamp;
+
+    xSemaphoreGive(xIrrigationMutex);
+
     return ESP_OK;
 }
 

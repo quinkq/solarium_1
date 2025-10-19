@@ -14,7 +14,7 @@ extern "C" {
 
 // ########################## Configuration Constants ##########################
 
-#define ADS1115_DEVICE_COUNT 3
+#define ADS1115_DEVICE_COUNT 4
 #define ADS1115_GAIN ADS111X_GAIN_4V096  // ±4.096V
 #define ADS1115_I2C_PORT I2C_NUM_0
 

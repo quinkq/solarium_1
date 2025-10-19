@@ -19,7 +19,9 @@
 #include "weather_station.h"
 #include "fluctus.h"
 #include "stellaria.h"
-
+#include "telemetry.h"
+#include "solar_calc.h" // For debug printouts only - remvoe it later
+#include "hmi.h" 
 
 #include "driver/ledc.h"
 #include "driver/gpio.h"
@@ -32,6 +34,8 @@
 #include "esp_event.h"
 #include "esp_sntp.h"
 #include <time.h>
+
+#include "driver/spi_master.h"
 
 #include "main.h"
 #include "wifi_credentials.h"
@@ -127,10 +131,34 @@ static void wifi_init_sta(void)
     ESP_LOGI(TAG, "wifi_init_sta finished.");
 }
 
-// ADS1115 functionality moved to ads1115_helper component
+// ------- SPI Bus Initialization -------
 
-// Legacy power management and solar tracking code removed - now handled by FLUCTUS component
+/**
+ * @brief Initialize SPI2 bus for shared use by ABP sensor and HMI display
+ */
+esp_err_t spi_bus_init(void)
+{
+    ESP_LOGI(TAG, "Initializing SPI2 bus (MOSI=%d, MISO=%d, SCLK=%d)...",
+             SPI2_MOSI_PIN, SPI2_MISO_PIN, SPI2_SCLK_PIN);
 
+    spi_bus_config_t buscfg = {
+        .mosi_io_num = SPI2_MOSI_PIN,
+        .miso_io_num = SPI2_MISO_PIN,
+        .sclk_io_num = SPI2_SCLK_PIN,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = 4096,
+    };
+
+    esp_err_t ret = spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize SPI2 bus: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ESP_LOGI(TAG, "SPI2 bus initialized successfully");
+    return ESP_OK;
+}
 
 // -----------------#################################-----------------
 // -----------------############# TASKS #############-----------------
@@ -271,6 +299,13 @@ void serial_debug_display_task(void *pvParameters)
         // Flush stdout buffer to ensure data is sent immediately
         fflush(stdout);
 
+        static uint32_t last_print = 0;
+            if ((xTaskGetTickCount() - last_print) > pdMS_TO_TICKS(600000)) {
+                telemetry_print_power_status();
+                telemetry_print_daily_summary();
+                last_print = xTaskGetTickCount();
+            }
+
         // --- End Format and Print ---
 
         vTaskDelay(pdMS_TO_TICKS(SERIAL_DISPLAY_INTERVAL_MS));
@@ -335,6 +370,10 @@ void app_main(void)
     ESP_LOGI(TAG, "Initializing I2C...");
     ESP_ERROR_CHECK(i2cdev_init());
 
+    // Initialize SPI2 bus (shared by ABP sensor and HMI display)
+    ESP_LOGI(TAG, "Initializing SPI2 bus...");
+    ESP_ERROR_CHECK(spi_bus_init());
+
     // Initialize ADS1115 helper system
     ESP_LOGI(TAG, "Initializing ADS1115 helper...");
     esp_err_t ads_init_result = ads1115_helper_init();
@@ -347,7 +386,25 @@ void app_main(void)
         ESP_LOGI(TAG, "ADS1115 helper system initialized successfully");
     }
 
+
     //---------- Core system TASKS ----------
+
+    // Initialize telemetry subsystem (power metering, weather data collection, LittleFS storage)
+    ESP_LOGI(TAG, "Initializing telemetry subsystem...");
+    esp_err_t telemetry_ret = telemetry_init();
+    if (telemetry_ret != ESP_OK) {
+        ESP_LOGE(TAG, "Telemetry initialization failed: %s", esp_err_to_name(telemetry_ret));
+        ESP_LOGW(TAG, "System will continue without telemetry/data logging functionality");
+    } else {
+        ESP_LOGI(TAG, "Telemetry subsystem initialized successfully");
+    }
+
+    // Test solar calculator
+  const solar_times_t *times = solar_calc_get_times();
+  ESP_LOGI(TAG, "Today's sunrise: %s", ctime(&times->sunrise_time));
+  ESP_LOGI(TAG, "Today's sunset: %s", ctime(&times->sunset_time));
+  ESP_LOGI(TAG, "Is daytime: %s", solar_calc_is_daytime() ? "YES" : "NO");
+
     ESP_LOGI(TAG, "Creating tasks...");
 
     // Initialize FLUCTUS power management and solar tracking system
@@ -360,7 +417,7 @@ void app_main(void)
         ESP_LOGI(TAG, "FLUCTUS initialized successfully");
     }
 
-    // Initialize weather station (SHT4x, BME280, AS5600 )
+    // Initialize weather station (SHT4x, BME280, AS5600, PMS5003)
     ESP_LOGI(TAG, "Initializing weather station...");
     esp_err_t weather_ret = weather_station_init();
     if (weather_ret != ESP_OK) {
@@ -371,7 +428,6 @@ void app_main(void)
     }
 
     // Initialize IMPLUVIUM irrigation system
-    // TODO: create init function to start task
     ESP_LOGI(TAG, "Initializing IMPLUVIUM irrigation system...");
     esp_err_t impluvium_ret = impluvium_init();
     if (impluvium_ret != ESP_OK) {
@@ -388,13 +444,25 @@ void app_main(void)
         // Continue anyway - ambient lighting is optional
     } else {
         ESP_LOGI(TAG, "STELLARIA initialized successfully");
+
+        // Enable automatic light toggle mode (uses FLUCTUS photoresistor readings)
+        esp_err_t auto_ret = stellaria_enable_auto_toggle();
+        if (auto_ret != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to enable STELLARIA auto toggle mode: %s", esp_err_to_name(auto_ret));
+        } else {
+            ESP_LOGI(TAG, "STELLARIA auto toggle mode enabled");
+        }
     }
 
-
-    // TODO: Communication tasks?
-    // xTaskCreate(telemetry_task, "TelemetryTask", configMINIMAL_STACK_SIZE * 4, NULL, 5, NULL);
-    // xTaskCreate(mppt_communication_task, "mppt_communication_task", configMINIMAL_STACK_SIZE * 4,
-    // NULL, 5, NULL);
+    // Initialize HMI system (OLED display + rotary encoder)
+    ESP_LOGI(TAG, "Initializing HMI system...");
+    esp_err_t hmi_ret = hmi_init();
+    if (hmi_ret != ESP_OK) {
+        ESP_LOGE(TAG, "HMI initialization failed: %s", esp_err_to_name(hmi_ret));
+        ESP_LOGW(TAG, "System will continue without display/user interface");
+    } else {
+        ESP_LOGI(TAG, "HMI initialized successfully");
+    }
 
     // Misc tasks / debug tools - ADS1115 retry task now handled by ads1115_helper component
     xTaskCreate(serial_debug_display_task, "serial_debug_display_task", configMINIMAL_STACK_SIZE * 4, NULL, 5, NULL);

@@ -12,7 +12,8 @@ static const char *TAG = "ADS1115_HELPER";
 static const uint8_t ads1115_addresses[ADS1115_DEVICE_COUNT] = {
     ADS111X_ADDR_GND, // 0x48 - Photoresistor array (Dev#0)
     ADS111X_ADDR_VCC, // 0x49 - Moisture sensors (Dev#1)
-    ADS111X_ADDR_SDA  // 0x4A - Zone5 moisture + pressure (Dev#2)
+    ADS111X_ADDR_SDA, // 0x4A - Zone5 moisture + pressure (Dev#2)
+    ADS111X_ADDR_SCL  // 0x4B - Hall sensor array (Dev#3)
 };
 
 // ########################## Private Variables ##########################
@@ -397,6 +398,7 @@ bool ads1115_is_device_ready(uint8_t device_id)
     return ads1115_devices[device_id].initialized;
 }
 
+// TODO: verify ads1115_get_latest_voltages is still needed - probably used for initial serial debuging
 esp_err_t ads1115_get_latest_voltages(float voltages[ADS1115_DEVICE_COUNT][4])
 {
     if (!voltages) {

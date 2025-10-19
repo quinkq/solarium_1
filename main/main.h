@@ -14,6 +14,12 @@
 
 // ADS1115 functionality moved to ads1115_helper component
 
+// ########################## SPI Settings ##########################
+// SPI2 bus shared by: ABP pressure sensor, HMI display
+#define SPI2_MOSI_PIN 9
+#define SPI2_MISO_PIN 10
+#define SPI2_SCLK_PIN 11
+
 // ########################## Solar Tracking System Settings ##########################
 // Photoresistor layout:
 // [Ch0: Left-Top]  [Ch1: Right-Top]
@@ -66,5 +72,11 @@ extern uint16_t latest_as5600_raw;
 // ########################## FUNCTION DECLARATIONS ################################
 
 // ADS1115 functions moved to ads1115_helper
+
+/**
+ * @brief Initialize SPI2 bus (shared by ABP pressure sensor and HMI display)
+ * @return ESP_OK on success, ESP_FAIL on error
+ */
+esp_err_t spi_bus_init(void);
 
 #endif // MAIN_H

@@ -2,8 +2,12 @@
 .devcontainer/
 esp8266_test/
 build/
+managed_components/
 main/wifi_credentials.h
 CLAUDE.md
 .claude
+
 components/abp/abp_example.c
 components/abp/README.md
+components/telemetry/TELEMETRY_ARCHITECTURE.md
+components/hmi/TODO.md
