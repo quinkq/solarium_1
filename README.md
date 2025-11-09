@@ -10,31 +10,29 @@ The system is built around four main subsystems: **FLUCTUS** (power & solar trac
 
 ![solarium Diagram drawio](https://github.com/user-attachments/assets/f8a33487-a0ce-4170-98f9-2d25f3874cc6)
 
-
-**FLUCTUS** - Manages four voltage buses (3.3V/5V/6.6V/12V) with reference counting, dual INA219 power monitors (solar + battery), overcurrent protection, thermal management with PWM fan control, and dual-axis solar tracking with 15-minute correction cycles.
-
-**TELEMETRY** - Zero-copy caching hub receiving push-based data injections from seven sources at variable frequencies (500ms to 15min). Implements two-tier MQTT buffering with msgpack serialization and Simplified NOAA solar calculations for sunrise/sunset callbacks.
-
-**IMPLUVIUM** - Five-zone irrigation with adaptive learning (exponential moving averages, 15-event history with recency weighting, 3-tier confidence blending, temperature correction). Uses moisture sensors (capacitive via ADS1115), ABP ΔP level sensor, rotary flow metering, and state machine with safety interlocks. Learns optimal water volume and pump speed per zone. Persistent learning data (5 recent cycles) stored in LittleFS.
-
-**TEMPESTA** - Eight-sensor weather station: temperature nad humidity (SHT40/BME280), pressure (BME280), wind speed/direction(AS5600/custom), air quality(PMS5003), rainfall and tank intake monitoring (custom). Power-aware polling switches between 15-minute and 60-minute cycles. Features 3 custom built sensors - based on Hall effect devices.
-
-**STELLARIA** - LED lighting with PWM controled Meanwell LDD-600L driver. Three modes (Manual/Auto toggle/Power Save), photoresistor feedback, fade ramping, auto-dimming under high power loads.
-
-**HMI** - Custom UI system with SH1106 OLED screen and EC11 encoder. Framebuffer rendering, 95-state menu hierarchy, variable refresh rates, auto power-off with wake-on-input.
-
-![solarium_topo-1](https://github.com/user-attachments/assets/5801f9b7-c7d6-40f8-a188-8f4dde045b36)
-
 ### Original Original Work (~15,000 lines)
 All core system architecture and components were designed and implemented from scratch:
 
-- **FLUCTUS** - Power management, solar tracking, load shedding orchestration
-- **IMPLUVIUM** - Irrigation management with learning irrigation algorithm
-- **TEMPESTA** - Multi-sensor weather station with adaptive polling
-- **STELLARIA** - Adaptive lighting with automatic dimming and toggling.
-- **TELEMETRY** - Zero-copy data cache and two-tier MQTT buffering system
-- **HMI** - Complete menu system with 95 states and custom font rendering
-###
+- #### FLUCTUS - Power management, solar tracking, load shedding orchestration
+Manages four voltage buses (3.3V/5V/6.6V/12V) with reference counting, dual INA219 power monitors (solar + battery), overcurrent protection, thermal management with PWM fan control, and dual-axis solar tracking with 15-minute correction cycles.
+
+- #### IMPLUVIUM - Irrigation management with learning irrigation algorithm
+Five-zone irrigation with adaptive learning (exponential moving averages, 15-event history with recency weighting, 3-tier confidence blending, temperature correction). Uses moisture sensors (capacitive analog), ABP ΔP level sensor, rotary flow metering, pressure (analog) sensor and state machine with safety interlocks. Learns optimal water volume and pump speed per zone. Persistent learning data (5 recent cycles) stored in LittleFS.
+
+- #### TEMPESTA - Multi-sensor weather station with adaptive polling
+Eight-sensor weather station: temperature nad humidity (SHT40/BME280), pressure (BME280), wind speed/direction(AS5600/custom), air quality(PMS5003), rainfall and tank intake monitoring (custom). Power-aware polling switches between 15-minute and 60-minute cycles. Features 3 custom built sensors - based on Hall effect devices.
+
+- #### STELLARIA - Adaptive lighting with automatic dimming and toggling.
+LED lighting with PWM controled Meanwell LDD-600L driver. Three modes (Manual/Auto toggle/Power Save), photoresistor feedback, fade ramping, auto-dimming under high power loads.
+
+- #### TELEMETRY - Zero-copy data cache and two-tier MQTT buffering system
+Caching hub receiving push-based data injections from seven sources at variable frequencies (500ms to 15min). Implements two-tier MQTT buffering with msgpack serialization and Simplified NOAA solar calculations for sunrise/sunset callbacks.
+
+- #### HMI - Complete menu system with custom font rendering
+Custom UI system with SH1106 OLED screen and EC11 encoder. Framebuffer rendering, 95-state menu hierarchy, variable refresh rates, auto power-off with wake-on-input.
+
+
+### Additionally:
 - **abp** - Honeywell ABP ΔP sensor SPI driver library
 - **as5600** - AS5600 Hall magnetic encoder I2C driver library, esp-idf-lib compatible
 ###
@@ -46,6 +44,8 @@ All core system architecture and components were designed and implemented from s
 - **Sensor drivers**: esp-idf-lib (SHT4x, BMP280, AS5600, INA219, DS18B20, OneWire)
 - **Serialization**: msgpack-c (library for MQTT payloads)
 - **Framework**: ESP-IDF v5.4 (Espressif's official development framework)
+
+![solarium_topo-1](https://github.com/user-attachments/assets/5801f9b7-c7d6-40f8-a188-8f4dde045b36)
 
 ## Technical Highlights
 
