@@ -15,11 +15,11 @@ The system is built around four main subsystems: **FLUCTUS** (power & solar trac
 
 **TELEMETRY** - Zero-copy caching hub receiving push-based data injections from seven sources at variable frequencies (500ms to 15min). Implements two-tier MQTT buffering with msgpack serialization and Simplified NOAA solar calculations for sunrise/sunset callbacks.
 
-**IMPLUVIUM** - Five-zone irrigation with adaptive learning (exponential moving averages, 15-event history with recency weighting, 3-tier confidence blending, temperature correction). Uses moisture sensors (ADS1115), ABP ΔP level sensor, flow metering, and state machine with comprehensive safety interlocks. Learns optimal water volume and pump speed per zone. Persistent learning data (5 recent cycles) stored in LittleFS.
+**IMPLUVIUM** - Five-zone irrigation with adaptive learning (exponential moving averages, 15-event history with recency weighting, 3-tier confidence blending, temperature correction). Uses moisture sensors (capacitive via ADS1115), ABP ΔP level sensor, rotary flow metering, and state machine with safety interlocks. Learns optimal water volume and pump speed per zone. Persistent learning data (5 recent cycles) stored in LittleFS.
 
-**TEMPESTA** - Eight-sensor weather station: temperature, humidity, pressure, wind speed/direction, air quality, rainfall, and tank monitoring. Power-aware polling switches between 15-minute and 60-minute cycles. Features 3 custom built sensors - based on Hall effect devices.
+**TEMPESTA** - Eight-sensor weather station: temperature nad humidity (SHT40/BME280), pressure (BME280), wind speed/direction(AS5600/custom), air quality(PMS5003), rainfall and tank intake monitoring (custom). Power-aware polling switches between 15-minute and 60-minute cycles. Features 3 custom built sensors - based on Hall effect devices.
 
-**STELLARIA** - LED lighting with Meanwell LDD-600L driver. Three modes (Manual/Auto toggle/Power Save), photoresistor feedback, fade ramping, auto-dimming under high power loads.
+**STELLARIA** - LED lighting with PWM controled Meanwell LDD-600L driver. Three modes (Manual/Auto toggle/Power Save), photoresistor feedback, fade ramping, auto-dimming under high power loads.
 
 **HMI** - Custom UI system with SH1106 OLED screen and EC11 encoder. Framebuffer rendering, 95-state menu hierarchy, variable refresh rates, auto power-off with wake-on-input.
 
