@@ -7,7 +7,11 @@ main/wifi_credentials.h
 CLAUDE.md
 .claude
 
-components/abp/abp_example.c
-components/abp/README.md
-components/telemetry/TELEMETRY_ARCHITECTURE.md
-components/hmi/TODO.md
+components/helpers/abp/abp_example.c
+components/helpers/abp/README.md
+
+components/core/telemetry/TELEMETRY_ARCHITECTURE.md
+components/core/telemetry/mqtt_migration.md
+
+components/core/hmi/HMI_ARCHITECTURE.md
+components/core/hmi/TODO_SPLIT.md

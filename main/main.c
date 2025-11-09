@@ -15,27 +15,22 @@
 #include "nvs.h"
 
 #include "ads1115_helper.h"
-#include "irrigation.h"
-#include "weather_station.h"
+#include "impluvium.h"
+#include "tempesta.h"
 #include "fluctus.h"
 #include "stellaria.h"
 #include "telemetry.h"
 #include "solar_calc.h" // For debug printouts only - remvoe it later
-#include "hmi.h" 
+#include "hmi.h"
+#include "wifi_helper.h"
 
 #include "driver/ledc.h"
 #include "driver/gpio.h"
 #include "driver/pulse_cnt.h"
+#include "driver/spi_master.h"
 
 #include "esp_log.h"
 #include "esp_err.h"
-
-#include "esp_wifi.h"
-#include "esp_event.h"
-#include "esp_sntp.h"
-#include <time.h>
-
-#include "driver/spi_master.h"
 
 #include "main.h"
 #include "wifi_credentials.h"
@@ -60,77 +55,10 @@ float latest_bmp_hum = -999.9;
 float latest_as5600_angle = -999.9;
 uint16_t latest_as5600_raw = 0;
 
-// Flag to indicate if time has been synchronized
-static bool g_time_synced = false;
-
-
 // ########################## FUNCTION DECLARATIONS ################################
 
 
 // ################################ FUNCTIONS ######################################
-// ------- WiFI and Simple Network Time Protocol Synchronization -------
-
-// Wi-Fi credentials are in wifi_credentials.h
-
-static void time_sync_notification_cb(struct timeval *tv)
-{
-    ESP_LOGI(TAG, "Time synchronized");
-    g_time_synced = true;
-}
-
-static void initialize_sntp(void)
-{
-    ESP_LOGI(TAG, "Initializing SNTP");
-    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
-    esp_sntp_setservername(0, "pool.ntp.org");
-    esp_sntp_set_time_sync_notification_cb(time_sync_notification_cb);
-    esp_sntp_init();
-}
-
-static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
-{
-    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
-    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        ESP_LOGI(TAG, "Wi-Fi disconnected, trying to reconnect...");
-        esp_wifi_connect();
-    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-        ip_event_got_ip_t *event = (ip_event_got_ip_t *) event_data;
-        ESP_LOGI(TAG, "Got IP address: " IPSTR, IP2STR(&event->ip_info.ip));
-        initialize_sntp();
-    }
-}
-
-static void wifi_init_sta(void)
-{
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
-
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-
-    esp_event_handler_instance_t instance_any_id;
-    esp_event_handler_instance_t instance_got_ip;
-    ESP_ERROR_CHECK(
-        esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL, &instance_any_id));
-    ESP_ERROR_CHECK(
-        esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler, NULL, &instance_got_ip));
-
-    wifi_config_t wifi_config = {
-        .sta =
-            {
-                .ssid = WIFI_SSID,
-                .password = WIFI_PASSWORD,
-            },
-    };
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-    ESP_ERROR_CHECK(esp_wifi_start());
-
-    ESP_LOGI(TAG, "wifi_init_sta finished.");
-}
-
 // ------- SPI Bus Initialization -------
 
 /**
@@ -163,7 +91,7 @@ esp_err_t spi_bus_init(void)
 // -----------------#################################-----------------
 // -----------------############# TASKS #############-----------------
 // -----------------#################################-----------------
-
+/*
 void serial_debug_display_task(void *pvParameters)
 {
     ESP_LOGI(TAG, "Serial Display Task started.");
@@ -178,7 +106,7 @@ void serial_debug_display_task(void *pvParameters)
     float sht_t, sht_h, bmp_t, bmp_p, bmp_h, as_a;
     uint16_t as_r;
     float ads_voltages[ADS1115_DEVICE_COUNT][4];
-    fluctus_monitoring_data_t fluctus_data;
+    fluctus_snapshot_t fluctus_data;
 
     while (1) {
         // --- Read Global Variables Safely ---
@@ -206,7 +134,7 @@ void serial_debug_display_task(void *pvParameters)
         }
         
         // Get ADS1115 voltages from helper component
-        esp_err_t ads_ret = ads1115_get_latest_voltages(ads_voltages);
+        esp_err_t ads_ret = ads1115_helper_get_latest_voltages(ads_voltages);
         if (ads_ret != ESP_OK) {
             ESP_LOGW(TAG, "Failed to get ADS1115 voltages: %s", esp_err_to_name(ads_ret));
             // Initialize with error values
@@ -217,13 +145,13 @@ void serial_debug_display_task(void *pvParameters)
             }
         }
         
-        // Get INA219/power monitoring data from FLUCTUS
-        esp_err_t fluctus_ret = fluctus_get_monitoring_data(&fluctus_data);
+        // Get INA219/power monitoring data from TELEMETRY
+        esp_err_t fluctus_ret = telemetry_get_fluctus_data(&fluctus_data);
         if (fluctus_ret != ESP_OK) {
-            ESP_LOGW(TAG, "Failed to get FLUCTUS monitoring data: %s", esp_err_to_name(fluctus_ret));
+            ESP_LOGW(TAG, "Failed to get FLUCTUS data from telemetry: %s", esp_err_to_name(fluctus_ret));
             // Initialize with error values
-            fluctus_data.solar_pv.voltage = fluctus_data.solar_pv.current = fluctus_data.solar_pv.power = -999.9;
-            fluctus_data.battery_out.voltage = fluctus_data.battery_out.current = fluctus_data.battery_out.power = -999.9;
+            fluctus_data.solar_voltage = fluctus_data.solar_current = fluctus_data.solar_power_w = -999.9;
+            fluctus_data.battery_voltage = fluctus_data.battery_current = fluctus_data.battery_power_w = -999.9;
         }
         // --- End Read ---
 
@@ -282,36 +210,29 @@ void serial_debug_display_task(void *pvParameters)
         snprintf(buffer,
                  sizeof(buffer),
                  "INA219_Solar: V=%.2f V, I=%.2f mA, P=%.2f mW\n",
-                 fluctus_data.solar_pv.voltage,
-                 fluctus_data.solar_pv.current * 1000,
-                 fluctus_data.solar_pv.power * 1000);
+                 fluctus_data.solar_voltage,
+                 fluctus_data.solar_current * 1000,
+                 fluctus_data.solar_power_w * 1000);
         printf("%s", buffer);
-        
+
         snprintf(buffer,
                  sizeof(buffer),
                  "INA219_Battery: V=%.2f V, I=%.2f mA, P=%.2f mW\n",
-                 fluctus_data.battery_out.voltage,
-                 fluctus_data.battery_out.current * 1000,
-                 fluctus_data.battery_out.power * 1000);
+                 fluctus_data.battery_voltage,
+                 fluctus_data.battery_current * 1000,
+                 fluctus_data.battery_power_w * 1000);
         printf("%s", buffer);
 
         printf("-----------------------\n");
         // Flush stdout buffer to ensure data is sent immediately
         fflush(stdout);
 
-        static uint32_t last_print = 0;
-            if ((xTaskGetTickCount() - last_print) > pdMS_TO_TICKS(600000)) {
-                telemetry_print_power_status();
-                telemetry_print_daily_summary();
-                last_print = xTaskGetTickCount();
-            }
-
         // --- End Format and Print ---
 
         vTaskDelay(pdMS_TO_TICKS(SERIAL_DISPLAY_INTERVAL_MS));
     }
 }
-
+*/
 // -----------------##########################################-----------------
 // -----------------################### MAIN #################-----------------
 // -----------------##########################################-----------------
@@ -363,20 +284,25 @@ void app_main(void)
            (chip_info.features & CHIP_FEATURE_EMB_FLASH) ? "embedded" : "external");
     printf("Minimum free heap size: %" PRIu32 " bytes\n", esp_get_minimum_free_heap_size());
 
-    // Initialize Wi-Fi and SNTP
-    wifi_init_sta();
+    // Initialize Wi-Fi helper (handles WiFi, SNTP, reconnection, power management)
+    vTaskDelay(pdMS_TO_TICKS(100));
+    ESP_LOGI(TAG, "Initializing WiFi helper...");
+    ESP_ERROR_CHECK(wifi_helper_init(WIFI_SSID, WIFI_PASSWORD));
 
     // Initialize I2C subsystem
+    vTaskDelay(pdMS_TO_TICKS(100));
     ESP_LOGI(TAG, "Initializing I2C...");
     ESP_ERROR_CHECK(i2cdev_init());
 
     // Initialize SPI2 bus (shared by ABP sensor and HMI display)
+    vTaskDelay(pdMS_TO_TICKS(100));
     ESP_LOGI(TAG, "Initializing SPI2 bus...");
     ESP_ERROR_CHECK(spi_bus_init());
 
     // Initialize ADS1115 helper system
+    vTaskDelay(pdMS_TO_TICKS(100));
     ESP_LOGI(TAG, "Initializing ADS1115 helper...");
-    esp_err_t ads_init_result = ads1115_helper_init();
+    esp_err_t ads_init_result = ads1115_helper_general_init();
     if (ads_init_result == ESP_FAIL) {
         ESP_LOGW(TAG,
                  "No ADS1115 devices available at startup - system will continue with limited "
@@ -389,7 +315,21 @@ void app_main(void)
 
     //---------- Core system TASKS ----------
 
+    ESP_LOGI(TAG, "Creating tasks...");
+
+    // Initialize solar calculator (CRITICAL: Must run BEFORE fluctus_init for midnight callback registration)
+    vTaskDelay(pdMS_TO_TICKS(100));
+    ESP_LOGI(TAG, "Initializing solar calculator...");
+    solar_calc_init();
+
+    // Test solar calculator
+    const solar_times_t *times = solar_calc_get_times();
+    ESP_LOGI(TAG, "Today's sunrise: %s", ctime(&times->sunrise_time));
+    ESP_LOGI(TAG, "Today's sunset: %s", ctime(&times->sunset_time));
+    ESP_LOGI(TAG, "Is daytime: %s", solar_calc_is_daytime() ? "YES" : "NO");
+
     // Initialize telemetry subsystem (power metering, weather data collection, LittleFS storage)
+    vTaskDelay(pdMS_TO_TICKS(100));
     ESP_LOGI(TAG, "Initializing telemetry subsystem...");
     esp_err_t telemetry_ret = telemetry_init();
     if (telemetry_ret != ESP_OK) {
@@ -399,15 +339,19 @@ void app_main(void)
         ESP_LOGI(TAG, "Telemetry subsystem initialized successfully");
     }
 
-    // Test solar calculator
-  const solar_times_t *times = solar_calc_get_times();
-  ESP_LOGI(TAG, "Today's sunrise: %s", ctime(&times->sunrise_time));
-  ESP_LOGI(TAG, "Today's sunset: %s", ctime(&times->sunset_time));
-  ESP_LOGI(TAG, "Is daytime: %s", solar_calc_is_daytime() ? "YES" : "NO");
-
-    ESP_LOGI(TAG, "Creating tasks...");
+    // Initialize HMI system (OLED display + rotary encoder)
+    vTaskDelay(pdMS_TO_TICKS(100));
+    ESP_LOGI(TAG, "Initializing HMI system...");
+    esp_err_t hmi_ret = hmi_init();
+    if (hmi_ret != ESP_OK) {
+        ESP_LOGE(TAG, "HMI initialization failed: %s", esp_err_to_name(hmi_ret));
+        ESP_LOGW(TAG, "System will continue without display/user interface");
+    } else {
+        ESP_LOGI(TAG, "HMI initialized successfully");
+    }
 
     // Initialize FLUCTUS power management and solar tracking system
+    vTaskDelay(pdMS_TO_TICKS(100));
     ESP_LOGI(TAG, "Initializing FLUCTUS power management...");
     esp_err_t fluctus_ret = fluctus_init();
     if (fluctus_ret != ESP_OK) {
@@ -418,8 +362,9 @@ void app_main(void)
     }
 
     // Initialize weather station (SHT4x, BME280, AS5600, PMS5003)
+    vTaskDelay(pdMS_TO_TICKS(100));
     ESP_LOGI(TAG, "Initializing weather station...");
-    esp_err_t weather_ret = weather_station_init();
+    esp_err_t weather_ret = tempesta_station_init();
     if (weather_ret != ESP_OK) {
         ESP_LOGE(TAG, "Weather station initialization failed: %s", esp_err_to_name(weather_ret));
         ESP_LOGW(TAG, "System will continue with limited weather functionality");
@@ -428,6 +373,7 @@ void app_main(void)
     }
 
     // Initialize IMPLUVIUM irrigation system
+    vTaskDelay(pdMS_TO_TICKS(100));
     ESP_LOGI(TAG, "Initializing IMPLUVIUM irrigation system...");
     esp_err_t impluvium_ret = impluvium_init();
     if (impluvium_ret != ESP_OK) {
@@ -437,6 +383,7 @@ void app_main(void)
     }
      
     // Initialize STELLARIA ambient lighting system
+    vTaskDelay(pdMS_TO_TICKS(100));
     ESP_LOGI(TAG, "Initializing STELLARIA ambient lighting...");
     esp_err_t stellaria_ret = stellaria_init();
     if (stellaria_ret != ESP_OK) {
@@ -446,26 +393,16 @@ void app_main(void)
         ESP_LOGI(TAG, "STELLARIA initialized successfully");
 
         // Enable automatic light toggle mode (uses FLUCTUS photoresistor readings)
-        esp_err_t auto_ret = stellaria_enable_auto_toggle();
+        esp_err_t auto_ret = stellaria_set_auto_mode(true);
         if (auto_ret != ESP_OK) {
-            ESP_LOGW(TAG, "Failed to enable STELLARIA auto toggle mode: %s", esp_err_to_name(auto_ret));
+            ESP_LOGW(TAG, "Failed to enable STELLARIA auto mode: %s", esp_err_to_name(auto_ret));
         } else {
-            ESP_LOGI(TAG, "STELLARIA auto toggle mode enabled");
+            ESP_LOGI(TAG, "STELLARIA auto mode enabled");
         }
     }
-
-    // Initialize HMI system (OLED display + rotary encoder)
-    ESP_LOGI(TAG, "Initializing HMI system...");
-    esp_err_t hmi_ret = hmi_init();
-    if (hmi_ret != ESP_OK) {
-        ESP_LOGE(TAG, "HMI initialization failed: %s", esp_err_to_name(hmi_ret));
-        ESP_LOGW(TAG, "System will continue without display/user interface");
-    } else {
-        ESP_LOGI(TAG, "HMI initialized successfully");
-    }
-
+/*
     // Misc tasks / debug tools - ADS1115 retry task now handled by ads1115_helper component
     xTaskCreate(serial_debug_display_task, "serial_debug_display_task", configMINIMAL_STACK_SIZE * 4, NULL, 5, NULL);
-
+*/
     ESP_LOGI(TAG, "Tasks created.");
 }

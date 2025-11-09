@@ -1,0 +1,19 @@
+idf_component_register(
+    SRCS
+        "telemetry.c"
+       
+    INCLUDE_DIRS
+        "." 
+    REQUIRES
+        esp_timer
+        nvs_flash
+        littlefs
+        msgpack
+        mqtt
+        stellaria
+        fluctus
+        tempesta
+        impluvium
+        wifi_helper
+        solar_calc
+)

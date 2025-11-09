@@ -1,76 +1,142 @@
 # Solarium - Solar-Powered Garden Automation System
 
-
-
 ## Overview
 
-Solarium is an ESP32-S3 based garden automation system that combines intelligent irrigation, weather monitoring, solar tracking, and power management. The system is designed with a modular architecture using ESP-IDF and FreeRTOS, with each major subsystem implemented as separate components that can operate independently or as part of a distributed network.
+Solarium is a self-contained garden automation platform running on a single ESP32-S3. It monitors weather conditions, waters plants based on learned patterns, tracks solar panels for maximum power generation, and manages a four-voltage-bus distribution system. When battery levels drop, it intelligently sheds non-essential loads to keep critical systems running.
+
+The system is built around four main subsystems: **FLUCTUS** (power & solar tracking), **TEMPESTA** (weather station with 8 sensors), **IMPLUVIUM** (learning irrigation controller), and **STELLARIA** (adaptive LED lighting). All data flows through **TELEMETRY**, a caching system with two-tier MQTT buffering, while **HMI** provides a custom menu system on a small OLED screen.
 
 ## System Architecture
 
-The current Alpha implementation runs on a single ESP32-S3 managing four main subsystems.
-
 ![solarium Diagram drawio](https://github.com/user-attachments/assets/f8a33487-a0ce-4170-98f9-2d25f3874cc6)
 
-**IMPLUVIUM (Irrigation)**: Multi-zone irrigation controller with learning algorithms that adjust watering based on historical data and temperature readings. Implements safety interlocks including over-pressure, low-flow, and empty tank detection. Features emergency diagnostics to isolate faults between system-wide (pump/filter) and zone-specific (valve) issues.
 
-**FLUCTUS (Power Management & Solar Tracking)**: Manages a 4-bus power distribution system (3.3V, 5V, 6.2V, 12V) with buck converter control and reference counting for multiple consumers. Implements 5-state load shedding (Normal -> Power Saving -> Low Power -> Very Low -> Critical) with inter-component communication. Includes dual-axis solar tracking using photoresistor feedback and automatic parking during low-light conditions.
+**FLUCTUS** - Manages four voltage buses (3.3V/5V/6.6V/12V) with reference counting, dual INA219 power monitors (solar + battery), overcurrent protection, thermal management with PWM fan control, and dual-axis solar tracking with 15-minute correction cycles.
 
-**TEMPESTA (Weather Station)**: Environmental monitoring using SHT4x (temperature/humidity), BME280 (t/h/pressure), AS5600 (wind speed via rotary encoder), and PMS5003 (air quality). Will feature custom wind measurement with triple-cup anemometer, rainfall detection via tipping bucket HAL sensor, and sensor fusion with historical averaging.
+**TELEMETRY** - Zero-copy caching hub receiving push-based data injections from seven sources at variable frequencies (500ms to 15min). Implements two-tier MQTT buffering with msgpack serialization and NOAA solar calculations for sunrise/sunset callbacks.
 
-**STELLARIA (Ambient Lighting)**: LED lighting control with constant current driver, PWM intensity control, and automatic light sensing with hysteresis. Integrates with power management for load shedding support.
+**IMPLUVIUM** - Five-zone irrigation with adaptive learning (exponential moving averages, 15-event history with recency weighting, 3-tier confidence blending, temperature correction). Uses moisture sensors (ADS1115), ABP ΔP level sensor, flow metering, and state machine with comprehensive safety interlocks. Learns optimal water volume and pump speed per zone. Persistent learning data (5 recent cycles) stored in LittleFS.
 
+**TEMPESTA** - Eight-sensor weather station: temperature, humidity, pressure, wind speed/direction, air quality, rainfall, and tank monitoring. Power-aware polling switches between 15-minute and 60-minute cycles. Features 3 custom built sensors - based on Hall effect devices.
 
+**STELLARIA** - LED lighting with Meanwell LDD-600L driver. Three modes (Manual/Auto/Power Save), photoresistor feedback, 10%/sec fade ramping, and auto-dimming during irrigation.
 
-## Technical Features
+**HMI** - Custom UI system with SH1106 OLED screen and EC11 encoder. Framebuffer rendering, 95-state menu hierarchy, variable refresh rates, auto power-off with wake-on-input.
 
 ![solarium_topo-1](https://github.com/user-attachments/assets/5801f9b7-c7d6-40f8-a188-8f4dde045b36)
 
-### Power Management
-- Battery monitoring with voltage-based load shedding
-- Reference-counted bus sharing prevents premature shutdowns
-- Overcurrent protection (1.5A/3s warning, 3A immediate shutdown)
-- Consumer tracking for fault diagnosis
+### Original Original Work (~15,000 lines)
+All core system architecture and components were designed and implemented from scratch:
 
-### Irrigation Intelligence  
-- State machine: IDLE -> MEASURING -> WATERING -> STOPPING
-- Learning algorithm correlates water volume with moisture change
-- Temperature-adaptive watering volumes
-- Real-time monitoring task with safety interlocks
-- Emergency diagnostics with automated test cycles
+- **FLUCTUS** - Power management, solar tracking, load shedding orchestration
+- **IMPLUVIUM** - Irrigation management with learning irrigation algorithm
+- **TEMPESTA** - Multi-sensor weather station with adaptive polling
+- **STELLARIA** - Adaptive lighting with automatic dimming
+- **TELEMETRY** - Zero-copy data cache and two-tier MQTT buffering system
+- **HMI** - Complete menu system with 95 states and custom font rendering
 
-### Weather Data Processing
-- Sensor fusion combining multiple temperature/humidity sources
-- Weighted averaging with more recent samples prioritized
-- AS5600 wind measurement
-- Quarter-hour aligned data collection cycles
-- Power-aware sensor operation with progressive load shedding
+- **abp** - Honeywell ABP ΔP sensor SPI driver library
+- **as5600** - AS5600 Hall magnetic encoder I2C driver library, esp-idf-lib compatible
 
-### Load Shedding Integration
-All components implement coordinated load shedding APIs:
-- Power save mode (reduced operation frequency)
-- Feature disabling (PMS5003 air quality sensor)
-- Complete shutdown for critical power states
-- Automatic restoration when power levels recover
+- **wifi_helper** - Power-aware WiFi management
+- **ads1115_helper** - Unified ADC interface with retry logic and state caching
+- **solar_calc** - Sunrise/Sunset calculations for detailed scheduling, timebased callbacks
 
-## Hardware Integration
+### Third-Party Components
+- **Sensor drivers**: esp-idf-lib (SHT4x, BMP280, AS5600, INA219, DS18B20, OneWire)
+- **Serialization**: msgpack-c (header-only library for MQTT payloads)
+- **Framework**: ESP-IDF v5.4 (Espressif's official development framework)
 
-**Sensors**: SHT4x, BME280, AS5600, PMS5003, multiple ADS1115 ADCs, Honeywell ABP delta pressure sensor, flow sensor with pulse counting
+## Technical Highlights
 
-**Actuators**: Water valves, pump control, dual-axis servos, LED drivers, 12V PWM fan
+### Two-Tier "In-Flight Database"
+The telemetry system implements a ring buffer architecture that ensures no data loss during power failures:
 
-**Power**: Solar panel input, battery bank, multi-stage voltage regulation, INA219 power monitoring
+- **PSRAM Ring Buffer**: 512KB total (~1.8k slots) circular buffer with head/tail pointers
+- **Flash Backup**: 1.1MB total (~4k slots), automatically flushes at 95% PSRAM capacity
+- **QoS 1 Integration**: Slots auto-dequeue on MQTT PUBACK, manual flush to FLASH before planned MCU reset via HMI
+- **Smart Recovery**: On boot, restores PSRAM from flash backup then deletes backup file
 
-**Communication**: I2C, SPI, UART, GPIO, 1Wire, PWM interfaces
+Each slot holds 32 bytes of metadata plus 256 bytes of msgpack-encoded payload. The system treats PSRAM as the active "database" and flash as the backup, moving data between tiers based on memory pressure (connection loss, server unavailable).
 
-## Development Status
+### Adaptive Learning Irrigation
+IMPLUVIUM waters on a schedule based on needs and learns what works:
 
-This Alpha stage focuses on single-node operation with integrated power management and a temporary blackbox MPPT. The planned Beta architecture will transition to a distributed multi-node system with dedicated controllers for power management, RS485/ESP-NOW communication, and Linux server integration through Home Assistant or database systems.
+- **Adaptive Algorithm**: Classical online supervised learning (exponential weighted moving averages)
+- **15-Event History**: Tracks water volume → moisture change correlation with recency weighting (70% recent, 30% older)
+- **3-Tier Confidence Blending**: High confidence (>70%) uses learned predictions, medium (40-70%) blends with defaults, low (<40%) favors defaults
+- **Temperature Correction**: Adjusts volumes by ±1% per °C deviation from 20°C baseline (accounts for evaporation)
+- **Anomaly Detection**: Flags rain events, extreme temps, sensor failures - excludes from learning but keeps system functional
+- **Persistent Storage**: Uses FLASH to save 5 most recent valid cycles per zone daily, loads them back in case of power failure
 
-Current implementation includes complete integration of all four subsystems with centralized FLUCTUS power management, comprehensive load shedding communication, and thread-safe operation across concurrent FreeRTOS tasks.
+The algorithm adapts to each zone independently through 4 conceptual phases: measure baseline → water with learned parameters → measure final → update learning. Learns optimal water volume, pump speed, and soil gain rate while enforcing comprehensive safety bounds (max 60s timeout, pressure/flow monitoring, emergency stop, overcurrent protection).
 
+### Intelligent Power Management
+FLUCTUS implements a reference-counted power distribution system with five-stage load shedding:
+
+- **Reference Counting**: Components request bus power by name, preventing premature shutdowns
+- **Five Load States**: Normal → Power Saving (40% SOC) → Low Power (25%) → Very Low (15%) → Critical (0%)
+- **Coordinated Shedding**: All components implement standardized power-save and shutdown APIs
+- **Bus-Level Gating**: Individual buses powered only when needed
+- **Adaptive Sampling**: Power metering adjusts from 500ms active to 3s steady to 15min idle with sensor power-down
+
+When battery drops below 40%, lighting dims to 12.5%. At 25%, lighting disables. At 15%, irrigation stops. At critical levels, only weather monitoring continues.
+
+### Direct-Write Telemetry Architecture
+Hybrid push/pull eliminating polling and minimizes lock contention:
+
+**Push-Based Injection**:
+- Components write directly to TELEMETRY cache buffers (~1KB total cache)
+- Each source has dedicated mutex - no lock contention between components, components never blocked by display rendering
+- Variable update rates: 500ms (active monitoring) to 60min (idle state)
+- Seven injection points with automatic timestamping
+- HMI memcpy's snapshots for local rendering of multiple screens catering to different needs
+- Variable Refresh rates: 1Hz static screens / 4Hz realtime monitoring
+
+### Custom HMI System
+Built entirely from scratch without LVGL or U8g2:
+
+- **Custom 5x8 Font**: 475-byte bitmap font, full ASCII support
+- **95 Menu States**: Hierarchical navigation across all subsystems with realtime and configuration screens
+- **Variable Refresh Rates**: 1Hz for static screens, 4Hz for realtime data
+- **Framebuffer Rendering**: 1024-byte buffer with efficient SPI flush to SH1106 128x64 OLED
+- **EC11 Encoder**: PCNT-based rotary encoder with button support for input
+
+### Solar Tracking with Differential Photoresistors
+FLUCTUS uses four photoresistors in a quadrant arrangement for dual-axis solar tracking via differential light sensing, then applies proportional servo corrections every 5 seconds during 30s tracking cycles using 15-minute intervals. Simplified NOAA solar algorithm provides sunrise/sunset detection with 30-minute buffers for automatic wake/sleep transitions and prevents tracking attempts during night. Smart parking: east-facing at sunset, center position on errors. Servo bus powers up only during correction cycles for energy efficiency.
+
+
+## Hardware Platform
+
+**MCU**: ESP32-S3 16MB flash, 8MB PSRAM
+**Storage**: FLASH LittleFS partition persistent config and backups
+**Display**: SH1106 128x64 OLED (SPI) with EC11 rotary encoder
+**Interfaces**: I2C, SPI, UART, GPIO, OneWire, PWM
+**Power**: 4-bus distribution (3.3V/5V/6.6V/12V) with solar input and battery bank
 
 ![20251013_135107](https://github.com/user-attachments/assets/67a5d10f-e1c2-459f-9a77-ee2e89fb2cb5)
 
-## Work in progres...
+## Development Status
 
+**Alpha Release** 
+- Single-node integrated system with all core features operational:
+- Seven main components fully implemented and tested
+- Learning algorithm with persistent storage
+- Two-tier MQTT buffering (PSRAM + Flash)
+- 95-state HMI with custom rendering
+- Day/night aware operations with NOAA solar calculations
+- Five-stage load shedding with coordinated shutdown
+- Adaptive sensor polling (500ms to 60min depending on context)
+
+**In Progress**:
+- MQTT broker integration and topic structure finalization
+- Field testing and learning algorithm tuning
+- Long-term reliability validation
+
+**Future (Beta)**:
+Transition to distributed multi-node architecture with dedicated subsystems communicating via RS485/ESP-NOW, custom MPPT controller replacing external unit, and integration with Home Assistant + InfluxDb database backend for historical analysis.
+
+## Documentation
+
+Detailed component documentation:
+TBC...

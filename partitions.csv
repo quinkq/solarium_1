@@ -5,6 +5,7 @@ phy_init,     data, phy,      0xf000,    0x1000,
 factory,      app,  factory,  0x10000,   0x400000,
 ota_0,        app,  ota_0,    0x410000,  0x400000,
 ota_1,        app,  ota_1,    0x810000,  0x400000,
-littlefs,     data, spiffs,   0xC10000,  0x200000,  # 2MB for telemetry (weather, power, irrigation)
+# 2MB for telemetry (weather, power, irrigation)
+littlefs,     data, littlefs, 0xC10000,  0x200000,
 coredump,     data, coredump, 0xE10000,  0x10000,
 # Total: ~14.5MB used, 1.5MB reserved
