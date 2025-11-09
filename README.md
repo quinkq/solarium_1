@@ -13,13 +13,13 @@ The system is built around four main subsystems: **FLUCTUS** (power & solar trac
 
 **FLUCTUS** - Manages four voltage buses (3.3V/5V/6.6V/12V) with reference counting, dual INA219 power monitors (solar + battery), overcurrent protection, thermal management with PWM fan control, and dual-axis solar tracking with 15-minute correction cycles.
 
-**TELEMETRY** - Zero-copy caching hub receiving push-based data injections from seven sources at variable frequencies (500ms to 15min). Implements two-tier MQTT buffering with msgpack serialization and NOAA solar calculations for sunrise/sunset callbacks.
+**TELEMETRY** - Zero-copy caching hub receiving push-based data injections from seven sources at variable frequencies (500ms to 15min). Implements two-tier MQTT buffering with msgpack serialization and Simplified NOAA solar calculations for sunrise/sunset callbacks.
 
 **IMPLUVIUM** - Five-zone irrigation with adaptive learning (exponential moving averages, 15-event history with recency weighting, 3-tier confidence blending, temperature correction). Uses moisture sensors (ADS1115), ABP ΔP level sensor, flow metering, and state machine with comprehensive safety interlocks. Learns optimal water volume and pump speed per zone. Persistent learning data (5 recent cycles) stored in LittleFS.
 
 **TEMPESTA** - Eight-sensor weather station: temperature, humidity, pressure, wind speed/direction, air quality, rainfall, and tank monitoring. Power-aware polling switches between 15-minute and 60-minute cycles. Features 3 custom built sensors - based on Hall effect devices.
 
-**STELLARIA** - LED lighting with Meanwell LDD-600L driver. Three modes (Manual/Auto/Power Save), photoresistor feedback, 10%/sec fade ramping, and auto-dimming during irrigation.
+**STELLARIA** - LED lighting with Meanwell LDD-600L driver. Three modes (Manual/Auto toggle/Power Save), photoresistor feedback, fade ramping, auto-dimming under high power loads.
 
 **HMI** - Custom UI system with SH1106 OLED screen and EC11 encoder. Framebuffer rendering, 95-state menu hierarchy, variable refresh rates, auto power-off with wake-on-input.
 
@@ -31,20 +31,20 @@ All core system architecture and components were designed and implemented from s
 - **FLUCTUS** - Power management, solar tracking, load shedding orchestration
 - **IMPLUVIUM** - Irrigation management with learning irrigation algorithm
 - **TEMPESTA** - Multi-sensor weather station with adaptive polling
-- **STELLARIA** - Adaptive lighting with automatic dimming
+- **STELLARIA** - Adaptive lighting with automatic dimming and toggling.
 - **TELEMETRY** - Zero-copy data cache and two-tier MQTT buffering system
 - **HMI** - Complete menu system with 95 states and custom font rendering
-
+###
 - **abp** - Honeywell ABP ΔP sensor SPI driver library
 - **as5600** - AS5600 Hall magnetic encoder I2C driver library, esp-idf-lib compatible
-
+###
 - **wifi_helper** - Power-aware WiFi management
 - **ads1115_helper** - Unified ADC interface with retry logic and state caching
 - **solar_calc** - Sunrise/Sunset calculations for detailed scheduling, timebased callbacks
 
 ### Third-Party Components
 - **Sensor drivers**: esp-idf-lib (SHT4x, BMP280, AS5600, INA219, DS18B20, OneWire)
-- **Serialization**: msgpack-c (header-only library for MQTT payloads)
+- **Serialization**: msgpack-c (library for MQTT payloads)
 - **Framework**: ESP-IDF v5.4 (Espressif's official development framework)
 
 ## Technical Highlights
@@ -129,6 +129,7 @@ FLUCTUS uses four photoresistors in a quadrant arrangement for dual-axis solar t
 - Adaptive sensor polling (500ms to 60min depending on context)
 
 **In Progress**:
+- Component refactoring for code readability and maintainablity
 - MQTT broker integration and topic structure finalization
 - Field testing and learning algorithm tuning
 - Long-term reliability validation
