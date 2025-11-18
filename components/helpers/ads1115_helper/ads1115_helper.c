@@ -20,6 +20,7 @@
 #include "esp_log.h"
 #include "freertos/task.h"
 #include "i2cdev.h"
+#include "fluctus.h"  // For power bus status checking
 #include <string.h>
 
 // ########################## Private Constants ##########################
@@ -114,6 +115,14 @@ static esp_err_t ads1115_helper_init_device(uint8_t device_id)
         return ESP_ERR_INVALID_ARG;
     }
 
+    // Request 3.3V bus power for I2C communication (reference counting handles overlaps)
+    esp_err_t power_ret = fluctus_request_bus_power(POWER_BUS_3V3, "ADS1115_INIT_DEV");
+    if (power_ret != ESP_OK) {
+        ESP_LOGD(TAG, "[Dev %d] 3.3V bus unavailable: %s", device_id, esp_err_to_name(power_ret));
+        return ESP_ERR_INVALID_STATE;
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));  // Brief stabilization delay
+
     i2c_dev_t *dev = &ads1115_devices[device_id].device;
     esp_err_t ret;
 
@@ -125,6 +134,7 @@ static esp_err_t ads1115_helper_init_device(uint8_t device_id)
                             CONFIG_I2CDEV_DEFAULT_SCL_PIN);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "[Dev %d] Failed ads111x_init_desc: %s", device_id, esp_err_to_name(ret));
+        fluctus_release_bus_power(POWER_BUS_3V3, "ADS1115_INIT_DEV");
         return ret;
     }
 
@@ -133,6 +143,7 @@ static esp_err_t ads1115_helper_init_device(uint8_t device_id)
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "[Dev %d] Failed ads111x_set_mode: %s", device_id, esp_err_to_name(ret));
         ads111x_free_desc(dev); // Cleanup on failure
+        fluctus_release_bus_power(POWER_BUS_3V3, "ADS1115_INIT_DEV");
         return ret;
     }
 
@@ -141,6 +152,7 @@ static esp_err_t ads1115_helper_init_device(uint8_t device_id)
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "[Dev %d] Failed ads111x_set_data_rate: %s", device_id, esp_err_to_name(ret));
         ads111x_free_desc(dev); // Cleanup on failure
+        fluctus_release_bus_power(POWER_BUS_3V3, "ADS1115_INIT_DEV");
         return ret;
     }
 
@@ -149,6 +161,7 @@ static esp_err_t ads1115_helper_init_device(uint8_t device_id)
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "[Dev %d] Failed ads111x_set_gain: %s", device_id, esp_err_to_name(ret));
         ads111x_free_desc(dev); // Cleanup on failure
+        fluctus_release_bus_power(POWER_BUS_3V3, "ADS1115_INIT_DEV");
         return ret;
     }
 
@@ -166,10 +179,14 @@ static esp_err_t ads1115_helper_init_device(uint8_t device_id)
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "[Dev %d] Failed test read: %s", device_id, esp_err_to_name(ret));
         ads111x_free_desc(dev); // Cleanup on failure
+        fluctus_release_bus_power(POWER_BUS_3V3, "ADS1115_INIT_DEV");
         return ret;
     }
 
     ESP_LOGD(TAG, "[Dev %d] Test read successful (raw: %d)", device_id, test_raw);
+
+    // Release power - init complete
+    fluctus_release_bus_power(POWER_BUS_3V3, "ADS1115_INIT_DEV");
     return ESP_OK;
 }
 
@@ -193,6 +210,7 @@ static void ads1115_helper_retry_task(void *pvParameters)
         bool retry_attempted = false;
 
         // Check each device for retry
+        // Note: ads1115_helper_init_device() handles power management internally
         for (uint8_t device = 0; device < ADS1115_DEVICE_COUNT; device++) {
             ads1115_device_t *status = &ads1115_devices[device];
 
@@ -269,10 +287,19 @@ esp_err_t ads1115_helper_general_init(void)
 
     ESP_LOGI(TAG, "Initializing ADS1115 helper system...");
 
+    // Request 3.3V bus power for initialization (requires fluctus_init already called)
+    esp_err_t ret = fluctus_request_bus_power(POWER_BUS_3V3, "ADS1115_INIT");
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to request 3.3V bus power: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    vTaskDelay(pdMS_TO_TICKS(100));  // Allow bus to stabilize
+
     // Create mutex
     xADS1115Mutex = xSemaphoreCreateMutex();
     if (xADS1115Mutex == NULL) {
         ESP_LOGE(TAG, "Failed to create ADS1115 mutex");
+        fluctus_release_bus_power(POWER_BUS_3V3, "ADS1115_INIT");
         return ESP_ERR_NO_MEM;
     }
 
@@ -322,13 +349,19 @@ esp_err_t ads1115_helper_general_init(void)
     if (task_result != pdPASS) {
         ESP_LOGE(TAG, "Failed to create ADS1115 retry task");
         vSemaphoreDelete(xADS1115Mutex);
+        fluctus_release_bus_power(POWER_BUS_3V3, "ADS1115_INIT");
         return ESP_ERR_NO_MEM;
     }
 
     ads1115_helper_initialized = true;
 
+    // Release init power - runtime operations request power as needed
+    fluctus_release_bus_power(POWER_BUS_3V3, "ADS1115_INIT");
+    ESP_LOGI(TAG, "Released 3.3V bus power (init complete)");
+
     if (successful_devices == 0) {
         ESP_LOGE(TAG, "No ADS1115 devices initialized! System functionality will be limited.");
+        ESP_LOGI(TAG, "Retry task will attempt recovery when 3.3V bus is powered");
         return ESP_FAIL;
     }
 
@@ -353,12 +386,21 @@ esp_err_t ads1115_helper_read_channel(uint8_t device_id, ads111x_mux_t channel, 
         return ESP_ERR_INVALID_STATE;
     }
 
+    // Request 3.3V bus power for I2C communication (reference counting handles overlaps)
+    esp_err_t power_ret = fluctus_request_bus_power(POWER_BUS_3V3, "ADS1115_READ");
+    if (power_ret != ESP_OK) {
+        ESP_LOGD(TAG, "[Dev %d] 3.3V bus unavailable: %s", device_id, esp_err_to_name(power_ret));
+        return ESP_ERR_INVALID_STATE;
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));  // Brief stabilization delay
+
     i2c_dev_t *dev = &ads1115_devices[device_id].device;
     esp_err_t ret;
 
     // Take mutex for thread safety
     if (xSemaphoreTake(xADS1115Mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
         ESP_LOGW(TAG, "[Dev %d] Failed to take mutex", device_id);
+        fluctus_release_bus_power(POWER_BUS_3V3, "ADS1115_READ");
         return ESP_ERR_TIMEOUT;
     }
 
@@ -369,6 +411,7 @@ esp_err_t ads1115_helper_read_channel(uint8_t device_id, ads111x_mux_t channel, 
         // Mark device as failed for retry
         ads1115_devices[device_id].initialized = false;
         xSemaphoreGive(xADS1115Mutex);
+        fluctus_release_bus_power(POWER_BUS_3V3, "ADS1115_READ");
         return ret;
     }
 
@@ -378,6 +421,7 @@ esp_err_t ads1115_helper_read_channel(uint8_t device_id, ads111x_mux_t channel, 
         ESP_LOGE(TAG, "[Dev %d] Failed to start conversion: %s (%d)", device_id, esp_err_to_name(ret), ret);
         ads1115_devices[device_id].initialized = false;
         xSemaphoreGive(xADS1115Mutex);
+        fluctus_release_bus_power(POWER_BUS_3V3, "ADS1115_READ");
         return ret;
     }
 
@@ -397,6 +441,7 @@ esp_err_t ads1115_helper_read_channel(uint8_t device_id, ads111x_mux_t channel, 
             ESP_LOGE(TAG, "[Dev %d] Failed to check busy status: %s (%d)", device_id, esp_err_to_name(ret), ret);
             ads1115_devices[device_id].initialized = false;
             xSemaphoreGive(xADS1115Mutex);
+            fluctus_release_bus_power(POWER_BUS_3V3, "ADS1115_READ");
             return ret;
         }
 
@@ -409,6 +454,7 @@ esp_err_t ads1115_helper_read_channel(uint8_t device_id, ads111x_mux_t channel, 
                 ESP_LOGE(TAG, "[Dev %d] Conversion timeout after %d ms", device_id, conversion_timeout_ms);
                 ads1115_devices[device_id].initialized = false;
                 xSemaphoreGive(xADS1115Mutex);
+                fluctus_release_bus_power(POWER_BUS_3V3, "ADS1115_READ");
                 return ESP_ERR_TIMEOUT;
             }
         }
@@ -420,6 +466,7 @@ esp_err_t ads1115_helper_read_channel(uint8_t device_id, ads111x_mux_t channel, 
         ESP_LOGE(TAG, "[Dev %d] Failed to get value: %s (%d)", device_id, esp_err_to_name(ret), ret);
         ads1115_devices[device_id].initialized = false;
         xSemaphoreGive(xADS1115Mutex);
+        fluctus_release_bus_power(POWER_BUS_3V3, "ADS1115_READ");
         return ret;
     }
 
@@ -439,6 +486,9 @@ esp_err_t ads1115_helper_read_channel(uint8_t device_id, ads111x_mux_t channel, 
     }
 
     xSemaphoreGive(xADS1115Mutex);
+
+    // Release power - read complete
+    fluctus_release_bus_power(POWER_BUS_3V3, "ADS1115_READ");
     return ESP_OK;
 }
 

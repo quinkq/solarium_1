@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
 
 #include "sdkconfig.h"
 
@@ -23,6 +24,7 @@
 #include "solar_calc.h" // For debug printouts only - remvoe it later
 #include "hmi.h"
 #include "wifi_helper.h"
+#include "interval_config.h"
 
 #include "driver/ledc.h"
 #include "driver/gpio.h"
@@ -284,6 +286,13 @@ void app_main(void)
            (chip_info.features & CHIP_FEATURE_EMB_FLASH) ? "embedded" : "external");
     printf("Minimum free heap size: %" PRIu32 " bytes\n", esp_get_minimum_free_heap_size());
 
+    // Configure timezone for Poland (CET/CEST with automatic DST transitions)
+    // CET = UTC+1 (winter), CEST = UTC+2 (summer)
+    // DST: Last Sunday of March 02:00 -> Last Sunday of October 03:00
+    setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3", 1);
+    tzset();
+    ESP_LOGI(TAG, "Timezone configured: CET-1CEST (Poland)");
+
     // Initialize Wi-Fi helper (handles WiFi, SNTP, reconnection, power management)
     vTaskDelay(pdMS_TO_TICKS(100));
     ESP_LOGI(TAG, "Initializing WiFi helper...");
@@ -299,36 +308,8 @@ void app_main(void)
     ESP_LOGI(TAG, "Initializing SPI2 bus...");
     ESP_ERROR_CHECK(spi_bus_init());
 
-    // Initialize ADS1115 helper system
-    vTaskDelay(pdMS_TO_TICKS(100));
-    ESP_LOGI(TAG, "Initializing ADS1115 helper...");
-    esp_err_t ads_init_result = ads1115_helper_general_init();
-    if (ads_init_result == ESP_FAIL) {
-        ESP_LOGW(TAG,
-                 "No ADS1115 devices available at startup - system will continue with limited "
-                 "functionality");
-        ESP_LOGW(TAG, "The ADS1115 helper retry task will attempt to recover failed devices automatically");
-    } else {
-        ESP_LOGI(TAG, "ADS1115 helper system initialized successfully");
-    }
-
-
-    //---------- Core system TASKS ----------
-
-    ESP_LOGI(TAG, "Creating tasks...");
-
-    // Initialize solar calculator (CRITICAL: Must run BEFORE fluctus_init for midnight callback registration)
-    vTaskDelay(pdMS_TO_TICKS(100));
-    ESP_LOGI(TAG, "Initializing solar calculator...");
-    solar_calc_init();
-
-    // Test solar calculator
-    const solar_times_t *times = solar_calc_get_times();
-    ESP_LOGI(TAG, "Today's sunrise: %s", ctime(&times->sunrise_time));
-    ESP_LOGI(TAG, "Today's sunset: %s", ctime(&times->sunset_time));
-    ESP_LOGI(TAG, "Is daytime: %s", solar_calc_is_daytime() ? "YES" : "NO");
-
     // Initialize telemetry subsystem (power metering, weather data collection, LittleFS storage)
+    // IMPORTANT: Must run BEFORE interval_config_init (mounts LittleFS at /data)
     vTaskDelay(pdMS_TO_TICKS(100));
     ESP_LOGI(TAG, "Initializing telemetry subsystem...");
     esp_err_t telemetry_ret = telemetry_init();
@@ -339,18 +320,33 @@ void app_main(void)
         ESP_LOGI(TAG, "Telemetry subsystem initialized successfully");
     }
 
-    // Initialize HMI system (OLED display + rotary encoder)
+    // Initialize interval configuration (Must run AFTER telemetry, BEFORE core component init)
     vTaskDelay(pdMS_TO_TICKS(100));
-    ESP_LOGI(TAG, "Initializing HMI system...");
-    esp_err_t hmi_ret = hmi_init();
-    if (hmi_ret != ESP_OK) {
-        ESP_LOGE(TAG, "HMI initialization failed: %s", esp_err_to_name(hmi_ret));
-        ESP_LOGW(TAG, "System will continue without display/user interface");
+    ESP_LOGI(TAG, "Loading interval configuration...");
+    esp_err_t interval_ret = interval_config_init();
+    if (interval_ret != ESP_OK) {
+        ESP_LOGW(TAG, "Interval config load failed, using defaults");
     } else {
-        ESP_LOGI(TAG, "HMI initialized successfully");
+        ESP_LOGI(TAG, "Interval configuration loaded successfully");
     }
 
+    // Initialize solar calculator (Must run BEFORE fluctus_init for midnight callback registration)
+    vTaskDelay(pdMS_TO_TICKS(100));
+    ESP_LOGI(TAG, "Initializing solar calculator...");
+    solar_calc_init();
+
+    //---------- Core system TASKS ----------
+
+    ESP_LOGI(TAG, "Creating core system tasks...");
+
+    // Test solar calculator
+    const solar_times_t *times = solar_calc_get_times();
+    ESP_LOGI(TAG, "Today's sunrise: %s", ctime(&times->sunrise_time));
+    ESP_LOGI(TAG, "Today's sunset: %s", ctime(&times->sunset_time));
+    ESP_LOGI(TAG, "Is daytime: %s", solar_calc_is_daytime() ? "YES" : "NO");
+
     // Initialize FLUCTUS power management and solar tracking system
+    // IMPORTANT: Must be initialized BEFORE ads1115_helper (ADS1115 needs 3.3V bus power)
     vTaskDelay(pdMS_TO_TICKS(100));
     ESP_LOGI(TAG, "Initializing FLUCTUS power management...");
     esp_err_t fluctus_ret = fluctus_init();
@@ -359,6 +355,19 @@ void app_main(void)
         // Continue anyway - system can still operate with limited functionality
     } else {
         ESP_LOGI(TAG, "FLUCTUS initialized successfully");
+    }
+
+    // Initialize ADS1115 helper system (requires FLUCTUS for 3.3V bus power)
+    vTaskDelay(pdMS_TO_TICKS(100));
+    ESP_LOGI(TAG, "Initializing ADS1115 helper...");
+    esp_err_t ads_init_result = ads1115_helper_general_init();
+    if (ads_init_result == ESP_FAIL) {
+        ESP_LOGW(TAG,
+                 "No ADS1115 devices available at startup - system will continue with limited "
+                 "functionality");
+        ESP_LOGW(TAG, "The ADS1115 helper retry task will attempt to recover failed devices automatically");
+    } else {
+        ESP_LOGI(TAG, "ADS1115 helper system initialized successfully");
     }
 
     // Initialize weather station (SHT4x, BME280, AS5600, PMS5003)
@@ -400,6 +409,18 @@ void app_main(void)
             ESP_LOGI(TAG, "STELLARIA auto mode enabled");
         }
     }
+
+    // Initialize HMI system (OLED display + rotary encoder)
+    vTaskDelay(pdMS_TO_TICKS(100));
+    ESP_LOGI(TAG, "Initializing HMI system...");
+    esp_err_t hmi_ret = hmi_init();
+    if (hmi_ret != ESP_OK) {
+        ESP_LOGE(TAG, "HMI initialization failed: %s", esp_err_to_name(hmi_ret));
+        ESP_LOGW(TAG, "System will continue without display/user interface");
+    } else {
+        ESP_LOGI(TAG, "HMI initialized successfully");
+    }
+
 /*
     // Misc tasks / debug tools - ADS1115 retry task now handled by ads1115_helper component
     xTaskCreate(serial_debug_display_task, "serial_debug_display_task", configMINIMAL_STACK_SIZE * 4, NULL, 5, NULL);

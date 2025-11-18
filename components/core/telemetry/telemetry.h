@@ -1,31 +1,44 @@
 #ifndef TELEMETRY_H
 #define TELEMETRY_H
 
-#include <time.h>
-#include <stdbool.h>
-#include "esp_err.h"
-
-#include "solar_calc.h"
-
 #include "impluvium.h"
 #include "fluctus.h"
 #include "tempesta.h"
 #include "stellaria.h"
 #include "wifi_helper.h"
 
+#include "esp_err.h"
+
 // ########################## Configuration ##########################
+
+// PSRAM ring buffer (512 KB, 1,820 slots of 288 bytes each)
+#define BUFFER_SLOT_SIZE 288
+#define BUFFER_CAPACITY 1820
+#define BUFFER_PAYLOAD_SIZE 256
+
+// FLASH backup configuration
+#define FLASH_BACKUP_FILE "/data/mqtt_backup.dat"
+#define FLASH_BACKUP_CAPACITY 4096          // ~1 MB / 288 bytes per slot (256 payload + 32 metadata)
+#define FLASH_BACKUP_THRESHOLD 1729         // 95% of PSRAM (1820 * 0.95)
+#define FLASH_BACKUP_MAGIC 0xDEADBEEF
+#define FLASH_BATCH_SIZE 100                // Write 100 slots at a time
 
 // Storage configuration
 #define TELEMETRY_LITTLEFS_MOUNT_POINT    "/data"
 #define TELEMETRY_POWER_DATA_FILE         "/data/power.dat"
 
 // MQTT configuration (from menuconfig - see Kconfig.projbuild)
-#define TELEMETRY_MQTT_BROKER_URI     CONFIG_TELEMETRY_MQTT_BROKER_URI
-#define TELEMETRY_MQTT_USERNAME       CONFIG_TELEMETRY_MQTT_USERNAME
-#define TELEMETRY_MQTT_PASSWORD       CONFIG_TELEMETRY_MQTT_PASSWORD
-#define TELEMETRY_MQTT_CLIENT_ID      CONFIG_TELEMETRY_MQTT_CLIENT_ID
-#define TELEMETRY_MQTT_TOPIC_HOURLY   "solarium/power/hourly"
-#define TELEMETRY_MQTT_TOPIC_DAILY    "solarium/power/daily"
+#define TELEMETRY_MQTT_BROKER_URI        CONFIG_TELEMETRY_MQTT_BROKER_URI
+#define TELEMETRY_MQTT_USERNAME          CONFIG_TELEMETRY_MQTT_USERNAME
+#define TELEMETRY_MQTT_PASSWORD          CONFIG_TELEMETRY_MQTT_PASSWORD
+#define TELEMETRY_MQTT_CLIENT_ID         CONFIG_TELEMETRY_MQTT_CLIENT_ID
+#define TELEMETRY_MQTT_TOPIC_INTERVAL_SET    "solarium/config/intervals/set"
+#define TELEMETRY_MQTT_TOPIC_INTERVAL_PRESET "solarium/config/intervals/preset"
+#define TELEMETRY_MQTT_TOPIC_INTERVAL_ACK    "solarium/config/intervals/ack"
+
+// MQTT QoS 1 retry configuration
+#define MQTT_PUBACK_TIMEOUT_SEC 5
+#define MQTT_MAX_RETRIES 3
 
 // ########################## Data Structures ##########################
 
@@ -210,5 +223,27 @@ esp_err_t telemetry_manual_flush_to_flash(uint16_t *flushed_count);
  * @return ESP_OK on success
  */
 esp_err_t telemetry_get_buffer_status(uint16_t *buffered_count, uint16_t *buffer_capacity);
+
+// ########################## MQTT Command Handlers (Internal) ##########################
+
+/**
+ * @brief Handle incoming MQTT interval configuration command
+ *
+ * Parses MessagePack payload for interval set/preset commands, validates ranges,
+ * applies changes to interval_config and components, and publishes acknowledgment.
+ *
+ * Supports two command types:
+ * - TELEMETRY_MQTT_TOPIC_INTERVAL_SET: Set individual intervals per component
+ * - TELEMETRY_MQTT_TOPIC_INTERVAL_PRESET: Apply preset profile (Aggressive/Balanced/Conservative)
+ *
+ * @param topic MQTT topic the message was received on
+ * @param data MessagePack binary payload
+ * @param data_len Payload length in bytes
+ * @return ESP_OK on success, ESP_FAIL on parsing/validation error
+ *
+ * @note This function is called internally by telemetry's MQTT event handler
+ * @note Acknowledgments are published to TELEMETRY_MQTT_TOPIC_INTERVAL_ACK with current config
+ */
+esp_err_t telemetry_handle_interval_command(const char *topic, const uint8_t *data, size_t data_len);
 
 #endif // TELEMETRY_H

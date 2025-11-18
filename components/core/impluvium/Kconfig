@@ -1,0 +1,17 @@
+menu "IMPLUVIUM Irrigation System Configuration"
+
+    config IMPLUVIUM_DRY_TEST_MODE
+        bool "Enable Dry Test Mode (Bypass Safety Checks)"
+        default n
+        help
+            When enabled, bypasses critical safety checks for dry test runs:
+            - Water level check: Returns fixed 50% level
+            - Outlet pressure check: Returns fixed 0.5 bar (safe range)
+            - Flow rate check: Bypassed during periodic safety monitoring
+            
+            Note: Temperature checks still use real TEMPESTA sensor.
+            
+            This is a compile-time flag - rebuild after changing.
+
+endmenu
+

@@ -12,11 +12,10 @@
 // ########################## Weather Station Configuration ##########################
 
 // Timing Configuration
-#define WEATHER_COLLECTION_INTERVAL_MS (15 * 60 * 1000) // 15 minutes
-#define WEATHER_COLLECTION_INTERVAL_POWER_SAVE_MS (60 * 60 * 1000) // 60 minutes (power save mode)
-#define WEATHER_AS5600_SAMPLE_DURATION_MS (5 * 1000)    // 5 seconds for wind speed
-#define WEATHER_AS5600_SAMPLE_INTERVAL_MS (100)         // 10Hz sampling
-#define WEATHER_PMS5003_WARMUP_TIME_MS (35 * 1000)      // 35s warmup (30s + safety)
+// Probing intervals in interval_config
+#define WEATHER_AS5600_SAMPLE_DURATION_MS (5 * 1000)               // 5 seconds for wind speed
+#define WEATHER_AS5600_SAMPLE_INTERVAL_MS (100)                    // 10Hz sampling
+#define WEATHER_PMS5003_WARMUP_TIME_MS (35 * 1000)                 // 35s warmup (30s + safety)
 
 // Sensor Configuration
 #define WEATHER_AVERAGING_SAMPLES 10  // Historical samples for temperature averaging
@@ -27,30 +26,30 @@
 #define WEATHER_MUTEX_TIMEOUT_UPDATE_MS 1000 // For data updates/init
 
 // GPIO Configuration
-#define WEATHER_RAINFALL_GPIO 19             // Tipbucket pulse counter for rainfall measurement
-#define WEATHER_TANK_INTAKE_GPIO 20          // Tipbucket pulse counter for water tank ingress
-#define WEATHER_PMS5003_TX_GPIO 43          // PMS5003 UART TX (GPIO43)
-#define WEATHER_PMS5003_RX_GPIO 44          // PMS5003 UART RX (GPIO44)
-#define WEATHER_PMS5003_UART_NUM UART_NUM_1 // Use UART1
+#define WEATHER_RAINFALL_GPIO GPIO_NUM_3    // Tipbucket pulse counter for rainfall measurement
+#define WEATHER_TANK_INTAKE_GPIO GPIO_NUM_8 // Tipbucket pulse counter for water tank ingress
+#define WEATHER_PMS5003_TX_GPIO GPIO_NUM_19 // PMS5003 UART TX (GPIO43)
+#define WEATHER_PMS5003_RX_GPIO GPIO_NUM_20 // PMS5003 UART RX (GPIO44)
+#define WEATHER_PMS5003_UART_NUM UART_NUM_2 // Use UART2 (UART0 reserved for console)
 #define WEATHER_PMS5003_RETRY_COUNT 3       // Count of retries for PMS5003
 
 // Rain Sensor Configuration (Tipbucket #1)
 #define WEATHER_RAIN_ML_PER_PULSE 100.0f        // Volume per tip in mm³ (50mL bucket, 2 tips)
-#define WEATHER_RAIN_COLLECTION_AREA_MM2 78.54f  // Collection area in mm² (to be measured)
+#define WEATHER_RAIN_COLLECTION_AREA_MM2 78.54f // Collection area in mm² (to be measured)
 // Tank Intake Sensor Configuration (Tipbucket #2)
-#define WEATHER_TANK_INTAKE_ML_PER_PULSE 50.0f   // Volume per tip in mL (50mL bucket)
+#define WEATHER_TANK_INTAKE_ML_PER_PULSE 50.0f // Volume per tip in mL (50mL bucket)
 
 // Wind Sensor Configuration
-#define WEATHER_WIND_RPM_TO_MS_FACTOR 1.0f       // Conversion factor RPM to m/s (to be calibrated with triple cup anemometer)
+#define WEATHER_WIND_RPM_TO_MS_FACTOR 1.0f // Conversion factor RPM to m/s (to be calibrated with triple cup anemometer)
 
 // Wind Direction Configuration (Hall Sensor Array - ADS1115 Device #3)
-#define WEATHER_WIND_DIR_ADS1115_DEVICE     3                       // ADS1115 device ID (0x4B - Hall_array)
-#define WEATHER_WIND_DIR_HALL_NORTH_CH      ADS111X_MUX_0_GND       // ADS1115 channel for North sensor
-#define WEATHER_WIND_DIR_HALL_EAST_CH       ADS111X_MUX_1_GND       // ADS1115 channel for East sensor
-#define WEATHER_WIND_DIR_HALL_SOUTH_CH      ADS111X_MUX_2_GND       // ADS1115 channel for South sensor
-#define WEATHER_WIND_DIR_HALL_WEST_CH       ADS111X_MUX_3_GND       // ADS1115 channel for West sensor
-#define WEATHER_WIND_DIR_MAX_VOLTAGE        2.5f                    // Maximum voltage when magnet directly overhead (V)
-#define WEATHER_WIND_DIR_THRESHOLD_VOLTAGE  0.2f                    // Minimum voltage to consider sensor active (V)
+#define WEATHER_WIND_DIR_ADS1115_DEVICE 3                // ADS1115 device ID (0x4B - Hall_array)
+#define WEATHER_WIND_DIR_HALL_NORTH_CH ADS111X_MUX_0_GND // ADS1115 channel for North sensor
+#define WEATHER_WIND_DIR_HALL_EAST_CH ADS111X_MUX_1_GND  // ADS1115 channel for East sensor
+#define WEATHER_WIND_DIR_HALL_SOUTH_CH ADS111X_MUX_2_GND // ADS1115 channel for South sensor
+#define WEATHER_WIND_DIR_HALL_WEST_CH ADS111X_MUX_3_GND  // ADS1115 channel for West sensor
+#define WEATHER_WIND_DIR_MAX_VOLTAGE 2.5f                // Maximum voltage when magnet directly overhead (V)
+#define WEATHER_WIND_DIR_THRESHOLD_VOLTAGE 0.2f          // Minimum voltage to consider sensor active (V)
 
 // ########################## Data Structures ##########################
 
@@ -68,12 +67,11 @@ typedef enum {
  * Provides uniform interface matching IMPLUVIUM and STELLARIA components.
  */
 typedef enum {
-    TEMPESTA_STATE_DISABLED = 0,    // System disabled (manual or init)
-    TEMPESTA_STATE_IDLE,            // Normal operation between readings (15min cycle)
-    TEMPESTA_STATE_READING,         // Actively polling sensors (includes PMS5003 warmup)
-    TEMPESTA_STATE_POWER_SAVE,      // Reduced functionality (60min cycle, skip PMS5003)
-    TEMPESTA_STATE_SHUTDOWN,        // Load shedding forced shutdown (FLUCTUS VERY_LOW power)
-    TEMPESTA_STATE_ERROR            // Sensor errors requiring user attention
+    TEMPESTA_STATE_DISABLED = 0, // System disabled (manual or init)
+    TEMPESTA_STATE_IDLE,         // Normal operation between readings
+    TEMPESTA_STATE_READING,      // Actively polling sensors (includes PMS5003 warmup)
+    TEMPESTA_STATE_SHUTDOWN,     // Load shedding forced shutdown (FLUCTUS VERY_LOW power)
+    TEMPESTA_STATE_ERROR         // Sensor errors requiring user attention
 } tempesta_state_t;
 
 typedef struct {
@@ -84,25 +82,26 @@ typedef struct {
     float air_quality_pm10; // PM10 in ug/m3
 
     // Wind measurements
-    float wind_speed_rpm;   // Wind speed in RPM
-    float wind_speed_ms;    // Wind speed in m/s
-    float wind_direction_deg; // Wind direction in degrees (0-360, 0=North, clockwise)
-    const char* wind_direction_cardinal; // Wind direction (N/NE/E/SE/S/SW/W/NW)
+    float wind_speed_rpm;                // Wind speed in RPM
+    float wind_speed_ms;                 // Wind speed in m/s
+    float wind_direction_deg;            // Wind direction in degrees (0-360, 0=North, clockwise)
+    const char *wind_direction_cardinal; // Wind direction (N/NE/E/SE/S/SW/W/NW)
 
     // Rainfall measurements (rain gauge) - weekly reset based on boot day
-    float rainfall_last_hour_mm;     // Last completed hour measurement (mm, stable value)
-    float rainfall_current_hour_mm;  // Current hour accumulation so far (mm, for debug/monitoring)
-    float rainfall_daily_mm;         // Rainfall accumulated today (mm, reset at midnight)
-    float rainfall_weekly_mm;        // Rainfall accumulated this week (mm, reset on boot day)
+    float rainfall_last_hour_mm;    // Last completed hour measurement (mm, stable value)
+    float rainfall_current_hour_mm; // Current hour accumulation so far (mm, for debug/monitoring)
+    float rainfall_daily_mm;        // Rainfall accumulated today (mm, reset at midnight)
+    float rainfall_weekly_mm;       // Rainfall accumulated this week (mm, reset on boot day)
 
     // Tank intake measurements - weekly reset based on boot day
-    float tank_intake_last_hour_ml;     // Last completed hour measurement (mL, stable value)
-    float tank_intake_current_hour_ml;  // Current hour accumulation so far (mL, for debug/monitoring)
-    float tank_intake_daily_ml;         // Tank intake accumulated today (mL, reset at midnight)
-    float tank_intake_weekly_ml;        // Tank intake accumulated this week (mL, reset on boot day)
+    float tank_intake_last_hour_ml;    // Last completed hour measurement (mL, stable value)
+    float tank_intake_current_hour_ml; // Current hour accumulation so far (mL, for debug/monitoring)
+    float tank_intake_daily_ml;        // Tank intake accumulated today (mL, reset at midnight)
+    float tank_intake_weekly_ml;       // Tank intake accumulated this week (mL, reset on boot day)
 
     // System state
-    tempesta_state_t state;  // Current operational state
+    tempesta_state_t state; // Current operational state
+    bool power_save_mode;   // Power saving mode active (60min cycle vs 15min)
 
     // Sensor status tracking
     weather_sensor_status_t temp_sensor_status;
@@ -129,10 +128,10 @@ typedef struct {
     uint8_t humidity_history_count;
 
     // Rainfall tracking
-    int64_t rainfall_hourly_start_time_ms;  // Monotonic time when hourly tracking started
-    int rainfall_hourly_start_pulses;       // Pulse count at start of hour
-    int rainfall_daily_base_pulses;         // Pulse count at last midnight (for daily calculation)
-    int rainfall_weekly_base_pulses;        // Pulse count at last Monday midnight (for weekly calculation)
+    int64_t rainfall_hourly_start_time_ms; // Monotonic time when hourly tracking started
+    int rainfall_hourly_start_pulses;      // Pulse count at start of hour
+    int rainfall_daily_base_pulses;        // Pulse count at last midnight (for daily calculation)
+    int rainfall_weekly_base_pulses;       // Pulse count at last Monday midnight (for weekly calculation)
 
     // Tank intake tracking
     int64_t tank_intake_hourly_start_time_ms; // Monotonic time when hourly tracking started
@@ -176,10 +175,20 @@ float tempesta_get_temperature(void);
 
 /**
  * @brief Set power saving mode for TEMPESTA weather station
- * @param enable True to enable power save mode (60min polling interval), false for normal operation
+ * @param enable True to enable power save mode (60min polling interval), false for normal (15min)
  * @return ESP_OK on success, ESP_ERR_INVALID_STATE if not initialized
+ * @note This is a flag modifier, independent of the state machine. Works when state is IDLE.
  */
 esp_err_t tempesta_set_power_save_mode(bool enable);
+
+/**
+ * @brief Set TEMPESTA collection intervals (runtime adjustment)
+ * @param normal_min Normal mode interval in minutes (5-60)
+ * @param power_save_min Power save mode interval in minutes (15-120)
+ * @return ESP_OK on success, ESP_ERR_INVALID_ARG if out of range
+ * @note Updates configuration file and timer period immediately if system is operational
+ */
+esp_err_t tempesta_set_collection_intervals(uint32_t normal_min, uint32_t power_save_min);
 
 /**
  * @brief Set shutdown state for TEMPESTA weather station (for load shedding)
@@ -201,6 +210,13 @@ esp_err_t tempesta_set_pms5003_enabled(bool enable);
  * @return ESP_OK on success, ESP_ERR_INVALID_STATE if not initialized
  */
 esp_err_t tempesta_set_system_enabled(bool enable);
+
+/**
+ * @brief Get current TEMPESTA operational state (lightweight, no snapshot fetch)
+ * @return Current tempesta_state_t value
+ * @note Thread-safe, uses quick mutex with 100ms timeout. Returns DISABLED on mutex timeout.
+ */
+tempesta_state_t tempesta_get_state(void);
 
 /**
  * @brief Force immediate data collection cycle (outside normal 15-min schedule)

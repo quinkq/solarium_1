@@ -17,13 +17,13 @@
  * Part of the Solarium project - Solar-powered garden automation system
  */
 
-#include <stdio.h>
-#include <string.h>
-
 #include "stellaria.h"
 #include "fluctus.h"
 #include "telemetry.h"
+
 #include "esp_log.h"
+#include <stdio.h>
+#include <string.h>
 
 
 // ########################## Constants and Variables ##########################
@@ -38,6 +38,7 @@ static stellaria_snapshot_t stellaria_status = {
     .driver_enabled = false,
     .initialized = false,
     .auto_mode_active = false,
+    .power_save_mode = false,
     .last_light_reading = -1.0f,
     .snapshot_timestamp = 0
 };
@@ -45,6 +46,7 @@ static stellaria_snapshot_t stellaria_status = {
 // Previous state for shutdown recovery
 static stellaria_state_t previous_state = STELLARIA_STATE_DISABLED;
 static uint16_t previous_intensity = 0;
+static bool previous_power_save_mode = false;
 
 // Mutex for thread-safe operations
 static SemaphoreHandle_t xStellariaMutex = NULL;
@@ -62,7 +64,7 @@ static bool irrigation_dimming_active = false;     // Flag for irrigation dimmin
 
 static esp_err_t stellaria_pwm_init(void);
 static esp_err_t stellaria_apply_pwm(void);
-static uint16_t stellaria_clamp_intensity(uint16_t intensity, stellaria_state_t state);
+static uint16_t stellaria_clamp_intensity(uint16_t intensity, stellaria_state_t state, bool power_save_mode);
 static uint16_t stellaria_calculate_effective_target(void);
 static void stellaria_start_ramp(uint16_t target);
 static void stellaria_ramp_task(void *pvParameters);
@@ -93,7 +95,7 @@ static esp_err_t stellaria_pwm_init(void)
     
     // Configure channel
     ledc_channel_config_t channel_conf = {
-        .gpio_num = STELLARIA_PWM_GPIO,
+        .gpio_num = STELLARIA_LED_PWM_GPIO,
         .speed_mode = STELLARIA_PWM_SPEED_MODE,
         .channel = STELLARIA_PWM_CHANNEL,
         .timer_sel = STELLARIA_PWM_TIMER,
@@ -108,7 +110,7 @@ static esp_err_t stellaria_pwm_init(void)
     }
     
     ESP_LOGI(TAG, "PWM initialized - GPIO%d, %dHz, %d-bit (100kΩ external pull-down)",
-             STELLARIA_PWM_GPIO, STELLARIA_PWM_FREQUENCY,
+             STELLARIA_LED_PWM_GPIO, STELLARIA_PWM_FREQUENCY,
              1 << STELLARIA_PWM_RESOLUTION);
     return ESP_OK;
 }
@@ -137,30 +139,23 @@ static esp_err_t stellaria_apply_pwm(void)
 }
 
 /**
- * @brief Clamp intensity based on current state and apply minimum threshold
+ * @brief Clamp intensity based on current state, power save mode, and apply minimum threshold
  */
-static uint16_t stellaria_clamp_intensity(uint16_t intensity, stellaria_state_t state)
+static uint16_t stellaria_clamp_intensity(uint16_t intensity, stellaria_state_t state, bool power_save_mode)
 {
-    // Apply state-specific limits first
-    switch (state) {
-        case STELLARIA_STATE_DISABLED:
-        case STELLARIA_STATE_SHUTDOWN:
-            return 0;
+    // Check state first - disabled/shutdown always returns 0
+    if (state == STELLARIA_STATE_DISABLED || state == STELLARIA_STATE_SHUTDOWN) {
+        return 0;
+    }
 
-        case STELLARIA_STATE_POWER_SAVE:
-            if (intensity > STELLARIA_POWER_SAVE_LIMIT) {
-                intensity = STELLARIA_POWER_SAVE_LIMIT;
-            }
-            break;
+    // Apply power save limit if active
+    if (power_save_mode && intensity > STELLARIA_POWER_SAVE_LIMIT) {
+        intensity = STELLARIA_POWER_SAVE_LIMIT;
+    }
 
-        case STELLARIA_STATE_ENABLED:
-        case STELLARIA_STATE_AUTO:
-        default:
-            // Clamp to maximum for enabled/auto states
-            if (intensity > STELLARIA_MAX_INTENSITY) {
-                intensity = STELLARIA_MAX_INTENSITY;
-            }
-            break;
+    // Clamp to maximum for enabled state
+    if (intensity > STELLARIA_MAX_INTENSITY) {
+        intensity = STELLARIA_MAX_INTENSITY;
     }
 
     // Apply minimum threshold: if non-zero but below minimum, clamp to minimum
@@ -180,8 +175,8 @@ static uint16_t stellaria_calculate_effective_target(void)
 {
     uint16_t target = user_raw_intensity;
 
-    // Apply state-specific clamping
-    target = stellaria_clamp_intensity(target, stellaria_status.state);
+    // Apply state-specific clamping with power save mode
+    target = stellaria_clamp_intensity(target, stellaria_status.state, stellaria_status.power_save_mode);
 
     // Irrigation dimming overrides everything (if lights would be on)
     if (irrigation_dimming_active && target > 0) {
@@ -197,6 +192,9 @@ static uint16_t stellaria_calculate_effective_target(void)
 static void stellaria_ramp_task(void *pvParameters)
 {
     while (1) {
+        xSemaphoreTake(xStellariaMutex, portMAX_DELAY);
+        telemetry_fetch_snapshot(TELEMETRY_SRC_STELLARIA);
+        xSemaphoreGive(xStellariaMutex);
         // Suspend immediately - will be resumed when ramping needed
         vTaskSuspend(NULL);
 
@@ -226,11 +224,8 @@ static void stellaria_ramp_task(void *pvParameters)
                 // Apply to hardware
                 stellaria_apply_pwm();
 
-                // Give mutex BEFORE telemetry and delay
+                // Give mutex BEFORE delay
                 xSemaphoreGive(xStellariaMutex);
-
-                // Update TELEMETRY cache (outside mutex)
-                telemetry_fetch_snapshot(TELEMETRY_SRC_STELLARIA);
 
             } else {
                 // Couldn't get mutex, exit ramp loop
@@ -246,7 +241,7 @@ static void stellaria_ramp_task(void *pvParameters)
 
 /**
  * @brief Start ramping to a new target intensity
- * @note Must be called with mutex already held
+ * @note Must be called with mutex already held. Returns with mutex held.
  */
 static void stellaria_start_ramp(uint16_t target)
 {
@@ -412,21 +407,18 @@ esp_err_t stellaria_enable(void)
 
     if (xSemaphoreTake(xStellariaMutex, pdMS_TO_TICKS(STELLARIA_MUTEX_TIMEOUT_MS)) == pdTRUE) {
         // Idempotent: if already enabled, just return success
-        if (stellaria_status.state == STELLARIA_STATE_ENABLED ||
-            stellaria_status.state == STELLARIA_STATE_POWER_SAVE ||
-            stellaria_status.state == STELLARIA_STATE_AUTO) {
+        if (stellaria_status.state == STELLARIA_STATE_ENABLED) {
             xSemaphoreGive(xStellariaMutex);
             ESP_LOGD(TAG, "STELLARIA already enabled, ignoring redundant call");
             return ESP_OK;
         }
 
         esp_err_t ret = ESP_OK;
+        stellaria_status.state = STELLARIA_STATE_ENABLED;
 
         // Check if auto mode is active
         if (stellaria_status.auto_mode_active) {
             // Auto mode decides based on current light levels
-            stellaria_status.state = STELLARIA_STATE_AUTO;
-
             // Check current light reading to decide initial state
             if (stellaria_status.last_light_reading > STELLARIA_LIGHT_TURN_ON_THRESHOLD) {
                 // Dark - turn lights ON
@@ -440,7 +432,6 @@ esp_err_t stellaria_enable(void)
             }
         } else {
             // Manual mode - turn lights ON
-            stellaria_status.state = STELLARIA_STATE_ENABLED;
             ret = stellaria_on_state();
             ESP_LOGI(TAG, "STELLARIA enabled in MANUAL mode - lights ON");
         }
@@ -475,6 +466,23 @@ esp_err_t stellaria_disable(void)
     return ESP_FAIL;
 }
 
+/**
+ * @brief Get current STELLARIA operational state (lightweight, no snapshot fetch)
+ * @return Current stellaria_state_t value
+ * @note Thread-safe, uses quick mutex with 100ms timeout. Returns DISABLED on mutex timeout.
+ */
+stellaria_state_t stellaria_get_state(void)
+{
+    stellaria_state_t state = STELLARIA_STATE_DISABLED;
+
+    if (xSemaphoreTake(xStellariaMutex, pdMS_TO_TICKS(STELLARIA_MUTEX_TIMEOUT_MS)) == pdTRUE) {
+        state = stellaria_status.state;
+        xSemaphoreGive(xStellariaMutex);
+    }
+
+    return state;
+}
+
 esp_err_t stellaria_set_power_save_mode(bool enable)
 {
     if (!stellaria_status.initialized) {
@@ -482,42 +490,41 @@ esp_err_t stellaria_set_power_save_mode(bool enable)
     }
 
     if (xSemaphoreTake(xStellariaMutex, pdMS_TO_TICKS(STELLARIA_MUTEX_TIMEOUT_MS)) == pdTRUE) {
-        if (enable) {
-            if (stellaria_status.state == STELLARIA_STATE_ENABLED) {
-                stellaria_status.state = STELLARIA_STATE_POWER_SAVE;
+        if (enable && !stellaria_status.power_save_mode) {
+            // Enable power save mode
+            stellaria_status.power_save_mode = true;
 
-                // PERMANENTLY clamp user preference if above limit (one-way operation!)
-                if (user_raw_intensity > STELLARIA_POWER_SAVE_LIMIT) {
-                    user_raw_intensity = STELLARIA_POWER_SAVE_LIMIT;
-                    ESP_LOGI(TAG, "Power-save mode: user preference PERMANENTLY clamped to %d", STELLARIA_POWER_SAVE_LIMIT);
-                }
-
-                // Recalculate effective target and ramp (unless irrigation dimming active)
-                uint16_t effective_target = stellaria_calculate_effective_target();
-                if (!irrigation_dimming_active) {
-                    stellaria_start_ramp(effective_target);
-                }
-
-                ESP_LOGI(TAG, "Power save mode enabled (intensity limited to %d)", STELLARIA_POWER_SAVE_LIMIT);
+            // PERMANENTLY clamp user preference if above limit (one-way operation!)
+            if (user_raw_intensity > STELLARIA_POWER_SAVE_LIMIT) {
+                user_raw_intensity = STELLARIA_POWER_SAVE_LIMIT;
+                ESP_LOGI(TAG, "Power-save mode: user preference PERMANENTLY clamped to %d", STELLARIA_POWER_SAVE_LIMIT);
             }
-        } else {
-            if (stellaria_status.state == STELLARIA_STATE_POWER_SAVE) {
-                stellaria_status.state = STELLARIA_STATE_ENABLED;
 
-                // user_raw_intensity stays at its current value (no restoration)
-                // Just ensure it doesn't exceed maximum for ENABLED state
-                if (user_raw_intensity > STELLARIA_MAX_INTENSITY) {
-                    user_raw_intensity = STELLARIA_MAX_INTENSITY;
-                }
-
-                // Recalculate effective target with new state and ramp (unless irrigation dimming active)
-                uint16_t effective_target = stellaria_calculate_effective_target();
-                if (!irrigation_dimming_active) {
-                    stellaria_start_ramp(effective_target);
-                }
-
-                ESP_LOGI(TAG, "Power save mode disabled (user preference: %d)", user_raw_intensity);
+            // Recalculate effective target and ramp (unless irrigation dimming active)
+            uint16_t effective_target = stellaria_calculate_effective_target();
+            if (!irrigation_dimming_active && stellaria_status.state == STELLARIA_STATE_ENABLED) {
+                stellaria_start_ramp(effective_target);
             }
+
+            ESP_LOGI(TAG, "Power save mode enabled (intensity limited to %d)", STELLARIA_POWER_SAVE_LIMIT);
+
+        } else if (!enable && stellaria_status.power_save_mode) {
+            // Disable power save mode
+            stellaria_status.power_save_mode = false;
+
+            // user_raw_intensity stays at its current value (no restoration)
+            // Just ensure it doesn't exceed maximum
+            if (user_raw_intensity > STELLARIA_MAX_INTENSITY) {
+                user_raw_intensity = STELLARIA_MAX_INTENSITY;
+            }
+
+            // Recalculate effective target and ramp (unless irrigation dimming active)
+            uint16_t effective_target = stellaria_calculate_effective_target();
+            if (!irrigation_dimming_active && stellaria_status.state == STELLARIA_STATE_ENABLED) {
+                stellaria_start_ramp(effective_target);
+            }
+
+            ESP_LOGI(TAG, "Power save mode disabled (user preference: %d)", user_raw_intensity);
         }
 
         xSemaphoreGive(xStellariaMutex);
@@ -537,9 +544,10 @@ esp_err_t stellaria_set_shutdown(bool shutdown)
         esp_err_t ret = ESP_OK;
 
         if (shutdown) {
-            // Save current state and user preference for recovery
+            // Save current state, power save mode, and user preference for recovery
             previous_state = stellaria_status.state;
             previous_intensity = user_raw_intensity;  // Save user preference, not target
+            previous_power_save_mode = stellaria_status.power_save_mode;
 
             // Set shutdown state
             stellaria_status.state = STELLARIA_STATE_SHUTDOWN;
@@ -547,23 +555,21 @@ esp_err_t stellaria_set_shutdown(bool shutdown)
             // Turn off using proper state handler (ramps down + releases power)
             ret = stellaria_off_state();
 
-            ESP_LOGI(TAG, "STELLARIA shutdown for load shedding (saved state: %d, intensity: %d)",
-                     previous_state, previous_intensity);
+            ESP_LOGI(TAG, "STELLARIA shutdown for load shedding (saved state: %d, intensity: %d, power_save: %d)",
+                     previous_state, previous_intensity, previous_power_save_mode);
         } else {
-            // Restore previous state
+            // Restore previous state and flags
             stellaria_status.state = previous_state;
             user_raw_intensity = previous_intensity;  // Restore user preference
+            stellaria_status.power_save_mode = previous_power_save_mode;
 
             // If the restored state requires lights to be on, use proper state handler
-            if (previous_state == STELLARIA_STATE_ENABLED ||
-                previous_state == STELLARIA_STATE_POWER_SAVE ||
-                previous_state == STELLARIA_STATE_AUTO) {
-
+            if (previous_state == STELLARIA_STATE_ENABLED) {
                 // Turn on using proper state handler (requests power + smooth ramp)
                 ret = stellaria_on_state();
 
-                ESP_LOGI(TAG, "STELLARIA restored from shutdown (state: %d, ramping to: %d)",
-                         previous_state, stellaria_status.target_intensity);
+                ESP_LOGI(TAG, "STELLARIA restored from shutdown (state: ENABLED, ramping to: %d, power_save: %d)",
+                         stellaria_status.target_intensity, stellaria_status.power_save_mode);
             } else {
                 // Previous state was DISABLED - just restore state, no action needed
                 ESP_LOGI(TAG, "STELLARIA restored from shutdown to DISABLED state");
@@ -626,11 +632,7 @@ esp_err_t stellaria_set_auto_mode(bool enable)
             stellaria_status.auto_mode_active = true;
 
             // Only affect lights if stellaria is currently enabled
-            if (stellaria_status.state == STELLARIA_STATE_ENABLED ||
-                stellaria_status.state == STELLARIA_STATE_POWER_SAVE) {
-
-                stellaria_status.state = STELLARIA_STATE_AUTO;
-
+            if (stellaria_status.state == STELLARIA_STATE_ENABLED) {
                 // Check current light reading to decide state
                 if (stellaria_status.last_light_reading > STELLARIA_LIGHT_TURN_ON_THRESHOLD) {
                     // Dark - ensure lights are ON
@@ -654,14 +656,14 @@ esp_err_t stellaria_set_auto_mode(bool enable)
             // Disable auto mode - return to manual control
             stellaria_status.auto_mode_active = false;
 
-            // Update state based on current operational state
-            if (stellaria_status.state == STELLARIA_STATE_AUTO) {
+            // If currently enabled, ensure lights are in a consistent state
+            if (stellaria_status.state == STELLARIA_STATE_ENABLED) {
                 if (stellaria_status.driver_enabled) {
-                    stellaria_status.state = STELLARIA_STATE_ENABLED;
-                    ESP_LOGI(TAG, "Auto mode disabled - returned to manual ENABLED mode (lights ON)");
+                    ESP_LOGI(TAG, "Auto mode disabled - remaining in ENABLED mode (lights ON)");
                 } else {
+                    // Lights are OFF - transition to DISABLED
                     stellaria_status.state = STELLARIA_STATE_DISABLED;
-                    ESP_LOGI(TAG, "Auto mode disabled - returned to manual DISABLED mode (lights OFF)");
+                    ESP_LOGI(TAG, "Auto mode disabled - transitioning to DISABLED mode (lights OFF)");
                 }
             } else {
                 ESP_LOGI(TAG, "Auto mode disabled (state unchanged)");
@@ -689,8 +691,8 @@ esp_err_t stellaria_update_light_intensity(float averaged_light_voltage)
     if (xSemaphoreTake(xStellariaMutex, pdMS_TO_TICKS(STELLARIA_MUTEX_TIMEOUT_MS)) == pdTRUE) {
         stellaria_status.last_light_reading = averaged_light_voltage;
 
-        // Only control lights if stellaria is enabled (in AUTO state)
-        if (stellaria_status.state != STELLARIA_STATE_AUTO) {
+        // Only control lights if stellaria is enabled
+        if (stellaria_status.state != STELLARIA_STATE_ENABLED) {
             xSemaphoreGive(xStellariaMutex);
             return ESP_OK;  // Auto mode configured but stellaria disabled - do nothing
         }
@@ -751,7 +753,7 @@ esp_err_t stellaria_request_irrigation_dim(bool dim)
             irrigation_dimming_active = false;
 
             // In auto mode, check light conditions to decide target
-            if (stellaria_status.auto_mode_active && stellaria_status.state == STELLARIA_STATE_AUTO) {
+            if (stellaria_status.auto_mode_active && stellaria_status.state == STELLARIA_STATE_ENABLED) {
                 // Use last light reading to determine if auto mode wants lights ON or OFF
                 bool should_be_on = (stellaria_status.last_light_reading > STELLARIA_LIGHT_TURN_ON_THRESHOLD);
                 if (should_be_on) {
@@ -759,7 +761,7 @@ esp_err_t stellaria_request_irrigation_dim(bool dim)
                     if (!stellaria_status.driver_enabled) {
                         stellaria_on_state();
                     } else {
-                        uint16_t restore_target = stellaria_clamp_intensity(auto_mode_intensity, stellaria_status.state);
+                        uint16_t restore_target = stellaria_clamp_intensity(auto_mode_intensity, stellaria_status.state, stellaria_status.power_save_mode);
                         stellaria_start_ramp(restore_target);
                     }
                     ESP_LOGI(TAG, "Irrigation complete: restoring auto mode ON");

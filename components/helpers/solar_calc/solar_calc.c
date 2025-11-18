@@ -50,7 +50,7 @@ static esp_timer_handle_t xMidnightTimer = NULL;
 // ########################## Private Function Declarations ##########################
 
 static double solar_calc_get_julian_day(time_t t);
-static void solar_calc_calculate_solar_times(double julian_day, double latitude, double longitude,
+static void solar_calc_calculate_solar_times(double julian_day, int day_of_year, double latitude, double longitude,
                                               double *sunrise_hour, double *sunset_hour);
 static time_t solar_calc_decimal_hours_to_time(time_t base_time, double hours);
 static void solar_calc_schedule_next_midnight(void);
@@ -79,12 +79,13 @@ static double solar_calc_get_julian_day(time_t t)
  * The trigonometric calculations automatically handle hemisphere differences.
  *
  * @param julian_day Julian day number
+ * @param day_of_year Day of year (1-366) for equation of time calculation
  * @param latitude Latitude in degrees (positive = North, negative = South)
  * @param longitude Longitude in degrees (positive = East, negative = West)
  * @param[out] sunrise_hour Sunrise time in decimal hours (UTC)
  * @param[out] sunset_hour Sunset time in decimal hours (UTC)
  */
-static void solar_calc_calculate_solar_times(double julian_day, double latitude, double longitude,
+static void solar_calc_calculate_solar_times(double julian_day, int day_of_year, double latitude, double longitude,
                                               double *sunrise_hour, double *sunset_hour)
 {
     // Calculate Julian century (same for all locations)
@@ -128,11 +129,19 @@ static void solar_calc_calculate_solar_times(double julian_day, double latitude,
 
     double hour_angle = RAD_TO_DEG(acos(cos_hour_angle));
 
+    // Equation of Time (Fourier series approximation)
+    // Reference: https://www.esrl.noaa.gov/gmd/grad/solcalc/calcdetails.html
+    // Accurate to ±1 minute for typical latitudes
+    double B = 2.0 * PI * (day_of_year - 1) / 365.0;
+    double eot_minutes = 229.18 * (0.000075
+                                   + 0.001868 * cos(B)
+                                   - 0.032077 * sin(B)
+                                   - 0.014615 * cos(2.0 * B)
+                                   - 0.040849 * sin(2.0 * B));
+
     // Solar noon (in decimal hours UTC)
-    // Longitude sign naturally handles hemisphere: negative longitude (West) shifts noon later
-    double equation_of_time = 4.0 * (longitude - RAD_TO_DEG(atan2(sin(2 * DEG_TO_RAD(sun_longitude)),
-                                                                    cos(2 * DEG_TO_RAD(sun_longitude))) * 2));
-    double solar_noon = 12.0 - equation_of_time / 60.0;
+    // Longitude correction: 15 degrees = 1 hour, positive East advances noon
+    double solar_noon = 12.0 - (longitude / 15.0) - (eot_minutes / 60.0);
 
     // Sunrise and sunset times (decimal hours UTC)
     *sunrise_hour = solar_noon - hour_angle / 15.0;
@@ -229,9 +238,14 @@ void solar_calc_update(void)
     time_t noon_today = day_start + 12 * 3600;  // UTC noon
     double julian_day = solar_calc_get_julian_day(noon_today);
 
+    // Extract day of year for equation of time calculation (1-366)
+    struct tm timeinfo;
+    gmtime_r(&now, &timeinfo);
+    int day_of_year = timeinfo.tm_yday + 1;  // tm_yday is 0-based, we need 1-based
+
     // Calculate sunrise and sunset
     double sunrise_hour, sunset_hour;
-    solar_calc_calculate_solar_times(julian_day, SOLAR_CALC_LATITUDE, SOLAR_CALC_LONGITUDE,
+    solar_calc_calculate_solar_times(julian_day, day_of_year, SOLAR_CALC_LATITUDE, SOLAR_CALC_LONGITUDE,
                                      &sunrise_hour, &sunset_hour);
 
     // Convert to time_t

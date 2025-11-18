@@ -1,7 +1,11 @@
 idf_component_register(
     SRCS
         "telemetry.c"
-       
+        "telemetry_cache.c"
+        "telemetry_mqtt_buffer.c"
+        "telemetry_msgpack.c"
+        "telemetry_mqtt_client.c"
+        "telemetry_commands.c"
     INCLUDE_DIRS
         "." 
     REQUIRES
@@ -16,4 +20,5 @@ idf_component_register(
         impluvium
         wifi_helper
         solar_calc
+        interval_config
 )

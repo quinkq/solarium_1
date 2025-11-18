@@ -14,4 +14,11 @@ components/core/telemetry/TELEMETRY_ARCHITECTURE.md
 components/core/telemetry/mqtt_migration.md
 
 components/core/hmi/HMI_ARCHITECTURE.md
-components/core/hmi/TODO_SPLIT.md
+components/core/hmi/HMI_SPLIT_TODO.md
+
+components/helpers/interval_config/MQTT_INTERVAL_COMMANDS.md
+components/helpers/interval_config/INTERVAL_ADJUSTMENT_TODO.md
+components/core/tempesta/TEMPESTA_SPLIT_TODO.md
+components/core/telemetry/TELEMETRY_SPLIT_TODO.md
+components/core/impluvium/IMPLUVIUM_SPLIT_TODO.md
+components/core/fluctus/FLUCTUS_SPLIT_TODO.md

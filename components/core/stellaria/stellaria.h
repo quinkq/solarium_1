@@ -12,7 +12,7 @@
 // ########################## STELLARIA Configuration ##########################
 
 // GPIO Configuration
-#define STELLARIA_PWM_GPIO          GPIO_NUM_2   // PWM intensity control (external 100kΩ pull-down)
+#define STELLARIA_LED_PWM_GPIO          GPIO_NUM_45   // PWM intensity control (external 100kΩ pull-down)
 
 // PWM Configuration
 #define STELLARIA_PWM_FREQUENCY     1000         // 1kHz PWM frequency
@@ -23,8 +23,8 @@
 
 // Intensity Limits (10-bit PWM: 0-1023)
 #define STELLARIA_MIN_INTENSITY     51           // Minimum intensity (5% duty cycle - driver turn-on threshold)
-#define STELLARIA_MAX_INTENSITY     512          // Maximum intensity (50%)
-#define STELLARIA_POWER_SAVE_LIMIT  128          // 12.5% intensity for power saving mode
+#define STELLARIA_MAX_INTENSITY     1023          // Maximum intensity (100%)
+#define STELLARIA_POWER_SAVE_LIMIT  102          // 10% intensity for power saving mode
 
 // Mutex timeout constants
 #define STELLARIA_MUTEX_TIMEOUT_MS  100          // Mutex timeout for operations
@@ -44,9 +44,7 @@
 typedef enum {
     STELLARIA_STATE_DISABLED = 0,    // System disabled
     STELLARIA_STATE_ENABLED,         // System enabled, normal operation
-    STELLARIA_STATE_POWER_SAVE,      // Power saving mode (limited intensity)
-    STELLARIA_STATE_SHUTDOWN,        // Load shedding shutdown
-    STELLARIA_STATE_AUTO             // Automatic light sensing mode
+    STELLARIA_STATE_SHUTDOWN         // Load shedding shutdown
 } stellaria_state_t;
 
 typedef struct {
@@ -56,6 +54,7 @@ typedef struct {
     bool driver_enabled;             // Driver enable state
     bool initialized;                // Component initialization status
     bool auto_mode_active;           // Auto light sensing mode active
+    bool power_save_mode;            // Power saving mode active (intensity limited)
     float last_light_reading;        // Last averaged light reading (V)
     time_t snapshot_timestamp;       // Timestamp of snapshot
 } stellaria_snapshot_t;
@@ -86,6 +85,13 @@ esp_err_t stellaria_enable(void);
  * @return ESP_OK on success, ESP_ERR_INVALID_STATE if not initialized
  */
 esp_err_t stellaria_disable(void);
+
+/**
+ * @brief Get current STELLARIA operational state (lightweight, no snapshot fetch)
+ * @return Current stellaria_state_t value
+ * @note Thread-safe, uses quick mutex with 100ms timeout. Returns DISABLED on mutex timeout.
+ */
+stellaria_state_t stellaria_get_state(void);
 
 /**
  * @brief Set power saving mode (limits intensity to 20%)

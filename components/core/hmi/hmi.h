@@ -3,8 +3,6 @@
 
 #include <stdbool.h>
 #include <time.h>
-#include "freertos/FreeRTOS.h"
-#include "freertos/semphr.h"
 #include "esp_err.h"
 #include "driver/gpio.h"
 
@@ -55,6 +53,7 @@ typedef enum {
     HMI_MENU_FLUCTUS_TRACKING,   // Solar tracking position [1Hz]
     HMI_MENU_FLUCTUS_SOLAR_DEBUG,// Solar tracking debug (errors, sensors) [4Hz REALTIME]
     HMI_MENU_FLUCTUS_CONTROLS,   // Solar tracking & safety controls [1Hz]
+    HMI_MENU_FLUCTUS_INTERVALS,  // Interval configuration (power day/night, solar correction) [1Hz]
     HMI_MENU_TEMPESTA,           // TEMPESTA weather station submenu
     HMI_MENU_TEMPESTA_ENV,       // Environmental sensors details
     HMI_MENU_TEMPESTA_WIND,      // Wind sensor details
@@ -62,6 +61,7 @@ typedef enum {
     HMI_MENU_TEMPESTA_TANK,      // Tank intake details
     HMI_MENU_TEMPESTA_AIR,       // Air quality details
     HMI_MENU_TEMPESTA_CONTROLS,  // System controls (enable/disable, force collection, resets)
+    HMI_MENU_TEMPESTA_INTERVALS, // Interval configuration (normal, power save) [1Hz]
     HMI_MENU_IMPLUVIUM,          // IMPLUVIUM irrigation submenu
     HMI_MENU_IMPLUVIUM_OVERVIEW, // System overview (state, water level, totals) [1Hz]
     HMI_MENU_IMPLUVIUM_STATISTICS, // Hourly/daily water usage statistics [1Hz]
@@ -84,6 +84,7 @@ typedef enum {
     HMI_MENU_IMPLUVIUM_ZONE_CONFIG, // Zone configuration list [1Hz]
     HMI_MENU_IMPLUVIUM_ZONE_EDIT,   // Zone editing (enable/target/deadband/manual water)
     HMI_MENU_IMPLUVIUM_MANUAL_WATER, // Manual water time input
+    HMI_MENU_IMPLUVIUM_INTERVALS, // Interval configuration (optimal/cool/power save/night min) [1Hz]
     HMI_MENU_STELLARIA,          // STELLARIA lighting submenu
     HMI_MENU_STELLARIA_STATUS,   // Status details
     HMI_MENU_STELLARIA_CONTROL,  // Manual control details
@@ -91,6 +92,7 @@ typedef enum {
     HMI_MENU_SYSTEM,             // System menu (WiFi, controls)
     HMI_MENU_SYSTEM_INFO,        // System info (WiFi RSSI, uptime, version)
     HMI_MENU_SYSTEM_CONTROLS,    // System controls (flush & reset, WiFi reconnect)
+    HMI_MENU_SYSTEM_INTERVALS,   // Global interval presets (Aggressive/Balanced/Conservative) [1Hz]
     HMI_MENU_CONFIRM             // Shared confirmation dialog (yes/no)
 } hmi_menu_state_t;
 

@@ -1,19 +1,11 @@
 #ifndef IMPLUVIUM_H
 #define IMPLUVIUM_H
 
-#include <inttypes.h>
-#include <time.h>
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "freertos/event_groups.h"
+#include "ads1115_helper.h"
 #include "esp_err.h"
-
-#include "driver/ledc.h"
 #include "driver/gpio.h"
-#include "driver/pulse_cnt.h"
+#include <time.h>
 
-#include "ads111x.h"
-#include "abp.h"
 
 // Forward declaration for telemetry cache lock (uses impluvium_snapshot_t)
 
@@ -28,25 +20,22 @@
 #define MIN_TEMPERATURE_GLOBAL 0.0f               // 0°C global system safety limit
 #define MAX_TEMPERATURE_GLOBAL 50.0f              // 50°C global system safety limit
 #define MIN_WATER_LEVEL_MBAR 15.0f                // 15 mbar minimum level // Use percentage??
-#define MIN_WATER_LEVEL_PERCENT 5.0f              // % minimum level
+#define MIN_WATER_LEVEL_PERCENT 3.0f              // % minimum level
 
 #define IRRIGATION_ZONE_COUNT 5
 
 // GPIO Pin Assignments
 #define FLOW_SENSOR_GPIO GPIO_NUM_21
-#define VALVE_GPIO_ZONE_1 GPIO_NUM_37
-#define VALVE_GPIO_ZONE_2 GPIO_NUM_38
-#define VALVE_GPIO_ZONE_3 GPIO_NUM_39
-#define VALVE_GPIO_ZONE_4 GPIO_NUM_40
-#define VALVE_GPIO_ZONE_5 GPIO_NUM_41
-#define PUMP_PWM_GPIO GPIO_NUM_42
+#define VALVE_GPIO_ZONE_1 GPIO_NUM_38
+#define VALVE_GPIO_ZONE_2 GPIO_NUM_39
+#define VALVE_GPIO_ZONE_3 GPIO_NUM_40
+#define VALVE_GPIO_ZONE_4 GPIO_NUM_41
+#define VALVE_GPIO_ZONE_5 GPIO_NUM_42
+#define PUMP_PWM_GPIO GPIO_NUM_46
 
 // ABP Pin definitions
 #define ABP_SPI_HOST SPI2_HOST
-#define ABP_MOSI_PIN GPIO_NUM_9 // Not used but required for SPI bus
-#define ABP_MISO_PIN GPIO_NUM_10
-#define ABP_SCLK_PIN GPIO_NUM_11
-#define ABP_CS_PIN GPIO_NUM_12
+#define ABP_CS_PIN   GPIO_NUM_12
 
 // Power Management
 #define MAX_OUTPUT_CURRENT_AMPS 1.25f // Total system current limit (immediate emergency stop)
@@ -127,13 +116,13 @@
 
 // Irrigation State Machine
 typedef enum {
-    IRRIGATION_STANDBY,    // System standby, waiting for moisture check timer (between cycles)
-    IRRIGATION_MEASURING,  // Powering sensors, reading moisture levels
-    IRRIGATION_WATERING,   // Active watering with event-driven monitoring
-    IRRIGATION_STOPPING,   // Pump off, pressure equalizing, valve closing
-    IRRIGATION_MAINTENANCE,// System maintenance tasks (NVS saves, resets, etc.)
-    IRRIGATION_DISABLED    // System disabled (manual disable or load shedding shutdown)
-} irrigation_state_t;
+    IMPLUVIUM_STANDBY,    // System standby, waiting for moisture check timer (between cycles)
+    IMPLUVIUM_MEASURING,  // Powering sensors, reading moisture levels
+    IMPLUVIUM_WATERING,   // Active watering with event-driven monitoring
+    IMPLUVIUM_STOPPING,   // Pump off, pressure equalizing, valve closing
+    IMPLUVIUM_MAINTENANCE,// System maintenance tasks (NVS saves, resets, etc.)
+    IMPLUVIUM_DISABLED    // System disabled (manual disable or load shedding shutdown)
+} impluvium_state_t;
 
 // Learning Algorithm Data Structures
 typedef struct {
@@ -184,6 +173,7 @@ typedef struct {
     ads111x_mux_t moisture_channel;  // Channel on ADS device
     float target_moisture_percent;   // Desired moisture level (0-100%)
     float moisture_deadband_percent; // Tolerance around target (±%)
+    float last_moisture_percent;     // Last measured moisture reading (0-100%)
     bool watering_enabled;           // Zone active/disabled
     int64_t last_watered_time_ms;    // Last watering time (monotonic milliseconds)
     // NOTE: volume_used_today removed - now stored in RTC accumulator (persistent!)
@@ -191,7 +181,7 @@ typedef struct {
     zone_learning_t learning;        // Learning algorithm data
 } irrigation_zone_t;
 
-// TODO: implement event logging
+// TODO: implement event logging - or maybe not?
 // Storing Data Structure
 typedef struct {
     float initial_moisture_percent; // Before watering (%)
@@ -230,7 +220,7 @@ typedef struct {
 
 // System State Structure
 typedef struct {
-    irrigation_state_t state;                                    // Current system state
+    impluvium_state_t state;                                    // Current system state
     uint8_t active_zone;                                         // Currently watering zone (255 = none)
     float outlet_pressure;                                       // System pressure (bar)
     float water_level;                                           // Tank level (%)
@@ -283,7 +273,7 @@ extern irrigation_system_t irrigation_system;
  */
 typedef struct {
     // System state
-    irrigation_state_t state;
+    impluvium_state_t state;
     uint8_t active_zone;                 // NO_ACTIVE_ZONE_ID if none
     bool emergency_stop;
     bool power_save_mode;
@@ -422,12 +412,19 @@ esp_err_t impluvium_init(void);
  * @brief Enable/disable IMPLUVIUM system master switch
  *
  * When disabled, allows current watering to finish, stops moisture check timer,
- * and transitions to IRRIGATION_DISABLED state.
+ * and transitions to IMPLUVIUM_DISABLED state.
  *
  * @param enable True to enable system (resumes normal operation), false to disable
  * @return ESP_OK on success, ESP_ERR_INVALID_STATE if not initialized
  */
 esp_err_t impluvium_set_system_enabled(bool enable);
+
+/**
+ * @brief Get current IMPLUVIUM operational state (lightweight, no snapshot fetch)
+ * @return Current impluvium_state_t value
+ * @note Thread-safe, uses quick mutex with 100ms timeout. Returns DISABLED on mutex timeout.
+ */
+impluvium_state_t impluvium_get_state(void);
 
 /**
  * @brief Force immediate moisture check (bypasses scheduled interval)
@@ -501,6 +498,18 @@ esp_err_t impluvium_force_water_zone(uint8_t zone_id, uint16_t duration_sec);
  * @return ESP_OK on success, ESP_ERR_INVALID_STATE if not initialized
  */
 esp_err_t impluvium_set_power_save_mode(bool enable);
+
+/**
+ * @brief Set IMPLUVIUM moisture check intervals (runtime adjustment)
+ * @param optimal_min Optimal temperature interval in minutes (5-60, for temp ≥20°C)
+ * @param cool_min Cool temperature interval in minutes (10-90, for 10-20°C)
+ * @param power_save_min Power save mode interval in minutes (30-120)
+ * @param night_hours Nighttime minimum interval in hours (1-6)
+ * @return ESP_OK on success, ESP_ERR_INVALID_ARG if out of range
+ * @note Updates configuration file, takes effect automatically on next moisture check cycle
+ */
+esp_err_t impluvium_set_check_intervals(uint32_t optimal_min, uint32_t cool_min,
+                                        uint32_t power_save_min, uint32_t night_hours);
 
 /**
  * @brief Set shutdown state for IMPLUVIUM irrigation system (for load shedding)

@@ -393,7 +393,7 @@ esp_err_t wifi_helper_init(const char *ssid, const char *password)
     BaseType_t task_created = xTaskCreate(
         rssi_monitor_task,
         "wifi_rssi",
-        2048,
+        3072,  // Increased from 2048 to handle UART0 printf buffering??
         NULL,
         5,
         &rssi_monitor_task_handle

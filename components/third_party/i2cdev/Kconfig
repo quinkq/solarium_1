@@ -32,13 +32,13 @@ config I2CDEV_AUTO_ENABLE_PULLUPS
 
 config I2CDEV_DEFAULT_SDA_PIN
 	int "Default I2C SDA pin"
-	default 21
+	default 19
 	help
 		Default SDA pin for I2C devices.
 
 config I2CDEV_DEFAULT_SCL_PIN
 	int "Default I2C SCL pin"
-	default 22
+	default 20
 	help
 		Default SCL pin for I2C devices.
 

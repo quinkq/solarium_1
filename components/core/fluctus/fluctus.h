@@ -3,14 +3,8 @@
 
 #include <stdbool.h>
 #include <time.h>
-#include "freertos/FreeRTOS.h"
-#include "freertos/semphr.h"
-#include "freertos/task.h"
 #include "esp_err.h"
-#include "driver/gpio.h"
-#include "driver/ledc.h"
-#include "ads111x.h"
-#include "ina219.h"
+
 
 // ########################## FLUCTUS Configuration ##########################
 
@@ -18,18 +12,19 @@
 // 3.3V: Push-pull output, HIGH=ON (controls N-MOSFET via SN74AHCT125N buffer)
 // 5V:   Open-drain output, FLOAT=ON, LOW=OFF (100kΩ series to buck EN pin)
 // 6.6V: Open-drain output, LOW=ON (inverted logic buck, 100kΩ pullup to 3.3V)
-// 12V:  Open-drain output, FLOAT=ON, LOW=OFF (100kΩ series to buck EN pin)
-#define FLUCTUS_3V3_BUS_ENABLE_GPIO         GPIO_NUM_0   // 3.3V non-essential sensor bus
+// 12V:  Push-pull output, HIGH=ON (controls N-MOSFET)
+
+#define FLUCTUS_3V3_BUS_ENABLE_GPIO         GPIO_NUM_2   // 3.3V non-essential sensor bus
 #define FLUCTUS_5V_BUS_ENABLE_GPIO          GPIO_NUM_4   // 5V bus (MOSFET drivers + some sensors)
 #define FLUCTUS_6V6_BUS_ENABLE_GPIO         GPIO_NUM_5   // 6.6V servo bus (inverted logic)
 #define FLUCTUS_12V_BUS_ENABLE_GPIO         GPIO_NUM_6   // 12V bus enable (Valves + pump)
-#define FLUCTUS_12V_FAN_PWM_GPIO            GPIO_NUM_45  // 12V cooling fan PWM (Intel cooler)
 
 #define FLUCTUS_3V3_HALL_ARRAY_ENABLE_GPIO  GPIO_NUM_7   // allowing 3.3V to Hall sensor array (MOSFET controlled) 
+#define FLUCTUS_12V_FAN_ENABLE_GPIO         GPIO_NUM_1   // 12V Fan enable
 
 // Solar Tracking Servo GPIOs
-#define FLUCTUS_SERVO_YAW_GPIO          GPIO_NUM_47  // Yaw servo control
-#define FLUCTUS_SERVO_PITCH_GPIO        GPIO_NUM_48  // Pitch servo control
+#define FLUCTUS_SERVO_PWM_YAW_GPIO          GPIO_NUM_47  // Yaw servo control
+#define FLUCTUS_SERVO_PWM_PITCH_GPIO        GPIO_NUM_48  // Pitch servo control
 
 // Temperature Monitoring GPIO
 #define FLUCTUS_DS18B20_GPIO            GPIO_NUM_15  // DS18B20 OneWire temperature sensor
@@ -71,20 +66,21 @@
 #define FLUCTUS_SERVO_ERROR_PARK_PITCH_PERCENT      50.0f    // 50% center position (pitch)
 
 // Fan PWM Configuration (Intel cooler with PWM input)
+#define FLUCTUS_FAN_PWM_GPIO            GPIO_NUM_0  // 12V cooling fan PWM (Intel cooler)
 #define FLUCTUS_FAN_PWM_FREQUENCY       25000        // 25kHz for 4-pin fan control
 #define FLUCTUS_FAN_PWM_RESOLUTION      LEDC_TIMER_8_BIT   // 8-bit resolution (0-255)
 #define FLUCTUS_FAN_PWM_TIMER           LEDC_TIMER_3
 #define FLUCTUS_FAN_PWM_CHANNEL         LEDC_CHANNEL_3
 
 // Temperature Monitoring Configuration
-#define FLUCTUS_TEMP_TURN_ON_THRESHOLD      30.0f    // Turn on fan at 30°C
-#define FLUCTUS_TEMP_TURN_OFF_THRESHOLD     28.0f    // Turn off fan at 28°C (hysteresis)
-#define FLUCTUS_TEMP_MAX_FAN_THRESHOLD      40.0f    // 100% fan speed at 40°C
-#define FLUCTUS_TEMP_MIN_FAN_DUTY           20       // Minimum fan speed (20% at 30°C)
-#define FLUCTUS_TEMP_MAX_FAN_DUTY           100      // Maximum fan speed (100% at 40°C)
-#define FLUCTUS_TEMP_ACTIVE_INTERVAL_MS     5000     // Read temp every 5s during active monitoring
-#define FLUCTUS_TEMP_THERMAL_INTERVAL_MS    60000    // Read temp every 1min during thermal event
-#define FLUCTUS_TEMP_CONVERSION_DELAY_MS    750      // DS18B20 12-bit conversion time
+#define FLUCTUS_FAN_TURN_ON_TEMP_THRESHOLD      30.0f    // Turn on fan at 30°C
+#define FLUCTUS_FAN_TURN_OFF_TEMP_THRESHOLD     28.0f    // Turn off fan at 28°C (hysteresis)
+#define FLUCTUS_FAN_MAX_TEMP_THRESHOLD          40.0f    // 100% fan speed at 40°C
+#define FLUCTUS_FAN_MIN_DUTY                    10       // Minimum fan speed (10% at 30°C)
+#define FLUCTUS_FAN_MAX_DUTY                    100      // Maximum fan speed (100% at 40°C)
+#define FLUCTUS_TEMP_ACTIVE_INTERVAL_MS         5000     // Read temp every 5s during active monitoring
+#define FLUCTUS_TEMP_THERMAL_INTERVAL_MS        60000    // Read temp every 1min during thermal event
+#define FLUCTUS_TEMP_CONVERSION_DELAY_MS        750      // DS18B20 12-bit conversion time
 
 // Power Monitoring Configuration
 #define FLUCTUS_POWER_ACTIVE_MONITOR_INTERVAL_MS    500     // Power reading interval when active
@@ -101,6 +97,8 @@
 #define FLUCTUS_NOTIFY_SOLAR_ENABLE          (1UL << 1)  // Enable solar tracking (solar task)
 #define FLUCTUS_NOTIFY_SOLAR_DISABLE         (1UL << 2)  // Disable solar tracking (solar task)
 #define FLUCTUS_NOTIFY_SUNRISE               (1UL << 3)  // Sunrise detected - wake SLEEPING tracking (solar task)
+#define FLUCTUS_NOTIFY_POWER_STATE_CHANGE    (1UL << 4)  // Power state change detected (core orchestration task)
+#define FLUCTUS_NOTIFY_CONFIG_UPDATE         (1UL << 5)  // Configuration updated - recalculate timeouts (monitoring task)
 
 // Battery Voltage Thresholds (12V AGM, 50% SOC = 0%)
 #define FLUCTUS_BATTERY_LEVEL_POWER_SAVING    12.48f  // 40% SOC - Limit STELLARIA
@@ -260,10 +258,34 @@ bool fluctus_is_bus_powered(power_bus_t bus);
 fluctus_power_state_t fluctus_get_power_state(void);
 
 /**
+ * @brief Get current solar tracking state (lightweight, no snapshot fetch)
+ * @return Current solar_tracking_state_t value
+ * @note Thread-safe, uses quick mutex with 100ms timeout. Returns DISABLED on mutex timeout.
+ */
+solar_tracking_state_t fluctus_get_solar_tracking_state(void);
+
+/**
  * @brief Manual reset from safety shutdown (requires external confirmation)
  * @return ESP_OK if reset successful, ESP_ERR_INVALID_STATE if not in shutdown
  */
 esp_err_t fluctus_manual_safety_reset(void);
+
+/**
+ * @brief Set FLUCTUS power monitoring intervals (runtime adjustment)
+ * @param day_min Daytime interval in minutes (5-60)
+ * @param night_min Nighttime interval in minutes (15-120)
+ * @return ESP_OK on success, ESP_ERR_INVALID_ARG if out of range
+ * @note Updates configuration file and wakes monitoring task for immediate effect
+ */
+esp_err_t fluctus_set_power_intervals(uint32_t day_min, uint32_t night_min);
+
+/**
+ * @brief Set FLUCTUS solar tracking correction interval (runtime adjustment)
+ * @param correction_min Correction cycle interval in minutes (5-60)
+ * @return ESP_OK on success, ESP_ERR_INVALID_ARG if out of range
+ * @note Updates configuration file, takes effect on next STANDBY cycle
+ */
+esp_err_t fluctus_set_solar_interval(uint32_t correction_min);
 
 // ################ Solar Tracking Functions ################
 
@@ -515,4 +537,4 @@ esp_err_t fluctus_write_realtime_to_telemetry_cache(fluctus_snapshot_t *cache);
         } \
     } while(0)
 
-#endif // FLUCTUS_H
+#endif  // FLUCTUS_H
