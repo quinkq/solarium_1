@@ -1,3 +1,24 @@
+/**
+ * @file tempesta_accumulator.c
+ * @brief TEMPESTA rainfall and tank intake accumulation tracking
+ * @author Piotr P. <quinkq@gmail.com>
+ * @date 2025
+ *
+ * Handles time-based accumulation for tipbucket sensors:
+ * - Hourly rollover tracking (completed hour + current hour in progress)
+ * - Daily accumulation (midnight reset via solar_calc callback)
+ * - Weekly accumulation (boot day reset to prevent overflow)
+ * - Hardware counter management (32767 pulse limit protection)
+ * - Pulse-to-physical unit conversions (mm rainfall depth, mL volume)
+ * - Public reset APIs for manual counter management
+ *
+ * Uses monotonic time for hourly tracking and solar_calc midnight callback
+ * for daily resets. Weekly reset on boot day clears hardware counters to
+ * prevent overflow during heavy rain weeks.
+ *
+ * Part of the Solarium project - Solar-powered garden automation system
+ */
+
 #include "tempesta.h"
 #include "tempesta_private.h"
 

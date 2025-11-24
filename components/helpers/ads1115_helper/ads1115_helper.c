@@ -1,26 +1,29 @@
 /**
  * @file ads1115_helper.c
- * @brief Unified ADS1115 ADC interface with retry logic
+ * @brief Unified ADS1115 ADC interface with power-aware retry logic
  * @author Piotr P. <quinkq@gmail.com>
  * @date 2025
  *
- * Original implementation of ADS1115 Helper - unified multi-device ADC management.
+ * Unified multi-device ADC management with automatic fault recovery.
  *
  * Key features:
- * - Three-device management (moisture sensors, photoresistor, wind direction)
- * - Retry macro with 3 attempts, 50ms delays
- * - State caching to reduce I2C traffic
- * - Task-based retry queue for failed reads
- * - Error tracking and recovery
+ * - Four-device management (moisture sensors, mixed sensors, photoresistors, hall array)
+ * - Built-in read retry logic (3 attempts, 50ms delays) - consumers don't need to retry
+ * - Two-tier device recovery strategy:
+ *   - Fast retries: 5s, 10s, 20s (power/transient issues)
+ *   - Slow retries: 1min, 5min, 10min (persistent hardware faults)
+ * - Power-aware operation (FLUCTUS 3.3V bus integration)
+ * - Notification-based recovery task (no polling overhead)
+ * - Voltage caching and thread safety
+ * - Health monitoring (needs_slow_retries flag for diagnostics)
  *
  * Part of the Solarium project - Solar-powered garden automation system
  */
 
 #include "ads1115_helper.h"
+#include "fluctus.h"
 #include "esp_log.h"
 #include "freertos/task.h"
-#include "i2cdev.h"
-#include "fluctus.h"  // For power bus status checking
 #include <string.h>
 
 // ########################## Private Constants ##########################
@@ -43,7 +46,8 @@ ads1115_device_t ads1115_devices[ADS1115_DEVICE_COUNT] = {
         .name = "Moisture_Sensors",
         .initialized = false,
         .retry_count = 0,
-        .next_retry_delay_ms = ADS1115_RETRY_DELAY_MAX_MS,
+        .next_retry_delay_ms = ADS1115_INIT_FAST_RETRY_DELAY_MS,
+        .needs_slow_retries = false,
         .mode = ADS111X_MODE_SINGLE_SHOT,
         .data_rate = ADS111X_DATA_RATE_16,
         .gain = ADS111X_GAIN_4V096
@@ -52,7 +56,8 @@ ads1115_device_t ads1115_devices[ADS1115_DEVICE_COUNT] = {
         .name = "Mixed_Sensors",
         .initialized = false,
         .retry_count = 0,
-        .next_retry_delay_ms = ADS1115_RETRY_DELAY_MAX_MS,
+        .next_retry_delay_ms = ADS1115_INIT_FAST_RETRY_DELAY_MS,
+        .needs_slow_retries = false,
         .mode = ADS111X_MODE_SINGLE_SHOT,
         .data_rate = ADS111X_DATA_RATE_16,
         .gain = ADS111X_GAIN_4V096
@@ -61,7 +66,8 @@ ads1115_device_t ads1115_devices[ADS1115_DEVICE_COUNT] = {
         .name = "Photoresistors",
         .initialized = false,
         .retry_count = 0,
-        .next_retry_delay_ms = ADS1115_RETRY_DELAY_MAX_MS,
+        .next_retry_delay_ms = ADS1115_INIT_FAST_RETRY_DELAY_MS,
+        .needs_slow_retries = false,
         .mode = ADS111X_MODE_SINGLE_SHOT,
         .data_rate = ADS111X_DATA_RATE_128,
         .gain = ADS111X_GAIN_4V096
@@ -70,7 +76,8 @@ ads1115_device_t ads1115_devices[ADS1115_DEVICE_COUNT] = {
         .name = "Hall_array",
         .initialized = false,
         .retry_count = 0,
-        .next_retry_delay_ms = ADS1115_RETRY_DELAY_MAX_MS,
+        .next_retry_delay_ms = ADS1115_INIT_FAST_RETRY_DELAY_MS,
+        .needs_slow_retries = false,
         .mode = ADS111X_MODE_SINGLE_SHOT,
         .data_rate = ADS111X_DATA_RATE_128,
         .gain = ADS111X_GAIN_4V096
@@ -191,94 +198,145 @@ static esp_err_t ads1115_helper_init_device(uint8_t device_id)
 }
 
 /**
+ * @brief Helper function to attempt re-initialization of all failed devices
+ *
+ * @return true if any devices remain failed, false if all devices are working
+ */
+static bool retry_all_failed_devices(void)
+{
+    // Check if 3.3V bus is available before attempting (power-aware)
+    esp_err_t power_check = fluctus_request_bus_power(POWER_BUS_3V3, "ADS1115_RETRY_CHECK");
+    if (power_check != ESP_OK) {
+        ESP_LOGD(TAG, "3.3V bus unavailable for device retry, deferring");
+        return true;  // Still have failed devices, but can't retry now
+    }
+    fluctus_release_bus_power(POWER_BUS_3V3, "ADS1115_RETRY_CHECK");  // Release immediately, init_device will request again
+
+    bool any_failed = false;
+    uint8_t working_count = 0;
+
+    for (uint8_t device = 0; device < ADS1115_DEVICE_COUNT; device++) {
+        ads1115_device_t *status = &ads1115_devices[device];
+
+        if (status->initialized) {
+            working_count++;
+            continue;
+        }
+
+        // Attempt re-initialization
+        ESP_LOGI(TAG, "Retrying ADS1115 device %d (%s)", device, status->name);
+        esp_err_t result = ads1115_helper_init_device(device);
+
+        if (result == ESP_OK) {
+            status->initialized = true;
+            status->retry_count = 0;
+            status->next_retry_delay_ms = ADS1115_INIT_FAST_RETRY_DELAY_MS;
+            working_count++;
+            ESP_LOGI(TAG, "ADS1115 device %d (%s) successfully recovered!", device, status->name);
+        } else {
+            any_failed = true;
+            ESP_LOGW(TAG, "ADS1115 device %d (%s) retry failed: %s", device, status->name, esp_err_to_name(result));
+        }
+    }
+
+    ESP_LOGI(TAG, "ADS1115 retry complete: %d/%d devices working", working_count, ADS1115_DEVICE_COUNT);
+    return any_failed;
+}
+
+/**
  * @brief Background task for retrying failed ADS1115 devices
- * 
- * Continuously monitors for failed devices and attempts to recover them
- * using exponential backoff strategy (1min → 3min → 10min max).
- * 
+ *
+ * Notification-based task that wakes when devices fail, then uses two-tier retry strategy:
+ * - Fast retries: 3 attempts with exponential backoff (5s, 10s, 20s) for power/transient issues
+ * - Slow retries: 3 attempts with long delays (1min, 5min, 10min) for persistent hardware issues
+ * - Continuous monitoring: Every 10 minutes until all devices recovered
+ *
+ * Sets needs_slow_retries flag on devices that require slow retry phase.
+ *
  * @param pvParameters Unused task parameter
  */
 static void ads1115_helper_retry_task(void *pvParameters)
 {
-    ESP_LOGI(TAG, "ADS1115 retry task started");
+    ESP_LOGI(TAG, "ADS1115 retry task started (notification-based)");
+    uint32_t notification_value = 0;
 
-    const uint32_t CHECK_INTERVAL_MS = 5000;    // Check every 5 seconds
-    const uint32_t MAX_RETRY_DELAY_MS = 600000; // Max 10 minutes between retries
+    while (true) {
+        // Wait for notification (blocks indefinitely)
+        notification_value = 0;
+        xTaskNotifyWait(0x00, ULONG_MAX, &notification_value, portMAX_DELAY);
 
-    while (1) {
-        uint32_t current_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
-        bool retry_attempted = false;
+        ESP_LOGI(TAG, "ADS1115 retry task triggered (notification received)");
 
-        // Check each device for retry
-        // Note: ads1115_helper_init_device() handles power management internally
+        // === PHASE 1: Fast Retries (for power-related and transient issues) ===
+        bool any_failed = true;
+        for (uint8_t quick_retry = 0; quick_retry < ADS1115_INIT_FAST_RETRY_COUNT && any_failed; quick_retry++) {
+            if (quick_retry > 0) {
+                // Exponential backoff: 5s, 10s, 20s
+                uint32_t delay_ms = ADS1115_INIT_FAST_RETRY_DELAY_MS << (quick_retry - 1);
+                ESP_LOGI(TAG, "Fast retry %d/%d in %lu seconds...", quick_retry + 1, ADS1115_INIT_FAST_RETRY_COUNT, delay_ms / 1000);
+                vTaskDelay(pdMS_TO_TICKS(delay_ms));
+            }
+
+            any_failed = retry_all_failed_devices();
+
+            if (!any_failed) {
+                ESP_LOGI(TAG, "All devices recovered during fast retry phase!");
+                break;  // All recovered, suspend task
+            }
+        }
+
+        if (!any_failed) {
+            continue;  // Wait for next notification
+        }
+
+        // === PHASE 2: Slow Retries (for persistent hardware issues) ===
+        ESP_LOGW(TAG, "Fast retries exhausted, entering slow retry phase (potential hardware issue)");
+
+        // Mark devices that need slow retries (diagnostic flag)
         for (uint8_t device = 0; device < ADS1115_DEVICE_COUNT; device++) {
-            ads1115_device_t *status = &ads1115_devices[device];
-
-            // Skip if device is already working
-            if (status->initialized) {
-                continue;
-            }
-
-            // Check if it's time to retry
-            uint32_t time_since_last_retry = current_time - status->last_retry_time;
-            if (time_since_last_retry >= status->next_retry_delay_ms) {
-                ESP_LOGI(TAG,
-                         "Retrying ADS1115 device %d (%s) - attempt %d",
-                         device,
-                         ads1115_devices[device].name,
-                         status->retry_count + 1);
-
-                // Attempt to reinitialize
-                esp_err_t result = ads1115_helper_init_device(device);
-                status->last_retry_time = current_time;
-                status->retry_count++;
-                retry_attempted = true;
-
-                if (result == ESP_OK) {
-                    status->initialized = true;
-                    status->retry_count = 0;             // Reset retry count on success
-                    status->next_retry_delay_ms = 60000; // Reset delay to 1 minute
-                    ESP_LOGI(TAG,
-                             "✓ ADS1115 device %d (%s) successfully recovered!",
-                             device,
-                             ads1115_devices[device].name);
-                } else {
-                    ESP_LOGW(TAG,
-                             "✗ ADS1115 device %d (%s) retry failed: %s",
-                             device,
-                             ads1115_devices[device].name,
-                             esp_err_to_name(result));
-
-                    // Exponential backoff: 1min → 3min → 10min → 10min (max)
-                    if (status->retry_count == 1) {
-                        status->next_retry_delay_ms = 180000; // 3 minutes
-                    } else if (status->retry_count >= 2) {
-                        status->next_retry_delay_ms = MAX_RETRY_DELAY_MS; // 10 minutes
-                    }
-
-                    ESP_LOGW(TAG, "    Next retry in %lu minutes", status->next_retry_delay_ms / 60000);
-                }
+            if (!ads1115_devices[device].initialized) {
+                ads1115_devices[device].needs_slow_retries = true;
+                ESP_LOGW(TAG, "Device %d (%s) flagged as potentially faulty (requires slow retries)",
+                         device, ads1115_devices[device].name);
             }
         }
 
-        // Log status periodically
-        if (retry_attempted) {
-            uint8_t working_count = 0;
-            for (uint8_t i = 0; i < ADS1115_DEVICE_COUNT; i++) {
-                if (ads1115_devices[i].initialized) {
-                    working_count++;
-                }
+        uint32_t slow_delays[] = {
+            ADS1115_INIT_SLOW_RETRY_DELAY_1_MS,  // 1 minute
+            ADS1115_INIT_SLOW_RETRY_DELAY_2_MS,  // 5 minutes
+            ADS1115_INIT_SLOW_RETRY_DELAY_3_MS   // 10 minutes
+        };
+
+        for (int i = 0; i < 3 && any_failed; i++) {
+            ESP_LOGI(TAG, "Slow retry %d/3 in %lu minutes...", i + 1, slow_delays[i] / 60000);
+            vTaskDelay(pdMS_TO_TICKS(slow_delays[i]));
+
+            any_failed = retry_all_failed_devices();
+
+            if (!any_failed) {
+                ESP_LOGI(TAG, "All devices recovered during slow retry phase");
+                break;
             }
-            ESP_LOGI(TAG, "ADS1115 status: %d/%d devices working", working_count, ADS1115_DEVICE_COUNT);
         }
 
-        vTaskDelay(pdMS_TO_TICKS(CHECK_INTERVAL_MS));
+        if (!any_failed) {
+            continue;  // Wait for next notification
+        }
+
+        // === PHASE 3: Continuous Monitoring (every 10 minutes until recovery) ===
+        ESP_LOGW(TAG, "Entering continuous monitoring mode (10-minute intervals)");
+        while (any_failed) {
+            vTaskDelay(pdMS_TO_TICKS(ADS1115_INIT_SLOW_RETRY_DELAY_3_MS));  // 10 minutes
+            any_failed = retry_all_failed_devices();
+        }
+
+        ESP_LOGI(TAG, "All devices recovered! Retry task going back to sleep");
     }
 }
 
 // ########################## Public Function Implementations ##########################
 
-esp_err_t ads1115_helper_general_init(void)
+esp_err_t ads1115_helper_init(void)
 {
     if (ads1115_helper_initialized) {
         ESP_LOGW(TAG, "ADS1115 helper already initialized");
@@ -308,7 +366,8 @@ esp_err_t ads1115_helper_general_init(void)
         ads1115_devices[device].initialized = false;
         ads1115_devices[device].last_retry_time = 0;
         ads1115_devices[device].retry_count = 0;
-        ads1115_devices[device].next_retry_delay_ms = 60000; // Start with 1 minute
+        ads1115_devices[device].next_retry_delay_ms = ADS1115_INIT_FAST_RETRY_DELAY_MS;
+        ads1115_devices[device].needs_slow_retries = false;
     }
 
     uint8_t successful_devices = 0;
@@ -359,9 +418,15 @@ esp_err_t ads1115_helper_general_init(void)
     fluctus_release_bus_power(POWER_BUS_3V3, "ADS1115_INIT");
     ESP_LOGI(TAG, "Released 3.3V bus power (init complete)");
 
+    // Trigger retry task if any devices failed during initialization
+    if (successful_devices < ADS1115_DEVICE_COUNT) {
+        ESP_LOGI(TAG, "Triggering retry task for %d failed device(s)", ADS1115_DEVICE_COUNT - successful_devices);
+        xTaskNotify(xADS1115RetryTaskHandle, 1, eSetBits);
+    }
+
     if (successful_devices == 0) {
         ESP_LOGE(TAG, "No ADS1115 devices initialized! System functionality will be limited.");
-        ESP_LOGI(TAG, "Retry task will attempt recovery when 3.3V bus is powered");
+        ESP_LOGI(TAG, "Retry task will attempt recovery");
         return ESP_FAIL;
     }
 
@@ -395,101 +460,115 @@ esp_err_t ads1115_helper_read_channel(uint8_t device_id, ads111x_mux_t channel, 
     vTaskDelay(pdMS_TO_TICKS(10));  // Brief stabilization delay
 
     i2c_dev_t *dev = &ads1115_devices[device_id].device;
-    esp_err_t ret;
+    esp_err_t ret = ESP_FAIL;
 
-    // Take mutex for thread safety
-    if (xSemaphoreTake(xADS1115Mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
-        ESP_LOGW(TAG, "[Dev %d] Failed to take mutex", device_id);
-        fluctus_release_bus_power(POWER_BUS_3V3, "ADS1115_READ");
-        return ESP_ERR_TIMEOUT;
-    }
-
-    // 1. Set MUX (channel selection)
-    ret = ads111x_set_input_mux(dev, channel);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "[Dev %d] Failed to set MUX: %s (%d)", device_id, esp_err_to_name(ret), ret);
-        // Mark device as failed for retry
-        ads1115_devices[device_id].initialized = false;
-        xSemaphoreGive(xADS1115Mutex);
-        fluctus_release_bus_power(POWER_BUS_3V3, "ADS1115_READ");
-        return ret;
-    }
-
-    // 2. Start Conversion
-    ret = ads111x_start_conversion(dev);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "[Dev %d] Failed to start conversion: %s (%d)", device_id, esp_err_to_name(ret), ret);
-        ads1115_devices[device_id].initialized = false;
-        xSemaphoreGive(xADS1115Mutex);
-        fluctus_release_bus_power(POWER_BUS_3V3, "ADS1115_READ");
-        return ret;
-    }
-
-    // MUX settling time: Allow input capacitor to charge after channel switch
-    // Worst-case RC settling: 1MΩ (dark photoresistor) × 1nF (input cap) = 1ms
-    vTaskDelay(pdMS_TO_TICKS(1));
-
-    // 3. Wait for conversion to complete (with timeout)
-    int conversion_timeout_ms = 100; // Increased timeout
-    int delay_ms = 5;                // Check every 5ms
-    int elapsed_ms = 0;
-    bool busy = true;
-
-    do {
-        ret = ads111x_is_busy(dev, &busy);
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "[Dev %d] Failed to check busy status: %s (%d)", device_id, esp_err_to_name(ret), ret);
-            ads1115_devices[device_id].initialized = false;
-            xSemaphoreGive(xADS1115Mutex);
-            fluctus_release_bus_power(POWER_BUS_3V3, "ADS1115_READ");
-            return ret;
+    // Retry loop: 3 attempts with 50ms delays
+    for (uint8_t attempt = 0; attempt < ADS1115_READ_RETRY_ATTEMPTS; attempt++) {
+        // Take mutex for thread safety
+        if (xSemaphoreTake(xADS1115Mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+            ESP_LOGW(TAG, "[Dev %d] Attempt %d: Failed to take mutex", device_id, attempt + 1);
+            ret = ESP_ERR_TIMEOUT;
+            goto retry_delay;
         }
 
-        vTaskDelay(1);
+        // 1. Set MUX (channel selection)
+        ret = ads111x_set_input_mux(dev, channel);
+        if (ret != ESP_OK) {
+            ESP_LOGD(TAG, "[Dev %d] Attempt %d: Failed to set MUX: %s", device_id, attempt + 1, esp_err_to_name(ret));
+            xSemaphoreGive(xADS1115Mutex);
+            goto retry_delay;
+        }
 
-        if (busy) {
-            vTaskDelay(pdMS_TO_TICKS(delay_ms));
-            elapsed_ms += delay_ms;
-            if (elapsed_ms > conversion_timeout_ms) {
-                ESP_LOGE(TAG, "[Dev %d] Conversion timeout after %d ms", device_id, conversion_timeout_ms);
-                ads1115_devices[device_id].initialized = false;
-                xSemaphoreGive(xADS1115Mutex);
-                fluctus_release_bus_power(POWER_BUS_3V3, "ADS1115_READ");
-                return ESP_ERR_TIMEOUT;
+        // 2. Start Conversion
+        ret = ads111x_start_conversion(dev);
+        if (ret != ESP_OK) {
+            ESP_LOGD(TAG, "[Dev %d] Attempt %d: Failed to start conversion: %s", device_id, attempt + 1, esp_err_to_name(ret));
+            xSemaphoreGive(xADS1115Mutex);
+            goto retry_delay;
+        }
+
+        // MUX settling time: Allow input capacitor to charge after channel switch
+        // Worst-case RC settling: 1MΩ (dark photoresistor) × 1nF (input cap) = 1ms
+        vTaskDelay(pdMS_TO_TICKS(1));
+
+        // 3. Wait for conversion to complete (with timeout)
+        bool conversion_failed = false;
+        int conversion_timeout_ms = 100;
+        int delay_ms = 5;
+        int elapsed_ms = 0;
+        bool busy = true;
+
+        while (busy) {
+            ret = ads111x_is_busy(dev, &busy);
+            if (ret != ESP_OK) {
+                ESP_LOGD(TAG, "[Dev %d] Attempt %d: Failed to check busy status: %s", device_id, attempt + 1, esp_err_to_name(ret));
+                conversion_failed = true;
+                break;
+            }
+
+            if (busy) {
+                vTaskDelay(pdMS_TO_TICKS(delay_ms));
+                elapsed_ms += delay_ms;
+                if (elapsed_ms > conversion_timeout_ms) {
+                    ESP_LOGD(TAG, "[Dev %d] Attempt %d: Conversion timeout after %d ms", device_id, attempt + 1, conversion_timeout_ms);
+                    ret = ESP_ERR_TIMEOUT;
+                    conversion_failed = true;
+                    break;
+                }
             }
         }
-    } while (busy);
 
-    // 4. Read Value
-    ret = ads111x_get_value(dev, raw);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "[Dev %d] Failed to get value: %s (%d)", device_id, esp_err_to_name(ret), ret);
-        ads1115_devices[device_id].initialized = false;
+        if (conversion_failed) {
+            xSemaphoreGive(xADS1115Mutex);
+            goto retry_delay;
+        }
+
+        // 4. Read Value
+        ret = ads111x_get_value(dev, raw);
+        if (ret != ESP_OK) {
+            ESP_LOGD(TAG, "[Dev %d] Attempt %d: Failed to get value: %s", device_id, attempt + 1, esp_err_to_name(ret));
+            xSemaphoreGive(xADS1115Mutex);
+            goto retry_delay;
+        }
+
+        // 5. Calculate Voltage (if requested)
+        float calculated_voltage = 0.0;
+        if (voltage || (device_id < ADS1115_DEVICE_COUNT && channel < 4)) {
+            calculated_voltage = (*raw / (float) ADS111X_MAX_VALUE) * ADS1115_GAIN;
+            if (voltage) {
+                *voltage = calculated_voltage;
+            }
+        }
+
+        // Update latest voltages array if within bounds
+        if (channel >= ADS111X_MUX_0_GND && channel <= ADS111X_MUX_3_GND) {
+            uint8_t ch_idx = channel - ADS111X_MUX_0_GND;
+            latest_voltages[device_id][ch_idx] = calculated_voltage;
+        }
+
+        // Success!
         xSemaphoreGive(xADS1115Mutex);
         fluctus_release_bus_power(POWER_BUS_3V3, "ADS1115_READ");
-        return ret;
-    }
 
-    // 5. Calculate Voltage (if requested)
-    float calculated_voltage = 0.0;
-    if (voltage || (device_id < ADS1115_DEVICE_COUNT && channel < 4)) {
-        calculated_voltage = (*raw / (float) ADS111X_MAX_VALUE) * ADS1115_GAIN;
-        if (voltage) {
-            *voltage = calculated_voltage;
+        if (attempt > 0) {
+            ESP_LOGD(TAG, "[Dev %d] Read succeeded on attempt %d", device_id, attempt + 1);
+        }
+        return ESP_OK;
+
+retry_delay:
+        // Delay before next attempt (except on last attempt)
+        if (attempt < ADS1115_READ_RETRY_ATTEMPTS - 1) {
+            vTaskDelay(pdMS_TO_TICKS(ADS1115_READ_RETRY_DELAY_MS));
         }
     }
 
-    // Update latest voltages array if within bounds
-    if (channel >= ADS111X_MUX_0_GND && channel <= ADS111X_MUX_3_GND) {
-        uint8_t ch_idx = channel - ADS111X_MUX_0_GND;
-        latest_voltages[device_id][ch_idx] = calculated_voltage;
-    }
+    // All retries exhausted - mark device as failed and notify retry task
+    ESP_LOGW(TAG, "[Dev %d] All %d read attempts failed: %s", device_id, ADS1115_READ_RETRY_ATTEMPTS, esp_err_to_name(ret));
+    ads1115_devices[device_id].initialized = false;
+    xTaskNotify(xADS1115RetryTaskHandle, 1, eSetBits);
 
-    xSemaphoreGive(xADS1115Mutex);
-
-    // Release power - read complete
     fluctus_release_bus_power(POWER_BUS_3V3, "ADS1115_READ");
-    return ESP_OK;
+    return ret;
 }
 
 bool ads1115_helper_is_device_ready(uint8_t device_id)
@@ -501,7 +580,7 @@ bool ads1115_helper_is_device_ready(uint8_t device_id)
     return ads1115_devices[device_id].initialized;
 }
 
-// TODO: verify ads1115_helper_get_latest_voltages is still needed - probably used for initial serial debuging
+// TODO: verify ads1115_helper_get_latest_voltages is still needed - probably intended for initial serial debuging
 esp_err_t ads1115_helper_get_latest_voltages(float voltages[ADS1115_DEVICE_COUNT][4])
 {
     if (!voltages) {

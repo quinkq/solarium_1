@@ -1,3 +1,31 @@
+/**
+ * @file telemetry_mqtt_client.c
+ * @brief TELEMETRY MQTT client - Publishing orchestrator
+ * @author Piotr P. <quinkq@gmail.com>
+ * @date 2025
+ *
+ * Central orchestrator for complete TELEMETRY pipeline:
+ * - MQTT client lifecycle (init, connection, events)
+ * - Component data ingestion (telemetry_fetch_snapshot)
+ * - Main publish task (encode/enqueue + dequeue/publish loops)
+ * - Event handler (CONNECTED, DATA, PUBLISHED, ERROR)
+ *
+ * Publishing task has TWO responsibilities:
+ * A. Data Ingestion (when notified by components):
+ *    - Lock cache → Encode msgpack → Unlock cache
+ *    - Check realtime/publishing flags → Enqueue to PSRAM
+ *    - Check for FLASH backup needed (95% threshold)
+ *
+ * B. MQTT Publishing (continuous loop):
+ *    - Peek message from buffer → Publish (QoS 1)
+ *    - Track in-flight message → Wait for PUBACK
+ *    - Dequeue on success → Retry/FLASH backup on failure
+ *
+ * Hybrid retry logic: Per-message lifetime (10 retries) + session failures (5 consecutive)
+ *
+ * Part of the Solarium project - Solar-powered garden automation system
+ */
+
 #include "telemetry.h"
 #include "telemetry_private.h"
 
@@ -6,6 +34,10 @@ static const char *TAG = "TELEMETRY_MQTT_CLIENT";
 
 // ################ MQTT Infrastructure ################
 
+/**
+ * @brief Initialize MQTT client and start publishing task
+ * Creates client, registers event handler, starts connection
+ */
 esp_err_t telemetry_mqtt_client_init(void) 
 {
     esp_mqtt_client_config_t mqtt_cfg = {
@@ -51,6 +83,10 @@ esp_err_t telemetry_mqtt_client_init(void)
     return ESP_OK;
 }
 
+/**
+ * @brief MQTT event handler - Handles connection, disconnection, PUBACK, commands
+ * Processes QoS 1 acknowledgments, interval commands, realtime mode control
+ */
 void telemetry_mqtt_event_handler(void *handler_args, esp_event_base_t base,
                                int32_t event_id, void *event_data)
 {
@@ -139,6 +175,10 @@ void telemetry_mqtt_event_handler(void *handler_args, esp_event_base_t base,
     }
 }
 
+/**
+ * @brief Convert telemetry source ID to MQTT topic name
+ * Handles special case for IMPLUVIUM zone messages (component_id 100-104)
+ */
 static const char* get_topic_name(telemetry_source_t src)
 {
     // Check for IMPLUVIUM zone messages (component_id 100-104)
@@ -161,6 +201,12 @@ static const char* get_topic_name(telemetry_source_t src)
     }
 }
 
+/**
+ * @brief Main MQTT publishing task - Dual responsibility orchestrator
+ * A. Data ingestion: Wait for component notifications → Lock cache → Encode → Enqueue
+ * B. Publishing loop: Peek buffer → Publish (QoS 1) → Wait PUBACK → Dequeue
+ * Implements hybrid retry logic: per-message lifetime (10) + session failures (5)
+ */
 void telemetry_mqtt_publish_task(void *parameters)
 {
     mqtt_task_handle = xTaskGetCurrentTaskHandle();
@@ -470,6 +516,11 @@ void telemetry_mqtt_publish_task(void *parameters)
 
 // ########################## Public API ##########################
 
+/**
+ * @brief Fetch snapshot from component and trigger MQTT publishing
+ * Calls component's writer function, then notifies MQTT task for encoding/publishing
+ * This is the entry point for all component telemetry injections
+ */
 esp_err_t telemetry_fetch_snapshot(telemetry_source_t src)
 {
     if (!telemetry_initialized || src >= TELEMETRY_SRC_COUNT) {

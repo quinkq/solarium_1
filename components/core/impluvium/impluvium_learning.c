@@ -57,7 +57,7 @@ uint32_t impluvium_calc_moisture_check_interval(float current_temperature)
     // Apply nighttime minimum (from config) to reduce unnecessary checks during darkness
     if (!solar_calc_is_daytime_buffered()) {
         if (interval < impluvium_night_minimum_ms) {
-            ESP_LOGD(TAG, "Nighttime - extending interval from %lums to %lums", interval, impluvium_night_minimum_ms);
+            ESP_LOGD(TAG, "Nighttime - extending interval from %lus to %lus", (interval / 1000), (impluvium_night_minimum_ms/ 1000));
             interval = impluvium_night_minimum_ms;
         }
     }

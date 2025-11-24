@@ -1,3 +1,23 @@
+/**
+ * @file tempesta_processing.c
+ * @brief TEMPESTA data processing and averaging algorithms
+ * @author Piotr P. <quinkq@gmail.com>
+ * @date 2025
+ *
+ * Handles sensor data processing and historical averaging:
+ * - Temperature averaging (10-sample rolling, weighted toward recent)
+ * - Humidity averaging (10-sample rolling, weighted toward recent)
+ * - Pressure processing (single value, no averaging)
+ * - Air quality processing (PMS5003 coordination)
+ * - Sensor fusion (SHT4x + BMP280 temperature combination)
+ * - Generic weighted averaging algorithm for code reuse
+ *
+ * Pure data processing module - no hardware interaction. Uses calculation_data
+ * for averaging state and updates weather_data with processed values.
+ *
+ * Part of the Solarium project - Solar-powered garden automation system
+ */
+
 #include "tempesta.h"
 #include "tempesta_private.h"
 

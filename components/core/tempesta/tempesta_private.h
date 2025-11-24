@@ -1,3 +1,21 @@
+/**
+ * @file tempesta_private.h
+ * @brief TEMPESTA internal shared declarations for modularized implementation
+ * @author Piotr P. <quinkq@gmail.com>
+ * @date 2025
+ *
+ * Central header for internal TEMPESTA module communication:
+ * - Shared global variable extern declarations (mutexes, data structures)
+ * - Internal function declarations across modules (sensors, processing, etc.)
+ * - Private type definitions (pms5003_data_t, consolidated_sensor_data_t)
+ * - Internal constants and helper macros
+ *
+ * This header provides a single source of truth for cross-module declarations
+ * while avoiding circular dependencies. Included by all TEMPESTA .c modules.
+ *
+ * Part of the Solarium project - Solar-powered garden automation system
+ */
+
 #ifndef TEMPESTA_PRIVATE_H
 #define TEMPESTA_PRIVATE_H
 

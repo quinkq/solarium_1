@@ -360,7 +360,7 @@ void app_main(void)
     // Initialize ADS1115 helper system (requires FLUCTUS for 3.3V bus power)
     vTaskDelay(pdMS_TO_TICKS(100));
     ESP_LOGI(TAG, "Initializing ADS1115 helper...");
-    esp_err_t ads_init_result = ads1115_helper_general_init();
+    esp_err_t ads_init_result = ads1115_helper_init();
     if (ads_init_result == ESP_FAIL) {
         ESP_LOGW(TAG,
                  "No ADS1115 devices available at startup - system will continue with limited "

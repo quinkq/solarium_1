@@ -9,13 +9,15 @@
  * - Drawing primitives (pixels, characters, strings, lines)
  */
 
+#include "hmi_private.h"
+#include "driver/spi_master.h"
 #include <string.h>
 #include "esp_log.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_vendor.h"
 #include "esp_lcd_panel_ops.h"
-#include "driver/spi_master.h"
-#include "hmi_private.h"
+
+
 
 static const char *TAG = "HMI_DISPLAY";
 

@@ -475,13 +475,14 @@ static void tempesta_main_task(void *pvParameters)
 {
     const char *task_tag = "WeatherMain";
     ESP_LOGI(task_tag, "Weather station main task started");
+    uint32_t notification_value = 0;
 
     // Wait for system initialization
     vTaskDelay(pdMS_TO_TICKS(3000));
 
     while (1) {
         // Wait for collection cycle notification
-        uint32_t notification_value = 0;
+        notification_value = 0;
         xTaskNotifyWait(0x00, ULONG_MAX, &notification_value, portMAX_DELAY);
 
         // Check if collection should proceed based on state

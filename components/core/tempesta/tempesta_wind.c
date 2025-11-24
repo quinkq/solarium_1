@@ -1,6 +1,27 @@
+/**
+ * @file tempesta_wind.c
+ * @brief TEMPESTA wind speed monitoring with AS5600 magnetic encoder
+ * @author Piotr P. <quinkq@gmail.com>
+ * @date 2025
+ *
+ * Dedicated task for time-sensitive wind speed measurements:
+ * - AS5600 magnetic encoder sampling (10Hz for 5 seconds)
+ * - RPM calculation from angle changes with wrap-around handling
+ * - Conversion to m/s using calibration factor
+ * - Low-power mode management (LPM3 during idle, 5mA savings)
+ * - Independent task timing (5s sampling, separate from main cycle)
+ * - Higher priority (6) for accurate time-critical measurements
+ *
+ * Runs autonomously, triggered by main task notifications. Isolated from
+ * main collection cycle for precise timing control.
+ *
+ * Part of the Solarium project - Solar-powered garden automation system
+ */
+
 #include "tempesta.h"
 #include "tempesta_private.h"
 
+#include "as5600.h"
 #include <inttypes.h>
 #include <math.h>
 

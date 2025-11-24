@@ -40,7 +40,7 @@
 #include <esp_idf_lib_helpers.h>
 #include "ina219.h"
 
-#define I2C_FREQ_HZ 400000 // Max 1 MHz for esp-idf, but supports up to 2.56 MHz
+#define I2C_FREQ_HZ 100000 // Max 1 MHz for esp-idf, but supports up to 2.56 MHz
 
 static const char *TAG = "ina219";
 

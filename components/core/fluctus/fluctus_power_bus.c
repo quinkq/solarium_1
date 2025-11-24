@@ -65,7 +65,7 @@ bool hardware_bus_state[POWER_BUS_COUNT] = {false, false, false, false};
  */
 esp_err_t fluctus_gpio_init(void)
 {
-    ESP_LOGI(TAG, "Initializing power control GPIOs (new hardware config)...");
+    ESP_LOGI(TAG, "Initializing power control GPIOs...");
     esp_err_t ret;
 
     // 3.3V, 12 V Buses and 2 devices: Push-pull output (controls N-MOSFETs)

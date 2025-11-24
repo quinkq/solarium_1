@@ -1,6 +1,20 @@
-// - Direct-write cache API (lock/unlock only)
-// - Snapshot retrieval (all get_*_data functions for HMI)
-// - Per-cache mutex management
+/**
+ * @file telemetry_cache.c
+ * @brief TELEMETRY cache management - Pure data hub
+ * @author Piotr P. <quinkq@gmail.com>
+ * @date 2025
+ *
+ * Passive data storage module for TELEMETRY component:
+ * - Direct-write cache API (lock/unlock only) - zero-copy access for components
+ * - Snapshot retrieval (all get_*_data functions for HMI display)
+ * - Per-cache mutex management (one mutex per source, minimal contention)
+ * - No MQTT dependencies - pure data hub (circular dependency avoided)
+ *
+ * Components write directly to cache via lock/unlock, HMI reads via memcpy snapshots.
+ * Cache memory: ~900B in internal SRAM for low-latency access.
+ *
+ * Part of the Solarium project - Solar-powered garden automation system
+ */
 
 #include "telemetry.h"
 #include "telemetry_private.h"
@@ -11,6 +25,10 @@ static const char *TAG = "TELEMETRY_CACHE";
 
 // ################ Unified Cache Implementation ################
 
+/**
+ * @brief Get or create mutex for a specific cache source
+ * Lazy initialization of per-cache mutexes
+ */
 inline SemaphoreHandle_t telemetry_get_mutex(telemetry_source_t src)
 {
     if (src >= TELEMETRY_SRC_COUNT) {
@@ -22,6 +40,10 @@ inline SemaphoreHandle_t telemetry_get_mutex(telemetry_source_t src)
     return xTelemetryMutexes[src];
 }
 
+/**
+ * @brief Lock cache for direct write access - Zero-copy API
+ * Returns pointer to cache for component to write directly
+ */
 esp_err_t telemetry_lock_cache(telemetry_source_t src, void **cache_ptr)
 {
     if (src >= TELEMETRY_SRC_COUNT || cache_ptr == NULL) {
@@ -38,6 +60,10 @@ esp_err_t telemetry_lock_cache(telemetry_source_t src, void **cache_ptr)
     return ESP_OK;
 }
 
+/**
+ * @brief Unlock cache after write - Timestamp handled by writer functions
+ * Components must call this after completing cache write
+ */
 void telemetry_unlock_cache(telemetry_source_t src)
 {
     if (src >= TELEMETRY_SRC_COUNT) {

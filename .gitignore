@@ -22,3 +22,4 @@ components/core/tempesta/TEMPESTA_SPLIT_TODO.md
 components/core/telemetry/TELEMETRY_SPLIT_TODO.md
 components/core/impluvium/IMPLUVIUM_SPLIT_TODO.md
 components/core/fluctus/FLUCTUS_SPLIT_TODO.md
+components/third_party/mcp23008/MCP23008_MIGRATION_PLAN.md

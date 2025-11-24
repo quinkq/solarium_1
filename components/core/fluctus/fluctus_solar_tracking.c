@@ -44,6 +44,8 @@
 
 #include "fluctus.h"
 #include "fluctus_private.h"
+#include "ads1115_helper.h"
+#include "stellaria.h"
 #include "solar_calc.h"
 #include "telemetry.h"
 #include "esp_timer.h"

@@ -28,9 +28,9 @@
 // GPIO Configuration
 #define WEATHER_RAINFALL_GPIO GPIO_NUM_3    // Tipbucket pulse counter for rainfall measurement
 #define WEATHER_TANK_INTAKE_GPIO GPIO_NUM_8 // Tipbucket pulse counter for water tank ingress
-#define WEATHER_PMS5003_TX_GPIO GPIO_NUM_19 // PMS5003 UART TX (GPIO43)
-#define WEATHER_PMS5003_RX_GPIO GPIO_NUM_20 // PMS5003 UART RX (GPIO44)
-#define WEATHER_PMS5003_UART_NUM UART_NUM_2 // Use UART2 (UART0 reserved for console)
+#define WEATHER_PMS5003_TX_GPIO GPIO_NUM_43 // PMS5003 UART TX (GPIO43)
+#define WEATHER_PMS5003_RX_GPIO GPIO_NUM_44 // PMS5003 UART RX (GPIO44)
+#define WEATHER_PMS5003_UART_NUM UART_NUM_2 // UART2 (UART0 reserved for console)
 #define WEATHER_PMS5003_RETRY_COUNT 3       // Count of retries for PMS5003
 
 // Rain Sensor Configuration (Tipbucket #1)

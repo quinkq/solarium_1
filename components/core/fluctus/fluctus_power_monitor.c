@@ -31,6 +31,7 @@
 
 #include "fluctus.h"
 #include "fluctus_private.h"
+#include "ads1115_helper.h"
 #include "telemetry.h"
 #include "solar_calc.h"
 #include "esp_timer.h"
@@ -78,7 +79,7 @@ esp_err_t fluctus_ina219_init(void)
     esp_err_t ret = ina219_init_desc(&ina219_dev[0], FLUCTUS_INA219_SOLAR_PV_ADDR,
                                      I2C_NUM_0, CONFIG_I2CDEV_DEFAULT_SDA_PIN, CONFIG_I2CDEV_DEFAULT_SCL_PIN);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to initialize Solar PV INA219: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "Failed to initialize description Solar PV INA219: %s", esp_err_to_name(ret));
         return ret;
     }
 

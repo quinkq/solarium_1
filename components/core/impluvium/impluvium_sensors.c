@@ -13,30 +13,6 @@
 
 static const char *TAG = "IMPLUVIUM_SENS";
 
-// Sensor retry helper macro - to reduce duplication in retry logic
-#define SENSOR_READ_WITH_RETRY(read_operation, sensor_name, context_id) do { \
-    esp_err_t _ret = ESP_FAIL; \
-    for (uint8_t _attempt = 0; _attempt < SENSOR_READ_MAX_RETRIES; _attempt++) { \
-        _ret = (read_operation); \
-        if (_ret == ESP_OK) { \
-            if (_attempt > 0) { \
-                ESP_LOGD(TAG, "%s %d succeeded on attempt %d", sensor_name, context_id, _attempt + 1); \
-            } \
-            break; \
-        } \
-        if (_attempt < SENSOR_READ_MAX_RETRIES - 1) { \
-            ESP_LOGD(TAG, "%s %d attempt %d failed: %s, retrying...", \
-                     sensor_name, context_id, _attempt + 1, esp_err_to_name(_ret)); \
-            vTaskDelay(pdMS_TO_TICKS(SENSOR_READ_RETRY_DELAY_MS)); \
-        } \
-    } \
-    if (_ret != ESP_OK) { \
-        ESP_LOGW(TAG, "Failed to read %s %d after %d attempts: %s", \
-                 sensor_name, context_id, SENSOR_READ_MAX_RETRIES, esp_err_to_name(_ret)); \
-    } \
-    ret = _ret; \
-} while(0)
-
 /**
  * @brief Read moisture sensor for specific zone
  *
@@ -62,15 +38,10 @@ esp_err_t impluvium_read_moisture_sensor(uint8_t zone_id, float *moisture_percen
         return ESP_ERR_INVALID_STATE;
     }
 
-    // Read raw voltage from ADS1115 with retry logic
+    // Read raw voltage from ADS1115 (ads1115_helper has built-in 3×50ms retry logic)
     int16_t raw;
     float voltage;
-    esp_err_t ret = ESP_FAIL;
-
-    SENSOR_READ_WITH_RETRY(
-        ads1115_helper_read_channel(zone->moisture_ads_device, zone->moisture_channel, &raw, &voltage),
-        "moisture sensor zone", zone_id
-    );
+    esp_err_t ret = ads1115_helper_read_channel(zone->moisture_ads_device, zone->moisture_channel, &raw, &voltage);
 
     if (ret == ESP_OK) {
         // Success - convert voltage to percentage
@@ -113,15 +84,10 @@ esp_err_t impluvium_read_pressure(float *outlet_pressure_bar)
         return ESP_ERR_INVALID_STATE;
     }
 
-    // Read pressure from ADS1115 with retry logic
+    // Read pressure from ADS1115 (ads1115_helper has built-in 3×50ms retry logic)
     int16_t raw;
     float voltage;
-    esp_err_t ret = ESP_FAIL;
-
-    SENSOR_READ_WITH_RETRY(
-        ads1115_helper_read_channel(1, ADS111X_MUX_1_GND, &raw, &voltage), // ADS111X_MUX_1_GND is 2nd channel on ADS1115
-        "pressure sensor", 0
-    );
+    esp_err_t ret = ads1115_helper_read_channel(1, ADS111X_MUX_1_GND, &raw, &voltage); // ADS111X_MUX_1_GND is 2nd channel on ADS1115
 
     if (ret == ESP_OK) {
         // Success - convert voltage to pressure
@@ -154,10 +120,20 @@ esp_err_t impluvium_read_water_level(float *water_level_percent)
     float water_level_pressure_mbar = 0.0f;
     esp_err_t ret = ESP_FAIL;
 
-    SENSOR_READ_WITH_RETRY(
-        abp_read_pressure_mbar(&abp_dev, &water_level_pressure_mbar),
-        "water level sensor", 0
-    );
+    // ABP sensor retry logic (3 attempts, 50ms delays) - inlined since ABP doesn't use ads1115_helper
+    for (uint8_t attempt = 0; attempt < SENSOR_READ_MAX_RETRIES; attempt++) {
+        ret = abp_read_pressure_mbar(&abp_dev, &water_level_pressure_mbar);
+        if (ret == ESP_OK) {
+            if (attempt > 0) {
+                ESP_LOGD(TAG, "Water level sensor succeeded on attempt %d", attempt + 1);
+            }
+            break;
+        }
+        if (attempt < SENSOR_READ_MAX_RETRIES - 1) {
+            ESP_LOGD(TAG, "Water level sensor attempt %d failed: %s, retrying...", attempt + 1, esp_err_to_name(ret));
+            vTaskDelay(pdMS_TO_TICKS(SENSOR_READ_RETRY_DELAY_MS));
+        }
+    }
 
     if (ret == ESP_OK) {
         // Clamp pressure to calibrated range

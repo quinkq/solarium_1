@@ -407,7 +407,7 @@ esp_err_t emergency_diagnostics_check_moisture_levels(void)
                          moisture_percent,
                          EMERGENCY_MOISTURE_THRESHOLD);
                 irrigation_system.emergency.eligible_zones_count++;
-                irrigation_system.emergency.eligible_zones_mask |= (1 << zone_id);
+                irrigation_system.emergency.eligible_zones_mask |= (1U << zone_id);
             }
         } else {
             ESP_LOGE(TAG, "Failed to read moisture for zone %d", zone_id);
@@ -462,7 +462,7 @@ esp_err_t emergency_diagnostics_test_zone(uint8_t zone_id)
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to start pump for zone %d test", zone_id);
         gpio_set_level(zone->valve_gpio, 0);
-        irrigation_system.emergency.failed_zones_mask |= (1 << zone_id);
+        irrigation_system.emergency.failed_zones_mask |= (1U << zone_id);
         irrigation_system.emergency.test_flow_rates[zone_id] = 0.0f;
         irrigation_system.emergency.test_pressures[zone_id] = 0.0f;
         return ESP_FAIL;
@@ -542,7 +542,7 @@ esp_err_t emergency_diagnostics_test_zone(uint8_t zone_id)
                  failure_reason,
                  test_flow_rate,
                  test_pressure);
-        irrigation_system.emergency.failed_zones_mask |= (1 << zone_id);
+        irrigation_system.emergency.failed_zones_mask |= (1U << zone_id);
     }
 
     // Move to next zone
@@ -566,8 +566,8 @@ esp_err_t emergency_diagnostics_analyze_results(void)
     // Count failures among eligible zones
     for (uint8_t i = 0; i < IRRIGATION_ZONE_COUNT; i++) {
         // Only consider zones that were eligible for testing
-        if (irrigation_system.emergency.eligible_zones_mask & (1 << i)) {
-            if (irrigation_system.emergency.failed_zones_mask & (1 << i)) {
+        if (irrigation_system.emergency.eligible_zones_mask & (1U << i)) {
+            if (irrigation_system.emergency.failed_zones_mask & (1U << i)) {
                 failed_zones++;
                 ESP_LOGW(TAG,
                          "Eligible Zone %d FAILED: Flow %.1f L/h, Outlet pressure %.2f bar",
@@ -623,7 +623,7 @@ esp_err_t emergency_diagnostics_analyze_results(void)
             // Less than half failed - disable failed zones and continue
             ESP_LOGI(TAG, "Disabling failed zones and continuing operation");
             for (uint8_t i = 0; i < IRRIGATION_ZONE_COUNT; i++) {
-                if (irrigation_system.emergency.failed_zones_mask & (1 << i)) {
+                if (irrigation_system.emergency.failed_zones_mask & (1U << i)) {
                     irrigation_zones[i].watering_enabled = false;
                     ESP_LOGW(TAG, "Zone %d disabled due to diagnostic failure", i);
                 }
@@ -657,13 +657,13 @@ esp_err_t emergency_diagnostics_resolve(void)
     // Log detailed results for maintenance records
     ESP_LOGI(TAG, "Diagnostic test results:");
     for (uint8_t i = 0; i < IRRIGATION_ZONE_COUNT; i++) {
-        if (irrigation_zones[i].watering_enabled || (irrigation_system.emergency.failed_zones_mask & (1 << i))) {
+        if (irrigation_zones[i].watering_enabled || (irrigation_system.emergency.failed_zones_mask & (1U << i))) {
             ESP_LOGI(TAG,
                      "  Zone %d: Flow %.1f L/h, Outlet pressure %.2f bar, %s",
                      i,
                      irrigation_system.emergency.test_flow_rates[i],
                      irrigation_system.emergency.test_pressures[i],
-                     (irrigation_system.emergency.failed_zones_mask & (1 << i)) ? "FAILED" : "PASSED");
+                     (irrigation_system.emergency.failed_zones_mask & (1U << i)) ? "FAILED" : "PASSED");
         }
     }
 
@@ -702,9 +702,10 @@ void impluvium_monitoring_task(void *pvParameters)
     static uint32_t error_count = 0;
     static uint32_t last_pulse_count = 0;
     static uint32_t last_flow_measurement_time = 0;
+    uint32_t notification_value = 0;
 
     while (1) {
-        uint32_t notification_value = 0;
+        notification_value = 0;
         // Wait for a notification to trigger action
         xTaskNotifyWait(0x00,
                         ULONG_MAX,

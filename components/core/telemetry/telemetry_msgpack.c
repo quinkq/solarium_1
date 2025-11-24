@@ -1,3 +1,26 @@
+/**
+ * @file telemetry_msgpack.c
+ * @brief TELEMETRY MessagePack encoders - Binary serialization
+ * @author Piotr P. <quinkq@gmail.com>
+ * @date 2025
+ *
+ * MessagePack binary serialization for all TELEMETRY sources:
+ * - 7 encoder functions (FLUCTUS, FLUCTUS_RT, TEMPESTA, IMPLUVIUM system/zone, IMPLUVIUM_RT, STELLARIA, WiFi)
+ * - All follow same pattern: snapshot struct → msgpack binary
+ * - Compact encoding: ~80-250 bytes per message (fits in 256-byte slot)
+ *
+ * Encoder breakdown:
+ * - FLUCTUS: 15-min averages + energy stats + system state (~180 bytes)
+ * - FLUCTUS_RT: Instantaneous power + bus states + debug fields (~200 bytes)
+ * - TEMPESTA: 8 sensors + status flags (~220 bytes)
+ * - IMPLUVIUM: Split into 1 system + 5 zone messages (~100-120 bytes each)
+ * - IMPLUVIUM_RT: Fast-changing sensors during watering (~140 bytes)
+ * - STELLARIA: Lighting state (~60 bytes)
+ * - WiFi: Connection status (~80 bytes)
+ *
+ * Part of the Solarium project - Solar-powered garden automation system
+ */
+
 #include "telemetry.h"
 #include "telemetry_private.h"
 
@@ -9,6 +32,10 @@ static const char *TAG = "TELEMETRY_MSGPACK";
 
 // ################ MessagePack Encoders ################
 
+/**
+ * @brief Encode FLUCTUS normal snapshot to MessagePack format
+ * Normal snapshot: 15-min averages + energy statistics + system state
+ */
 esp_err_t telemetry_msgpack_encode_fluctus(const fluctus_snapshot_t *data,
                                         uint8_t *output, uint16_t *output_len,
                                         uint16_t max_len)
@@ -235,6 +262,10 @@ esp_err_t telemetry_msgpack_encode_fluctus_rt(const fluctus_snapshot_t *data,
     return ESP_OK;
 }
 
+/**
+ * @brief Encode STELLARIA snapshot to MessagePack format
+ * Lighting state: intensity, driver enabled, auto mode
+ */
 esp_err_t telemetry_msgpack_encode_stellaria(const stellaria_snapshot_t *data,
                                           uint8_t *output, uint16_t *output_len,
                                           uint16_t max_len)
@@ -275,6 +306,10 @@ esp_err_t telemetry_msgpack_encode_stellaria(const stellaria_snapshot_t *data,
     return ESP_OK;
 }
 
+/**
+ * @brief Encode TEMPESTA snapshot to MessagePack format
+ * Weather data: 8 sensors (temp/humidity/pressure/air quality/wind/rain/tank) + status flags
+ */
 esp_err_t telemetry_msgpack_encode_tempesta(const tempesta_snapshot_t *data,
                                          uint8_t *output, uint16_t *output_len,
                                          uint16_t max_len)
@@ -698,6 +733,10 @@ esp_err_t telemetry_msgpack_encode_impluvium_rt(const impluvium_snapshot_rt_t *d
     return ESP_OK;
 }
 
+/**
+ * @brief Encode WiFi snapshot to MessagePack format
+ * Connection status: state, RSSI, reconnect count, IP address, power save mode
+ */
 esp_err_t telemetry_msgpack_encode_wifi(const wifi_snapshot_t *data,
                                       uint8_t *output, uint16_t *output_len,
                                       uint16_t max_len)

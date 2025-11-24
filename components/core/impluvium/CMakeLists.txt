@@ -13,7 +13,6 @@ idf_component_register(
         ads1115_helper
         interval_config
         abp
-        i2cdev
         tempesta
         fluctus
         stellaria

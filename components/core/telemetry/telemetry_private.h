@@ -1,10 +1,18 @@
-#ifndef IMPLUVIUM_PRIVATE_H
-#define IMPLUVIUM_PRIVATE_H
+#ifndef TELEMETRY_PRIVATE_H
+#define TELEMETRY_PRIVATE_H
 
 #include "telemetry.h"
 #include "mqtt_client.h"
 
 #include "esp_log.h"
+#include <stdio.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <time.h>
+#include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "freertos/task.h"
 
 
 
@@ -141,4 +149,4 @@ void telemetry_mqtt_publish_task(void *parameters);
 // Public API, but internal to orchestrator
 esp_err_t telemetry_fetch_snapshot(telemetry_source_t src);  
 
-#endif // IMPLUVIUM_PRIVATE_H
+#endif // TELEMETRY_PRIVATE_H

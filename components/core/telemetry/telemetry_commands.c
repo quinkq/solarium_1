@@ -1,3 +1,28 @@
+/**
+ * @file telemetry_commands.c
+ * @brief TELEMETRY MQTT command handling - Remote configuration
+ * @author Piotr P. <quinkq@gmail.com>
+ * @date 2025
+ *
+ * MQTT command handling for TELEMETRY component:
+ * - Parse MQTT interval commands (MessagePack format)
+ * - Validate and apply configuration changes
+ * - Publish acknowledgments with current config
+ *
+ * Command types:
+ * 1. PRESET - Apply preset profile (Aggressive/Balanced/Conservative)
+ *    Topic: solarium/config/intervals/preset
+ *    Payload: {"preset": "Aggressive"|"Balanced"|"Conservative"}
+ *
+ * 2. SET - Set individual component intervals
+ *    Topic: solarium/config/intervals/set
+ *    Payload: {"component": "FLUCTUS"|"TEMPESTA"|"IMPLUVIUM", "intervals": {...}}
+ *
+ * All commands publish ACK to solarium/config/intervals/ack with full current config.
+ *
+ * Part of the Solarium project - Solar-powered garden automation system
+ */
+
 #include "telemetry.h"
 #include "telemetry_private.h"
 

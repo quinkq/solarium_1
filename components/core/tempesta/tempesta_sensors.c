@@ -1,3 +1,23 @@
+/**
+ * @file tempesta_sensors.c
+ * @brief TEMPESTA sensor hardware management and reading
+ * @author Piotr P. <quinkq@gmail.com>
+ * @date 2025
+ *
+ * Handles all sensor hardware initialization and data acquisition:
+ * - I2C sensors: SHT4x (temp/humidity), BMP280 (pressure), AS5600 (wind speed)
+ * - UART: PMS5003 air quality sensor with sleep/wake commands
+ * - Pulse counters: Rainfall and tank intake tipbucket sensors
+ * - Hall array: 4-channel wind direction via ADS1115 with FLUCTUS gating
+ * - Power management: Sensor-level gating (hall array 10ms/cycle)
+ *
+ * All sensor readings populate consolidated data structures for processing
+ * by other TEMPESTA modules. Hardware initialization is isolated to this
+ * module for clean separation of concerns.
+ *
+ * Part of the Solarium project - Solar-powered garden automation system
+ */
+
 #include "tempesta.h"
 #include "tempesta_private.h"
 #include "fluctus.h"
@@ -29,7 +49,6 @@ esp_err_t tempesta_hardware_init(void)
     }
 
     // Initialize PMS5003 UART
-    ESP_LOGE(TAG, "CHECKPOINT: Pulse sensors OK. Initializing PMS5003..."); // <-- ADD THIS
     ret = tempesta_pms5003_init();
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Failed to initialize PMS5003: %s", esp_err_to_name(ret));
@@ -222,21 +241,18 @@ esp_err_t tempesta_pms5003_init(void)
         .source_clk = UART_SCLK_DEFAULT,
     };
 
-    ESP_LOGE(TAG, "CHECKPOINT: Calling uart_driver_install on UART %d", WEATHER_PMS5003_UART_NUM);
     esp_err_t ret = uart_driver_install(WEATHER_PMS5003_UART_NUM, 256, 0, 0, NULL, 0);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to install UART driver: %s", esp_err_to_name(ret));
         return ret;
     }
     vTaskDelay(pdMS_TO_TICKS(100));
-    ESP_LOGE(TAG, "CHECKPOINT: Calling uart_param_config");
     ret = uart_param_config(WEATHER_PMS5003_UART_NUM, &uart_config);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to configure UART parameters: %s", esp_err_to_name(ret));
         return ret;
     }
     vTaskDelay(pdMS_TO_TICKS(100));
-    ESP_LOGE(TAG, "CHECKPOINT: Calling uart_set_pin (TX: %d, RX: %d)", WEATHER_PMS5003_TX_GPIO, WEATHER_PMS5003_RX_GPIO);
     ret = uart_set_pin(WEATHER_PMS5003_UART_NUM,
                        WEATHER_PMS5003_TX_GPIO,
                        WEATHER_PMS5003_RX_GPIO,
@@ -413,7 +429,7 @@ esp_err_t tempesta_read_pms5003(pms5003_data_t *data, weather_sensor_status_t *s
 
         // Parse data frame
         uint8_t *frame = &buffer[start_idx];
-        uint16_t frame_len = (frame[2] << 8) | frame[3];
+        uint16_t frame_len = ((uint16_t)frame[2] << 8) | frame[3];
 
         if (frame_len != 28) { // Should be 2*13+2
             ESP_LOGW(TAG, "PMS5003: Invalid frame length %d (attempt %d/3)", frame_len, retry + 1);
@@ -427,7 +443,7 @@ esp_err_t tempesta_read_pms5003(pms5003_data_t *data, weather_sensor_status_t *s
         for (int i = 0; i < 30; i++) {
             checksum += frame[i];
         }
-        uint16_t received_checksum = (frame[30] << 8) | frame[31];
+        uint16_t received_checksum = ((uint16_t)frame[30] << 8) | frame[31];
 
         if (checksum != received_checksum) {
             ESP_LOGW(TAG,
@@ -441,9 +457,9 @@ esp_err_t tempesta_read_pms5003(pms5003_data_t *data, weather_sensor_status_t *s
         }
 
         // Success! Extract PM data (use atmospheric environment values)
-        data->pm1_0_atm = (frame[10] << 8) | frame[11];
-        data->pm2_5_atm = (frame[12] << 8) | frame[13];
-        data->pm10_atm = (frame[14] << 8) | frame[15];
+        data->pm1_0_atm = ((uint16_t)frame[10] << 8) | frame[11];
+        data->pm2_5_atm = ((uint16_t)frame[12] << 8) | frame[13];
+        data->pm10_atm = ((uint16_t)frame[14] << 8) | frame[15];
         data->valid = true;
 
         *status = WEATHER_SENSOR_OK;

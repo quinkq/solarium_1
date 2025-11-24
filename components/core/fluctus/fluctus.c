@@ -23,6 +23,7 @@
 #include "stellaria.h"
 #include "impluvium.h"
 #include "tempesta.h"
+#include "wifi_helper.h"
 #include "telemetry.h"
 #include "solar_calc.h"
 #include "interval_config.h"
@@ -189,9 +190,10 @@ void fluctus_core_orchestration_task(void *parameters)
 {
     ESP_LOGI(TAG, "Core orchestration task started");
 
+    uint32_t notification_value = 0;
     while (true) {
         // Wait indefinitely for power state change notifications
-        uint32_t notification_value = 0;
+        notification_value = 0;
         BaseType_t notified = xTaskNotifyWait(
             0x00,           // Don't clear bits on entry
             ULONG_MAX,      // Clear all bits on exit

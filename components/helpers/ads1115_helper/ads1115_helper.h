@@ -1,10 +1,10 @@
 #ifndef ADS1115_HELPER_H
 #define ADS1115_HELPER_H
 
+#include "ads111x.h"
 #include <stdbool.h>
 #include <stdint.h>
 #include "esp_err.h"
-#include "ads111x.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
@@ -18,9 +18,16 @@ extern "C" {
 #define ADS1115_GAIN ADS111X_GAIN_4V096  // ±4.096V
 #define ADS1115_I2C_PORT I2C_NUM_0
 
-// Retry configuration
-#define ADS1115_RETRY_DELAY_START_MS 2000
-#define ADS1115_RETRY_DELAY_MAX_MS 60000
+// Retry configuration - read operation (fast retries for transient issues)
+#define ADS1115_READ_RETRY_ATTEMPTS 3
+#define ADS1115_READ_RETRY_DELAY_MS 50
+
+// Retry configuration - device initialization (two-tier strategy)
+#define ADS1115_INIT_FAST_RETRY_COUNT 3        // Number of fast retry attempts
+#define ADS1115_INIT_FAST_RETRY_DELAY_MS 5000UL  // 5 seconds for first fast retry
+#define ADS1115_INIT_SLOW_RETRY_DELAY_1_MS 60000   // 1 minute
+#define ADS1115_INIT_SLOW_RETRY_DELAY_2_MS 300000  // 5 minutes
+#define ADS1115_INIT_SLOW_RETRY_DELAY_3_MS 600000  // 10 minutes
 
 // ########################## Type Definitions ##########################
 
@@ -30,6 +37,7 @@ typedef struct {
     uint32_t last_retry_time;     // Last retry attempt timestamp
     uint8_t retry_count;          // Number of retry attempts
     uint32_t next_retry_delay_ms; // Next retry delay (exponential backoff)
+    bool needs_slow_retries;      // Flag indicating device required slow retries (potential hardware issue)
     const char *name;             // Device name for logging
 
     // Configuration parameters (set during initialization)
@@ -50,7 +58,7 @@ extern ads1115_device_t ads1115_devices[ADS1115_DEVICE_COUNT];
  * 
  * @return ESP_OK on success, ESP_FAIL if no devices could be initialized
  */
-esp_err_t ads1115_helper_general_init(void);
+esp_err_t ads1115_helper_init(void);
 
 /**
  * @brief Read a single channel from an ADS1115 device

@@ -1,3 +1,27 @@
+/**
+ * @file telemetry_mqtt_buffer.c
+ * @brief TELEMETRY MQTT buffering - Two-tier storage system
+ * @author Piotr P. <quinkq@gmail.com>
+ * @date 2025
+ *
+ * Two-tier MQTT buffering system for TELEMETRY component:
+ * - PSRAM ring buffer: 1820 slots × 288 bytes = 512KB (primary, volatile)
+ * - FLASH backup: 4096 slots × 288 bytes = ~1.1MB (secondary, persistent)
+ *
+ * PSRAM buffer features:
+ * - Circular buffer with head/tail pointers
+ * - Auto-dequeue on MQTT PUBACK (QoS 1)
+ * - Peek/dequeue operations for publish task
+ *
+ * FLASH backup features:
+ * - Automatic flush at 95% PSRAM capacity (1729 slots)
+ * - Manual flush via HMI before MCU reset
+ * - Boot recovery: restore to PSRAM, then delete file
+ * - Chronological order maintained via qsort by global_seq
+ *
+ * Part of the Solarium project - Solar-powered garden automation system
+ */
+
 #include "telemetry.h"
 #include "telemetry_private.h"
 
@@ -9,6 +33,10 @@ static const char *TAG = "TELEMETRY_MQTT_BUFFER";
 
 // ################ PSRAM Ring Buffer ################
 
+/**
+ * @brief Initialize PSRAM ring buffer for MQTT messages
+ * Allocates 512KB in SPIRAM (1820 slots × 288 bytes)
+ */
 esp_err_t telemetry_buffer_init(void)
 {
     psram_buffer = (buffer_slot_t *)heap_caps_malloc(
@@ -43,6 +71,10 @@ esp_err_t telemetry_buffer_init(void)
     return ESP_OK;
 }
 
+/**
+ * @brief Enqueue message to PSRAM ring buffer
+ * Called after msgpack encoding, before MQTT publishing
+ */
 esp_err_t telemetry_buffer_enqueue(const uint8_t *payload, uint16_t payload_len,
                                 telemetry_source_t src, uint8_t message_type)
 {
@@ -85,6 +117,10 @@ esp_err_t telemetry_buffer_enqueue(const uint8_t *payload, uint16_t payload_len,
     return ESP_OK;
 }
 
+/**
+ * @brief Peek at next message in buffer without removing it
+ * Used by publish task to read message before MQTT publish
+ */
 esp_err_t telemetry_buffer_peek(buffer_slot_t *out_slot, uint16_t *out_tail_index)
 {
     if (!psram_buffer || !out_slot) {
@@ -112,6 +148,10 @@ esp_err_t telemetry_buffer_peek(buffer_slot_t *out_slot, uint16_t *out_tail_inde
     return ESP_OK;
 }
 
+/**
+ * @brief Remove message from buffer after successful MQTT publish
+ * Called in event handler upon QoS 1 PUBACK
+ */
 esp_err_t telemetry_buffer_dequeue(void)
 {
     if (!psram_buffer) {
@@ -138,6 +178,10 @@ esp_err_t telemetry_buffer_dequeue(void)
     return ESP_OK;
 }
 
+/**
+ * @brief Get current number of messages in PSRAM buffer
+ * Thread-safe read of buffer_count
+ */
 uint16_t telemetry_buffer_get_count(void)
 {
     if (xSemaphoreTake(xBufferMutex, pdMS_TO_TICKS(100)) != pdTRUE) {

@@ -29,6 +29,8 @@
 
 #include "impluvium.h"
 #include "impluvium_private.h"
+#include "fluctus.h"
+#include "tempesta.h"   
 #include "telemetry.h"
 #include "solar_calc.h"
 #include "interval_config.h"
@@ -58,10 +60,10 @@ uint32_t impluvium_night_minimum_ms;          // Nighttime minimum interval
 
 // GPIO mapping for zones
 const gpio_num_t zone_valve_gpios[IRRIGATION_ZONE_COUNT] = {VALVE_GPIO_ZONE_1,
-                                                                   VALVE_GPIO_ZONE_2,
-                                                                   VALVE_GPIO_ZONE_3,
-                                                                   VALVE_GPIO_ZONE_4,
-                                                                   VALVE_GPIO_ZONE_5};
+                                                            VALVE_GPIO_ZONE_2,
+                                                            VALVE_GPIO_ZONE_3,
+                                                            VALVE_GPIO_ZONE_4,
+                                                            VALVE_GPIO_ZONE_5};
 
 // ABP sensor handle
 abp_t abp_dev = {0};
@@ -76,7 +78,7 @@ RTC_DATA_ATTR irrigation_accumulator_rtc_t rtc_impluvium_accumulator = {0};
 // ########################## Forward Declarations ##########################
 
 static void vTimerCallbackMoistureCheck(TimerHandle_t xTimer);
-void impluvium_task(void *pvParameters);
+static void impluvium_task(void *pvParameters);
 static void impluvium_daily_reset_callback(void);
 
 // ########################## System Initialization ##########################
@@ -112,7 +114,7 @@ esp_err_t impluvium_init(void)
     }
 
     // Initialize system state (static variables are zero-initialized)
-    irrigation_system.state = IMPLUVIUM_STANDBY;
+    irrigation_system.state = IMPLUVIUM_DISABLED;
     irrigation_system.active_zone = NO_ACTIVE_ZONE_ID; // No active zone
     irrigation_system.queue_index = 0;                 // Start at beginning of queue
     irrigation_system.state_start_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
@@ -300,7 +302,7 @@ static void vTimerCallbackMoistureCheck(TimerHandle_t xTimer)
 
     // If temperature is too low, skip moisture checks entirely
     if (next_interval_ms == UINT32_MAX) {
-        ESP_LOGI("MoistureTimer", "Skipping moisture check due to low temperature (%.1f°C)", current_temperature);
+        ESP_LOGI("IMPLUVIUM(Timer)", "Skipping moisture check due to low temperature (%.1f°C)", current_temperature);
         // Set timer to check again in 1 hour
         next_interval_ms = 60 * 60 * 1000;
         return; // Don't trigger moisture check
@@ -311,7 +313,7 @@ static void vTimerCallbackMoistureCheck(TimerHandle_t xTimer)
     TickType_t new_period = pdMS_TO_TICKS(next_interval_ms);
 
     if (current_period != new_period) {
-        ESP_LOGI("MoistureTimer",
+        ESP_LOGI("IMPLUVIUM(Timer)",
                  "Updating moisture check interval: %" PRIu32 "min (temp: %.1f°C)",
                  next_interval_ms / (60 * 1000),
                  current_temperature);
@@ -332,9 +334,9 @@ static void vTimerCallbackMoistureCheck(TimerHandle_t xTimer)
  *
  * @param pvParameters Task parameters (unused)
  */
-void impluvium_task(void *pvParameters)
+static void impluvium_task(void *pvParameters)
 {
-    const char *task_tag = "IMPLUVIUM_TASK";
+    const char *task_tag = "IMPLUVIUM(Task)";
     ESP_LOGI(task_tag, "Main irrigation task started");
 
     // Wait for other systems to initialize
@@ -344,9 +346,10 @@ void impluvium_task(void *pvParameters)
 
     // Start the periodic moisture check timer
     xTimerStart(xMoistureCheckTimer, 0);
+    uint32_t notification_value = 0;
 
     while (1) {
-        uint32_t notification_value = 0;
+        notification_value = 0;
         // Wait indefinitely for a notification
         xTaskNotifyWait(0x00,                /* Don't clear any bits on entry */
                         ULONG_MAX,           /* Clear all bits on exit */
