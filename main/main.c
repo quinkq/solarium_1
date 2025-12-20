@@ -16,6 +16,7 @@
 #include "nvs.h"
 
 #include "ads1115_helper.h"
+#include "mcp23008_helper.h"
 #include "impluvium.h"
 #include "tempesta.h"
 #include "fluctus.h"
@@ -242,6 +243,10 @@ void serial_debug_display_task(void *pvParameters)
 void app_main(void)
 {
     esp_log_level_set(TAG, ESP_LOG_INFO);
+
+    // Suppress noisy SPI debug messages (keep global DEBUG level for other components)
+    esp_log_level_set("spi_master", ESP_LOG_INFO);
+
     ESP_LOGI(TAG, "Starting ESP...");
 
     // Initialize NVS
@@ -370,6 +375,17 @@ void app_main(void)
         ESP_LOGI(TAG, "ADS1115 helper system initialized successfully");
     }
 
+    // Initialize MCP23008 I/O expander (encoder, pulse counters, hall array enable)
+    vTaskDelay(pdMS_TO_TICKS(100));
+    ESP_LOGI(TAG, "Initializing MCP23008 helper...");
+    esp_err_t mcp_ret = mcp23008_helper_init();
+    if (mcp_ret != ESP_OK) {
+        ESP_LOGE(TAG, "MCP23008 helper initialization failed: %s", esp_err_to_name(mcp_ret));
+        ESP_LOGW(TAG, "System will continue without encoder/pulse counter functionality");
+    } else {
+        ESP_LOGI(TAG, "MCP23008 helper initialized successfully");
+    }
+
     // Initialize weather station (SHT4x, BME280, AS5600, PMS5003)
     vTaskDelay(pdMS_TO_TICKS(100));
     ESP_LOGI(TAG, "Initializing weather station...");
@@ -425,5 +441,15 @@ void app_main(void)
     // Misc tasks / debug tools - ADS1115 retry task now handled by ads1115_helper component
     xTaskCreate(serial_debug_display_task, "serial_debug_display_task", configMINIMAL_STACK_SIZE * 4, NULL, 5, NULL);
 */
-    ESP_LOGI(TAG, "Tasks created.");
+    ESP_LOGI(TAG, "Tasks created!!!");
+
+    // Detailed heap stats after all initialization complete
+    ESP_LOGI(TAG, "=== Heap Memory Status (Post-Init) ===");
+    ESP_LOGI(TAG, "Internal RAM free:    %6d bytes (DMA-capable, fast)", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    ESP_LOGI(TAG, "Internal RAM largest: %6d bytes (biggest block)", heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    ESP_LOGI(TAG, "PSRAM free:           %6d bytes (slower, buffers)", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    ESP_LOGI(TAG, "PSRAM largest:        %6d bytes (biggest block)", heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+    ESP_LOGI(TAG, "Total free heap:      %6d bytes (all combined)", heap_caps_get_free_size(MALLOC_CAP_8BIT));
+    ESP_LOGI(TAG, "Min ever free heap:   %lu bytes (lowest point)", esp_get_minimum_free_heap_size());
+    ESP_LOGI(TAG, "======================================");
 }

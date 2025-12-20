@@ -44,15 +44,13 @@
 #define AS5600_PM_LPM3   0x03  // Low power mode 3: 100ms polling, 1.5mA
 #define AS5600_PM_MASK   0x03  // Mask for PM bits (bits 1:0)
 #define AS5600_READING_MASK 0x0FFF         // 12 bits
-#define AS5600_UPDATE_TASK_STACK_SIZE 4096 // Increased stack size
-#define AS5600_UPDATE_TASK_PRIORITY 5
-#define AS5600_UPDATE_INTERVAL_MS 20 // How often to read (Increased to ensure > 0 ticks)
 #define AS5600_MUTEX_TIMEOUT_MS 100
 
 static const char *TAG = "AS5600";
 
-// Threshold to detect wrap-around (slightly less than full range)
-static const float encoder_wrap_threshold = AS5600_PULSES_PER_REVOLUTION * 0.90f;
+// Threshold to detect wrap-around (50% = Nyquist criterion for encoder wrap detection)
+// If movement > 2048 counts between samples, assume shortest path wrapped through zero
+static const int32_t encoder_wrap_threshold = (int32_t)(AS5600_PULSES_PER_REVOLUTION / 2.0f); // 2048
 static const float counts_to_deg = 360.0f / AS5600_PULSES_PER_REVOLUTION;
 static const float counts_to_rad = (2.0f * M_PI) / AS5600_PULSES_PER_REVOLUTION;
 
@@ -70,13 +68,12 @@ static const float counts_to_rad = (2.0f * M_PI) / AS5600_PULSES_PER_REVOLUTION;
             return ESP_ERR_INVALID_ARG; \
     } while (0)
 
-// Forward declarations of internal functions
-static void as5600_update_task(void *pvParameters);
-static esp_err_t _as5600_read_raw_internal(as5600_dev_t *dev, uint16_t *raw_angle);
+// Forward declaration of internal function
+static esp_err_t _as5600_read_raw_internal(as5600_t *dev, uint16_t *raw_angle);
 
 /* Public API Functions */
 
-esp_err_t as5600_init_desc(as5600_dev_t *dev, i2c_port_t port, uint8_t addr, gpio_num_t sda_gpio, gpio_num_t scl_gpio)
+esp_err_t as5600_init_desc(as5600_t *dev, i2c_port_t port, uint8_t addr, gpio_num_t sda_gpio, gpio_num_t scl_gpio)
 {
     CHECK_ARG(dev);
 
@@ -87,7 +84,7 @@ esp_err_t as5600_init_desc(as5600_dev_t *dev, i2c_port_t port, uint8_t addr, gpi
     }
 
     // Zero-initialize the structure
-    memset(dev, 0, sizeof(as5600_dev_t));
+    memset(dev, 0, sizeof(as5600_t));
     dev->initialized = false;
 
     // Initialize I2C device descriptor
@@ -106,17 +103,9 @@ esp_err_t as5600_init_desc(as5600_dev_t *dev, i2c_port_t port, uint8_t addr, gpi
     return i2c_dev_create_mutex(&dev->i2c_dev);
 }
 
-esp_err_t as5600_free_desc(as5600_dev_t *dev)
+esp_err_t as5600_free_desc(as5600_t *dev)
 {
     CHECK_ARG(dev);
-
-    // If device was fully initialized, need to stop the task first
-    if (dev->initialized && dev->update_task_handle)
-    {
-        vTaskDelete(dev->update_task_handle);
-        dev->update_task_handle = NULL;
-        ESP_LOGD(TAG, "[0x%02x] Update task deleted", dev->i2c_dev.addr);
-    }
 
     // Delete the data mutex if it exists
     if (dev->data_mutex)
@@ -130,7 +119,7 @@ esp_err_t as5600_free_desc(as5600_dev_t *dev)
     return i2c_dev_delete_mutex(&dev->i2c_dev);
 }
 
-esp_err_t as5600_init(as5600_dev_t *dev)
+esp_err_t as5600_init(as5600_t *dev)
 {
     CHECK_ARG(dev);
 
@@ -145,8 +134,8 @@ esp_err_t as5600_init(as5600_dev_t *dev)
     }
 
     // Initialize accumulated_counts and zero_offset
-    dev->accumulated_counts = 0.0f;
-    dev->previous_raw_counts = 0.0f;
+    dev->accumulated_counts = 0;
+    dev->previous_raw_counts = 0;
     dev->zero_offset = 0;
     dev->initialized = false; // Will be set to true only after successful initialization
 
@@ -182,7 +171,7 @@ esp_err_t as5600_init(as5600_dev_t *dev)
     // Store the initial reading
     if (xSemaphoreTake(dev->data_mutex, pdMS_TO_TICKS(AS5600_MUTEX_TIMEOUT_MS)) == pdTRUE)
     {
-        dev->previous_raw_counts = (float)temp_raw;
+        dev->previous_raw_counts = (int32_t)temp_raw;
         xSemaphoreGive(dev->data_mutex);
     }
     else
@@ -193,73 +182,98 @@ esp_err_t as5600_init(as5600_dev_t *dev)
         return ESP_ERR_TIMEOUT;
     }
 
-    // Create the background update task
-    BaseType_t task_created = xTaskCreate(as5600_update_task,
-                                          "as5600_update",
-                                          AS5600_UPDATE_TASK_STACK_SIZE,
-                                          (void *)dev,
-                                          AS5600_UPDATE_TASK_PRIORITY,
-                                          &dev->update_task_handle);
-
-    if (task_created != pdPASS)
-    {
-        ESP_LOGE(TAG, "[0x%02x] Failed to create update task", dev->i2c_dev.addr);
-        vSemaphoreDelete(dev->data_mutex);
-        dev->data_mutex = NULL;
-        return ESP_FAIL;
-    }
-
-    // Now explicitly set initialized
+    // Mark as initialized - now using synchronous on-demand reads instead of autonomous task
     dev->initialized = true;
-    ESP_LOGI(TAG, "[0x%02x] AS5600 initialized successfully (initialized flag set to true)", dev->i2c_dev.addr);
+    ESP_LOGI(TAG, "[0x%02x] AS5600 initialized successfully (on-demand read mode)", dev->i2c_dev.addr);
 
     return ESP_OK;
 }
 
-esp_err_t as5600_read_raw_counts(as5600_dev_t *dev, uint16_t *counts)
+esp_err_t as5600_read_raw_counts(as5600_t *dev, uint16_t *counts)
 {
     CHECK_ARG(dev && counts);
 
     // Set default error value
     *counts = 0;
 
-    if (!dev)
-    {
-        ESP_LOGE(TAG, "Device pointer is NULL!");
-        return ESP_ERR_INVALID_ARG;
-    }
-
     if (!dev->initialized)
     {
-        ESP_LOGE(TAG, "[0x%02x] Device not initialized, flag is false", dev->i2c_dev.addr);
+        ESP_LOGE(TAG, "[0x%02x] Device not initialized", dev->i2c_dev.addr);
         return ESP_ERR_INVALID_STATE;
     }
 
-    if (!dev->data_mutex)
+    // Take I2C mutex and perform actual read
+    esp_err_t ret = i2c_dev_take_mutex(&dev->i2c_dev);
+    if (ret != ESP_OK)
     {
-        ESP_LOGE(TAG, "[0x%02x] Data mutex is NULL!", dev->i2c_dev.addr);
-        return ESP_ERR_INVALID_STATE;
+        ESP_LOGE(TAG, "[0x%02x] Failed to take I2C mutex: %s", dev->i2c_dev.addr, esp_err_to_name(ret));
+        return ret;
     }
 
+    uint16_t current_raw;
+    ret = _as5600_read_raw_internal(dev, &current_raw);
+    i2c_dev_give_mutex(&dev->i2c_dev);
+
+    if (ret != ESP_OK)
+    {
+        ESP_LOGW(TAG, "[0x%02x] I2C read failed: %s", dev->i2c_dev.addr, esp_err_to_name(ret));
+        return ret;
+    }
+
+    // Update accumulated counts with wrap-around handling (protected by data mutex)
     if (xSemaphoreTake(dev->data_mutex, pdMS_TO_TICKS(AS5600_MUTEX_TIMEOUT_MS)) != pdTRUE)
     {
-        ESP_LOGE(TAG, "[0x%02x] Failed to take mutex for reading raw counts", dev->i2c_dev.addr);
+        ESP_LOGE(TAG, "[0x%02x] Failed to take data mutex for accumulation", dev->i2c_dev.addr);
         return ESP_ERR_TIMEOUT;
     }
 
-    *counts = (uint16_t)dev->previous_raw_counts;
+    int32_t current = (int32_t)current_raw;
+    int32_t delta = current - dev->previous_raw_counts;
+
+    // Detect wrap-around using 50% threshold (Nyquist criterion for rotary encoders)
+    // If delta > 2048 counts (>180°), shortest path is backward wrap (crossed 0 going 4095→0)
+    // If delta < -2048 counts (<-180°), shortest path is forward wrap (crossed 0 going 0→4095)
+    if (delta > encoder_wrap_threshold)
+    {
+        // Example: previous=10, current=3086 → delta=+3076 (appears to jump forward)
+        // Forward path: 10→3086 = 3076 counts (270°)
+        // Backward path: 10→0→4095→3086 = 1020 counts (90°) ← shortest!
+        // Correction: subtract one full revolution from accumulator
+        dev->accumulated_counts -= (int32_t)AS5600_PULSES_PER_REVOLUTION;
+        ESP_LOGD(TAG, "[0x%02x] Wrap detected (backward), delta: %ld", dev->i2c_dev.addr, (long)delta);
+    }
+    else if (delta < -encoder_wrap_threshold)
+    {
+        // Example: previous=3086, current=10 → delta=-3076 (appears to jump backward)
+        // Forward path: 3086→4095→0→10 = 1020 counts (90°) ← shortest!
+        // Backward path: 3086→10 = 3076 counts (270°)
+        // Correction: add one full revolution to accumulator
+        dev->accumulated_counts += (int32_t)AS5600_PULSES_PER_REVOLUTION;
+        ESP_LOGD(TAG, "[0x%02x] Wrap detected (forward), delta: %ld", dev->i2c_dev.addr, (long)delta);
+    }
+
+    dev->previous_raw_counts = current;
+    *counts = current_raw;
+
     xSemaphoreGive(dev->data_mutex);
 
     return ESP_OK;
 }
 
-esp_err_t as5600_read_relative_counts(as5600_dev_t *dev, uint16_t *counts)
+esp_err_t as5600_read_relative_counts(as5600_t *dev, uint16_t *counts)
 {
     CHECK_ARG(dev && counts);
 
     if (!dev->initialized)
         return ESP_ERR_INVALID_STATE;
 
+    // First get fresh data from sensor (updates previous_raw_counts and accumulator)
+    uint16_t raw;
+    esp_err_t ret = as5600_read_raw_counts(dev, &raw);
+    if (ret != ESP_OK)
+        return ret;
+
+    // Now calculate relative position with fresh data
     if (xSemaphoreTake(dev->data_mutex, pdMS_TO_TICKS(AS5600_MUTEX_TIMEOUT_MS)) != pdTRUE)
     {
         ESP_LOGE(TAG, "[0x%02x] Failed to take mutex for reading relative counts", dev->i2c_dev.addr);
@@ -267,22 +281,30 @@ esp_err_t as5600_read_relative_counts(as5600_dev_t *dev, uint16_t *counts)
     }
 
     // Calculate relative counts: (current_raw - offset + full_range) % full_range
-    int32_t relative = (int32_t)dev->previous_raw_counts - (int32_t)dev->zero_offset;
-    relative = (relative + (int32_t)AS5600_PULSES_PER_REVOLUTION) % (int32_t)AS5600_PULSES_PER_REVOLUTION;
-    *counts = (uint16_t)relative;
+    int32_t relative = (int32_t)raw - (int32_t)dev->zero_offset;
+    if (relative < 0)
+        relative += (int32_t)AS5600_PULSES_PER_REVOLUTION;
+    *counts = (uint16_t)(relative % (int32_t)AS5600_PULSES_PER_REVOLUTION);
 
     xSemaphoreGive(dev->data_mutex);
 
     return ESP_OK;
 }
 
-esp_err_t as5600_read_accumulated_counts(as5600_dev_t *dev, float *counts)
+esp_err_t as5600_read_accumulated_counts(as5600_t *dev, int32_t *counts)
 {
     CHECK_ARG(dev && counts);
 
     if (!dev->initialized)
         return ESP_ERR_INVALID_STATE;
 
+    // First get fresh data from sensor (updates previous_raw_counts and accumulator)
+    uint16_t raw;
+    esp_err_t ret = as5600_read_raw_counts(dev, &raw);
+    if (ret != ESP_OK)
+        return ret;
+
+    // Now read accumulated total with fresh data
     if (xSemaphoreTake(dev->data_mutex, pdMS_TO_TICKS(AS5600_MUTEX_TIMEOUT_MS)) != pdTRUE)
     {
         ESP_LOGE(TAG, "[0x%02x] Failed to take mutex for reading accumulated counts", dev->i2c_dev.addr);
@@ -290,8 +312,7 @@ esp_err_t as5600_read_accumulated_counts(as5600_dev_t *dev, float *counts)
     }
 
     // Return absolute accumulated counts (ignores zero_offset)
-    // The accumulated value already includes the base for the current wrap cycle.
-    // We just need to add the current position within this cycle.
+    // The accumulated value tracks full revolutions, add current position within revolution
     *counts = dev->accumulated_counts + dev->previous_raw_counts;
 
     xSemaphoreGive(dev->data_mutex);
@@ -299,13 +320,20 @@ esp_err_t as5600_read_accumulated_counts(as5600_dev_t *dev, float *counts)
     return ESP_OK;
 }
 
-esp_err_t as5600_read_accumulated_counts_relative(as5600_dev_t *dev, float *counts)
+esp_err_t as5600_read_accumulated_counts_relative(as5600_t *dev, int32_t *counts)
 {
     CHECK_ARG(dev && counts);
 
     if (!dev->initialized)
         return ESP_ERR_INVALID_STATE;
 
+    // First get fresh data from sensor (updates previous_raw_counts and accumulator)
+    uint16_t raw;
+    esp_err_t ret = as5600_read_raw_counts(dev, &raw);
+    if (ret != ESP_OK)
+        return ret;
+
+    // Now read relative accumulated total with fresh data
     if (xSemaphoreTake(dev->data_mutex, pdMS_TO_TICKS(AS5600_MUTEX_TIMEOUT_MS)) != pdTRUE)
     {
         ESP_LOGE(TAG, "[0x%02x] Failed to take mutex for reading relative accumulated counts", dev->i2c_dev.addr);
@@ -314,15 +342,15 @@ esp_err_t as5600_read_accumulated_counts_relative(as5600_dev_t *dev, float *coun
 
     // Return accumulated counts relative to zero_offset
     // Get total raw position, then subtract the zero offset
-    float total_raw_counts = dev->accumulated_counts + dev->previous_raw_counts;
-    *counts = total_raw_counts - (float)dev->zero_offset;
+    int32_t total_raw_counts = dev->accumulated_counts + dev->previous_raw_counts;
+    *counts = total_raw_counts - (int32_t)dev->zero_offset;
 
     xSemaphoreGive(dev->data_mutex);
 
     return ESP_OK;
 }
 
-esp_err_t as5600_read_angle_degrees(as5600_dev_t *dev, float *angle)
+esp_err_t as5600_read_angle_degrees(as5600_t *dev, float *angle)
 {
     CHECK_ARG(dev && angle);
 
@@ -346,7 +374,7 @@ esp_err_t as5600_read_angle_degrees(as5600_dev_t *dev, float *angle)
     return ESP_OK;
 }
 
-esp_err_t as5600_read_angle_radians(as5600_dev_t *dev, float *angle)
+esp_err_t as5600_read_angle_radians(as5600_t *dev, float *angle)
 {
     CHECK_ARG(dev && angle);
 
@@ -368,7 +396,7 @@ esp_err_t as5600_read_angle_radians(as5600_dev_t *dev, float *angle)
     return ESP_OK;
 }
 
-esp_err_t as5600_set_zero_offset(as5600_dev_t *dev)
+esp_err_t as5600_set_zero_offset(as5600_t *dev)
 {
     CHECK_ARG(dev);
 
@@ -389,13 +417,13 @@ esp_err_t as5600_set_zero_offset(as5600_dev_t *dev)
     return ESP_OK;
 }
 
-float as5600_get_counts_per_revolution(as5600_dev_t *dev)
+float as5600_get_counts_per_revolution(as5600_t *dev)
 {
     (void)dev; // Parameter not needed for this constant value
     return AS5600_PULSES_PER_REVOLUTION;
 }
 
-esp_err_t as5600_set_power_mode(as5600_dev_t *dev, uint8_t power_mode)
+esp_err_t as5600_set_power_mode(as5600_t *dev, uint8_t power_mode)
 {
     CHECK_ARG(dev);
 
@@ -440,7 +468,7 @@ esp_err_t as5600_set_power_mode(as5600_dev_t *dev, uint8_t power_mode)
     return ESP_OK;
 }
 
-esp_err_t as5600_read_status(as5600_dev_t *dev, as5600_status_t *status)
+esp_err_t as5600_read_status(as5600_t *dev, as5600_status_t *status)
 {
     CHECK_ARG(dev);
     CHECK_ARG(status);
@@ -481,7 +509,7 @@ esp_err_t as5600_read_status(as5600_dev_t *dev, as5600_status_t *status)
 /* Internal Functions */
 
 // Internal function to read the raw 12-bit angle
-static esp_err_t _as5600_read_raw_internal(as5600_dev_t *dev, uint16_t *raw_angle)
+static esp_err_t _as5600_read_raw_internal(as5600_t *dev, uint16_t *raw_angle)
 {
     if (!dev || !raw_angle)
         return ESP_ERR_INVALID_ARG;
@@ -503,95 +531,4 @@ static esp_err_t _as5600_read_raw_internal(as5600_dev_t *dev, uint16_t *raw_angl
     *raw_angle &= AS5600_READING_MASK; // Apply 12-bit mask
 
     return ESP_OK;
-}
-
-// Background task to continuously read the sensor and update accumulated counts
-static void as5600_update_task(void *pvParameters)
-{
-    as5600_dev_t *dev = (as5600_dev_t *)pvParameters;
-    TickType_t last_wake_time = xTaskGetTickCount();
-    const TickType_t update_interval_ticks = pdMS_TO_TICKS(AS5600_UPDATE_INTERVAL_MS);
-
-    ESP_LOGI(TAG, "[0x%02x] Update task started", dev->i2c_dev.addr);
-
-    // Main update loop
-    uint8_t fail_count = 0;
-
-    while (1)
-    {
-        uint16_t current_raw;
-
-        if (i2c_dev_take_mutex(&dev->i2c_dev) == ESP_OK)
-        {
-            esp_err_t read_ret = _as5600_read_raw_internal(dev, &current_raw);
-            i2c_dev_give_mutex(&dev->i2c_dev);
-
-            if (read_ret == ESP_OK)
-            {
-                fail_count = 0; // Reset fail counter on success
-
-                if (xSemaphoreTake(dev->data_mutex, pdMS_TO_TICKS(AS5600_MUTEX_TIMEOUT_MS)) == pdTRUE)
-                {
-                    float current_f = (float)current_raw;
-                    float delta = current_f - dev->previous_raw_counts;
-
-                    // Check for wrap-around
-                    if (fabsf(delta) >= encoder_wrap_threshold)
-                    {
-                        // Determine direction of wrap
-                        if (delta < 0.0f)
-                        { // Wrapped from low to high (e.g., 10 -> 4090)
-                            dev->accumulated_counts += AS5600_PULSES_PER_REVOLUTION;
-                            ESP_LOGD(TAG, "[0x%02x] Wrap detected (+), delta: %.1f, prev: %.1f, curr: %.1f",
-                                     dev->i2c_dev.addr, delta, dev->previous_raw_counts, current_f);
-                        }
-                        else
-                        { // Wrapped from high to low (e.g., 4090 -> 10)
-                            dev->accumulated_counts -= AS5600_PULSES_PER_REVOLUTION;
-                            ESP_LOGD(TAG, "[0x%02x] Wrap detected (-), delta: %.1f, prev: %.1f, curr: %.1f",
-                                     dev->i2c_dev.addr, delta, dev->previous_raw_counts, current_f);
-                        }
-                    }
-
-                    // Update previous value for next iteration
-                    dev->previous_raw_counts = current_f;
-                    xSemaphoreGive(dev->data_mutex);
-
-                    // Periodically log the raw reading to help diagnose issues
-                    static int log_counter = 0;
-                    if (++log_counter >= 100)
-                    { // Log every ~2 seconds at 20ms interval
-                        ESP_LOGD(TAG, "[0x%02x] Raw reading: %u, Accumulated: %.1f",
-                                 dev->i2c_dev.addr, current_raw, dev->accumulated_counts);
-                        log_counter = 0;
-                    }
-                }
-                else
-                {
-                    ESP_LOGW(TAG, "[0x%02x] Could not take mutex in update task", dev->i2c_dev.addr);
-                }
-            }
-            else
-            {
-                fail_count++;
-                ESP_LOGE(TAG, "[0x%02x] Failed to read sensor in update task: %d (%s), fails: %d",
-                         dev->i2c_dev.addr, read_ret, esp_err_to_name(read_ret), fail_count);
-
-                // If persistent failures, try reinitializing the I2C communication
-                if (fail_count > 10)
-                {
-                    ESP_LOGW(TAG, "[0x%02x] Persistent read failures, consider reinitializing sensor",
-                             dev->i2c_dev.addr);
-                    fail_count = 0; // Reset counter to avoid flooding logs
-                }
-            }
-        }
-        else
-        {
-            ESP_LOGW(TAG, "[0x%02x] Failed to take I2C mutex in update task", dev->i2c_dev.addr);
-        }
-
-        // Wait for the next interval
-        vTaskDelayUntil(&last_wake_time, update_interval_ticks);
-    }
 }

@@ -25,12 +25,12 @@
 #define IRRIGATION_ZONE_COUNT 5
 
 // GPIO Pin Assignments
-#define FLOW_SENSOR_GPIO GPIO_NUM_21
-#define VALVE_GPIO_ZONE_1 GPIO_NUM_38
-#define VALVE_GPIO_ZONE_2 GPIO_NUM_39
-#define VALVE_GPIO_ZONE_3 GPIO_NUM_40
-#define VALVE_GPIO_ZONE_4 GPIO_NUM_41
-#define VALVE_GPIO_ZONE_5 GPIO_NUM_42
+#define FLOW_SENSOR_GPIO GPIO_NUM_48
+#define VALVE_GPIO_ZONE_0 GPIO_NUM_38
+#define VALVE_GPIO_ZONE_1 GPIO_NUM_39
+#define VALVE_GPIO_ZONE_2 GPIO_NUM_40
+#define VALVE_GPIO_ZONE_3 GPIO_NUM_41
+#define VALVE_GPIO_ZONE_4 GPIO_NUM_42
 #define PUMP_PWM_GPIO GPIO_NUM_46
 
 // ABP Pin definitions
@@ -50,8 +50,8 @@
 // Pump PWM Settings
 #define PUMP_PWM_FREQUENCY 1000 // 1kHz for pump speed control
 #define PUMP_PWM_RESOLUTION LEDC_TIMER_10_BIT
-#define PUMP_PWM_TIMER LEDC_TIMER_1
-#define PUMP_PWM_CHANNEL LEDC_CHANNEL_2
+#define PUMP_PWM_TIMER LEDC_TIMER_0  // Dedicated timer for pump (avoid sharing with Stellaria)
+#define PUMP_PWM_CHANNEL LEDC_CHANNEL_4  // Changed from 2 to avoid conflict with pitch servo
 #define PUMP_MIN_DUTY 434 // 42% minimum duty cycle (pump stall protection)
 #define PUMP_MAX_DUTY 1023
 #define PUMP_DEFAULT_DUTY 512 // 50% default startup duty cycle
@@ -59,7 +59,7 @@
 // Flow and Monitoring
 #define MONITORING_INTERVAL_MS 500               // 500ms monitoring during watering
 #define FLOW_RATE_CALC_PERIOD_MS 500             // Calculate flow rate every 500ms
-#define VALVE_OPEN_DELAY_MS 100                  // Wait for valve to open (ms)
+#define VALVE_OPEN_DELAY_MS 1500                 // Wait for valve to open + power stabilization (ms)
 #define PUMP_FLOW_ESTABLISH_DELAY_MS 3000        // Wait for flow to establish after pump start before measuring
 #define PRESSURE_EQUALIZE_DELAY_MS 1000          // Wait for pressure equalization after pump stop
 #define FLOW_CALIBRATION_PULSES_PER_LITER 400.0f // Global flow sensor calibration
@@ -96,8 +96,8 @@
 #define PUMP_GAIN_RATE_TOLERANCE 0.1f  // Acceptable gain rate deviation
 
 // Sensor Calibration Settings
-#define MOISTURE_SENSOR_DRY_V 0.3f // Voltage for 0% moisture
-#define MOISTURE_SENSOR_WET_V 3.3f // Voltage for 100% moisture
+#define MOISTURE_SENSOR_DRY_V 2.2f // Voltage for 0% moisture
+#define MOISTURE_SENSOR_WET_V 0.85f // Voltage for 100% moisture
 #define WATER_LEVEL_MIN_MBAR 15.0f // mbar for 0% water level
 #define WATER_LEVEL_MAX_MBAR 60.0f // mbar for 100% water level
 
@@ -169,7 +169,7 @@ typedef struct {
 typedef struct {
     uint8_t zone_id;                 // Zone number (0-4)
     gpio_num_t valve_gpio;           // Solenoid valve control pin
-    uint8_t moisture_ads_device;     // ADS1115 device ID (1 or 2)
+    uint8_t moisture_ads_device;     // ADS1115 device ID (0 or 1)
     ads111x_mux_t moisture_channel;  // Channel on ADS device
     float target_moisture_percent;   // Desired moisture level (0-100%)
     float moisture_deadband_percent; // Tolerance around target (±%)
@@ -220,7 +220,7 @@ typedef struct {
 
 // System State Structure
 typedef struct {
-    impluvium_state_t state;                                    // Current system state
+    impluvium_state_t state;                                     // Current system state
     uint8_t active_zone;                                         // Currently watering zone (255 = none)
     float outlet_pressure;                                       // System pressure (bar)
     float water_level;                                           // Tank level (%)

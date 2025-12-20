@@ -8,10 +8,9 @@
 
 // ########################## HMI Configuration ##########################
 
-// EC11 Rotary Encoder GPIO Configuration
-#define HMI_ENCODER_A_GPIO      GPIO_NUM_16  // Quadrature signal A
-#define HMI_ENCODER_B_GPIO      GPIO_NUM_17  // Quadrature signal B
-#define HMI_ENCODER_BTN_GPIO    GPIO_NUM_18  // Push button
+// EC11 Rotary Encoder Configuration
+// NOTE: Encoder signals routed through MCP23008 I2C GPIO expander
+// See mcp23008_helper.h for pin mapping (GP0/GP1/GP2)
 
 // SH1106 OLED Display SPI Configuration
 #define HMI_DISPLAY_CS_GPIO     GPIO_NUM_13  // Chip select
@@ -21,17 +20,13 @@
 // Display Specifications
 #define HMI_DISPLAY_WIDTH       128          // Pixels
 #define HMI_DISPLAY_HEIGHT      64           // Pixels
-#define HMI_DISPLAY_ROTATION    0            // 0, 90, 180, or 270 degrees
+#define HMI_DISPLAY_ROTATION    180            // 0, 90, 180, or 270 degrees (90° increments)
 
 // Display Timing Configuration
 #define HMI_DISPLAY_TIMEOUT_NORMAL_MS   (30 * 1000)  // 30 second timeout for normal menus
 #define HMI_DISPLAY_TIMEOUT_REALTIME_MS (60 * 1000)  // 60 second timeout for realtime pages
-#define HMI_REFRESH_RATE_NORMAL_MS      1000         // 1Hz for static menus (event-driven)
-#define HMI_REFRESH_RATE_REALTIME_MS    250          // 4Hz for realtime pages
-
-// PCNT Configuration for Encoder
-#define HMI_PCNT_HIGH_LIMIT     100          // Upper count limit
-#define HMI_PCNT_LOW_LIMIT      -100         // Lower count limit
+#define HMI_REFRESH_RATE_NORMAL_MS      250          // 2Hz for static menus (responsive interaction)
+#define HMI_REFRESH_RATE_REALTIME_MS    125          // 8Hz for realtime pages (smooth updates)
 
 // Menu Configuration
 #define HMI_MENU_MAX_ITEMS      10           // Maximum items per menu page
@@ -50,22 +45,20 @@ typedef enum {
     HMI_MENU_FLUCTUS_ENERGY,     // Energy statistics (hourly/daily) [1Hz]
     HMI_MENU_FLUCTUS_LIVE_POWER, // Live power monitoring (inst + avg) [4Hz REALTIME]
     HMI_MENU_FLUCTUS_BUSES,      // Power bus status [1Hz]
-    HMI_MENU_FLUCTUS_TRACKING,   // Solar tracking position [1Hz]
-    HMI_MENU_FLUCTUS_SOLAR_DEBUG,// Solar tracking debug (errors, sensors) [4Hz REALTIME]
+    HMI_MENU_FLUCTUS_SOLAR, // Paginated: Tracking, Errors, Sensors [3 pages, 4Hz REALTIME]
+    HMI_MENU_FLUCTUS_SERVO_DEBUG,       // Servo debug menu (select yaw/pitch) [1Hz]
+    HMI_MENU_FLUCTUS_SERVO_CONTROL_YAW, // Manual yaw servo control [4Hz REALTIME]
+    HMI_MENU_FLUCTUS_SERVO_CONTROL_PITCH, // Manual pitch servo control [4Hz REALTIME]
     HMI_MENU_FLUCTUS_CONTROLS,   // Solar tracking & safety controls [1Hz]
     HMI_MENU_FLUCTUS_INTERVALS,  // Interval configuration (power day/night, solar correction) [1Hz]
     HMI_MENU_TEMPESTA,           // TEMPESTA weather station submenu
-    HMI_MENU_TEMPESTA_ENV,       // Environmental sensors details
-    HMI_MENU_TEMPESTA_WIND,      // Wind sensor details
-    HMI_MENU_TEMPESTA_RAIN,      // Rain gauge details
-    HMI_MENU_TEMPESTA_TANK,      // Tank intake details
-    HMI_MENU_TEMPESTA_AIR,       // Air quality details
+    HMI_MENU_TEMPESTA_SENSORS,   // Paginated sensors (Environment, Wind, Rain+Tank, Air) [4 pages]
     HMI_MENU_TEMPESTA_CONTROLS,  // System controls (enable/disable, force collection, resets)
     HMI_MENU_TEMPESTA_INTERVALS, // Interval configuration (normal, power save) [1Hz]
-    HMI_MENU_IMPLUVIUM,          // IMPLUVIUM irrigation submenu
-    HMI_MENU_IMPLUVIUM_OVERVIEW, // System overview (state, water level, totals) [1Hz]
-    HMI_MENU_IMPLUVIUM_STATISTICS, // Hourly/daily water usage statistics [1Hz]
-    HMI_MENU_IMPLUVIUM_ZONES,    // Zones submenu selector
+    HMI_MENU_IMPLUVIUM,              // IMPLUVIUM irrigation submenu
+    HMI_MENU_IMPLUVIUM_OVERVIEW_STATS, // Paginated: Overview, Stats Z1-3, Stats Z4-5 [3 pages]
+    HMI_MENU_IMPLUVIUM_MONITOR,      // System monitor (state, pressure, flow, pump) [4Hz REALTIME]
+    HMI_MENU_IMPLUVIUM_ZONES,        // Zones submenu selector
     HMI_MENU_IMPLUVIUM_ZONES_ALL, // All zones summary (default)
     HMI_MENU_IMPLUVIUM_ZONE_1,   // Zone 1 detail
     HMI_MENU_IMPLUVIUM_ZONE_2,   // Zone 2 detail
@@ -79,7 +72,6 @@ typedef enum {
     HMI_MENU_IMPLUVIUM_LEARNING_3, // Zone 3 learning detail
     HMI_MENU_IMPLUVIUM_LEARNING_4, // Zone 4 learning detail
     HMI_MENU_IMPLUVIUM_LEARNING_5, // Zone 5 learning detail
-    HMI_MENU_IMPLUVIUM_MONITOR,  // System monitor [4Hz REALTIME]
     HMI_MENU_IMPLUVIUM_CONTROLS, // System controls (enable/disable, force check, resets) [1Hz]
     HMI_MENU_IMPLUVIUM_ZONE_CONFIG, // Zone configuration list [1Hz]
     HMI_MENU_IMPLUVIUM_ZONE_EDIT,   // Zone editing (enable/target/deadband/manual water)
@@ -118,6 +110,15 @@ typedef struct {
     int16_t encoder_count;       // Current encoder count
     bool blink_state;            // Blinking indicator state for [LIVE] pages
     uint32_t blink_counter;      // Counter for blink timing (250ms toggles = 500ms cycle)
+
+    // Scrolling state (for menus with >7 items)
+    uint8_t scroll_offset;       // First visible item index (0-based)
+    uint8_t menu_scroll_memory[47]; // Per-menu scroll position memory (indexed by hmi_menu_state_t)
+    uint8_t menu_selected_item_memory[47]; // Per-menu selected item memory (indexed by hmi_menu_state_t)
+
+    // Pagination state (for detail pages)
+    uint8_t current_page;        // Current page index (0-based, 0 = no pagination)
+    uint8_t total_pages;         // Total pages for current view (0 = no pagination)
 } hmi_status_t;
 
 // ########################## Public API Functions ##########################

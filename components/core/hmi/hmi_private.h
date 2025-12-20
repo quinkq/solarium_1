@@ -22,6 +22,24 @@
 #include "interval_config.h"
 
 
+// ########################## Scrolling and Pagination Constants ##########################
+
+/**
+ * @brief Maximum visible menu items on screen (including "< Back")
+ * Calculated: 7 items × 7px spacing = 49px, fits in 54px content area
+ */
+#define HMI_MAX_VISIBLE_ITEMS 7
+
+/**
+ * @brief Y-coordinate where menu content starts (after title + divider)
+ */
+#define HMI_MENU_START_Y 14
+
+/**
+ * @brief Standard vertical spacing between menu items (pixels)
+ */
+#define HMI_MENU_ITEM_SPACING 7
+
 // ########################## Confirmation Action Types ##########################
 
 /**
@@ -74,6 +92,12 @@ extern uint32_t editing_interval_value;
 extern confirm_action_t confirmation_action;
 extern uint8_t confirmation_param;
 extern hmi_menu_state_t confirmation_return_menu;
+
+// Servo debug state (for FLUCTUS manual servo control)
+extern bool servo_debug_active;           // True when in servo control mode
+extern time_t servo_debug_start_time;     // Timestamp when control mode started (for timeout)
+extern bool servo_debug_bus_requested;    // True if we have 6.6V bus power
+extern uint32_t servo_debug_current_duty; // Current servo duty cycle (tracked locally during control)
 
 // ########################## Display Functions (hmi_display.c) ##########################
 
@@ -138,6 +162,22 @@ void hmi_fb_draw_hline(int x, int y, int width);
  * @brief Flush framebuffer to display via SPI
  */
 void hmi_fb_flush(void);
+
+/**
+ * @brief Draw scroll indicators (▲/▼) for menus with >7 items
+ * @param total_items Total number of items in current menu
+ */
+void hmi_draw_scroll_indicators(uint8_t total_items);
+
+/**
+ * @brief Draw navigation symbol in top-left corner (← for back)
+ */
+void hmi_draw_back_symbol(void);
+
+/**
+ * @brief Draw navigation symbol in top-right corner (↔ for pagination)
+ */
+void hmi_draw_pagination_symbol(void);
 
 // ########################## Navigation Functions (hmi_navigation.c) ##########################
 

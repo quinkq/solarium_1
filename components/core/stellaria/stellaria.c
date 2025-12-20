@@ -35,7 +35,7 @@ static stellaria_snapshot_t stellaria_status = {
     .state = STELLARIA_STATE_DISABLED,
     .current_intensity = 0,
     .target_intensity = 0,
-    .driver_enabled = false,
+    .driver_output_enabled = false,
     .initialized = false,
     .auto_mode_active = false,
     .power_save_mode = false,
@@ -68,8 +68,8 @@ static uint16_t stellaria_clamp_intensity(uint16_t intensity, stellaria_state_t 
 static uint16_t stellaria_calculate_effective_target(void);
 static void stellaria_start_ramp(uint16_t target);
 static void stellaria_ramp_task(void *pvParameters);
-static esp_err_t stellaria_on_state(void);
-static esp_err_t stellaria_off_state(void);
+static esp_err_t stellaria_enable_output(void);
+static esp_err_t stellaria_disable_output(void);
 
 // ########################## Private Functions ##########################
 
@@ -221,6 +221,14 @@ static void stellaria_ramp_task(void *pvParameters)
                     stellaria_status.current_intensity = current + step;
                 }
 
+                // Verify 12V bus is still powered before applying PWM
+                // (FLUCTUS may revoke bus power during load shedding)
+                if (stellaria_status.driver_output_enabled && !fluctus_is_bus_powered(POWER_BUS_12V)) {
+                    ESP_LOGW(TAG, "12V bus power lost during ramp - suspending task");
+                    xSemaphoreGive(xStellariaMutex);
+                    break;  // Exit ramp loop
+                }
+
                 // Apply to hardware
                 stellaria_apply_pwm();
 
@@ -259,7 +267,7 @@ static void stellaria_start_ramp(uint16_t target)
  * @note Must be called with mutex already held
  * @return ESP_OK on success, ESP_FAIL if bus power request fails
  */
-static esp_err_t stellaria_on_state(void)
+static esp_err_t stellaria_enable_output(void)
 {
     // Request 12V bus power for LED drivers
     esp_err_t ret = fluctus_request_bus_power(POWER_BUS_12V, "STELLARIA");
@@ -268,7 +276,7 @@ static esp_err_t stellaria_on_state(void)
         return ESP_FAIL;
     }
 
-    stellaria_status.driver_enabled = true;
+    stellaria_status.driver_output_enabled = true;
 
     // Calculate effective target and start ramping (unless irrigation dimming active)
     uint16_t effective_target = stellaria_calculate_effective_target();
@@ -285,9 +293,9 @@ static esp_err_t stellaria_on_state(void)
  * @note Must be called with mutex already held
  * @return ESP_OK on success
  */
-static esp_err_t stellaria_off_state(void)
+static esp_err_t stellaria_disable_output(void)
 {
-    stellaria_status.driver_enabled = false;
+    stellaria_status.driver_output_enabled = false;
 
     // Ramp to 0
     stellaria_start_ramp(0);
@@ -342,7 +350,7 @@ esp_err_t stellaria_init(void)
         stellaria_status.state = STELLARIA_STATE_DISABLED;
         stellaria_status.current_intensity = 0;
         stellaria_status.target_intensity = 0;
-        stellaria_status.driver_enabled = false;
+        stellaria_status.driver_output_enabled = false;
         stellaria_status.initialized = true;
         user_raw_intensity = 0;
         ramp_target_intensity = 0;
@@ -422,7 +430,7 @@ esp_err_t stellaria_enable(void)
             // Check current light reading to decide initial state
             if (stellaria_status.last_light_reading > STELLARIA_LIGHT_TURN_ON_THRESHOLD) {
                 // Dark - turn lights ON
-                ret = stellaria_on_state();
+                ret = stellaria_enable_output();
                 ESP_LOGI(TAG, "STELLARIA enabled in AUTO mode - lights ON (dark: %.3fV)",
                          stellaria_status.last_light_reading);
             } else {
@@ -432,7 +440,7 @@ esp_err_t stellaria_enable(void)
             }
         } else {
             // Manual mode - turn lights ON
-            ret = stellaria_on_state();
+            ret = stellaria_enable_output();
             ESP_LOGI(TAG, "STELLARIA enabled in MANUAL mode - lights ON");
         }
 
@@ -451,7 +459,7 @@ esp_err_t stellaria_disable(void)
 
     if (xSemaphoreTake(xStellariaMutex, pdMS_TO_TICKS(STELLARIA_MUTEX_TIMEOUT_MS)) == pdTRUE) {
         // Turn lights OFF and release bus power
-        esp_err_t ret = stellaria_off_state();
+        esp_err_t ret = stellaria_disable_output();
 
         // Set state to DISABLED but preserve auto_mode_active flag
         stellaria_status.state = STELLARIA_STATE_DISABLED;
@@ -552,11 +560,16 @@ esp_err_t stellaria_set_shutdown(bool shutdown)
             // Set shutdown state
             stellaria_status.state = STELLARIA_STATE_SHUTDOWN;
 
-            // Turn off using proper state handler (ramps down + releases power)
-            ret = stellaria_off_state();
-
-            ESP_LOGI(TAG, "STELLARIA shutdown for load shedding (saved state: %d, intensity: %d, power_save: %d)",
-                     previous_state, previous_intensity, previous_power_save_mode);
+            // Only call disable_output if lights were actually enabled
+            // (prevents bus release errors when Stellaria was already DISABLED)
+            if (previous_state == STELLARIA_STATE_ENABLED) {
+                // Turn off using proper state handler (ramps down + releases power)
+                ret = stellaria_disable_output();
+                ESP_LOGI(TAG, "STELLARIA shutdown for load shedding (saved state: ENABLED, intensity: %d, power_save: %d)",
+                         previous_intensity, previous_power_save_mode);
+            } else {
+                ESP_LOGI(TAG, "STELLARIA shutdown for load shedding (saved state: DISABLED, no action needed)");
+            }
         } else {
             // Restore previous state and flags
             stellaria_status.state = previous_state;
@@ -566,7 +579,7 @@ esp_err_t stellaria_set_shutdown(bool shutdown)
             // If the restored state requires lights to be on, use proper state handler
             if (previous_state == STELLARIA_STATE_ENABLED) {
                 // Turn on using proper state handler (requests power + smooth ramp)
-                ret = stellaria_on_state();
+                ret = stellaria_enable_output();
 
                 ESP_LOGI(TAG, "STELLARIA restored from shutdown (state: ENABLED, ramping to: %d, power_save: %d)",
                          stellaria_status.target_intensity, stellaria_status.power_save_mode);
@@ -636,15 +649,15 @@ esp_err_t stellaria_set_auto_mode(bool enable)
                 // Check current light reading to decide state
                 if (stellaria_status.last_light_reading > STELLARIA_LIGHT_TURN_ON_THRESHOLD) {
                     // Dark - ensure lights are ON
-                    if (!stellaria_status.driver_enabled) {
-                        ret = stellaria_on_state();
+                    if (!stellaria_status.driver_output_enabled) {
+                        ret = stellaria_enable_output();
                     }
                     ESP_LOGI(TAG, "Auto mode enabled - lights ON (dark: %.3fV)",
                              stellaria_status.last_light_reading);
                 } else {
                     // Bright - turn lights OFF
-                    if (stellaria_status.driver_enabled) {
-                        ret = stellaria_off_state();
+                    if (stellaria_status.driver_output_enabled) {
+                        ret = stellaria_disable_output();
                     }
                     ESP_LOGI(TAG, "Auto mode enabled - lights OFF (bright: %.3fV)",
                              stellaria_status.last_light_reading);
@@ -658,7 +671,7 @@ esp_err_t stellaria_set_auto_mode(bool enable)
 
             // If currently enabled, ensure lights are in a consistent state
             if (stellaria_status.state == STELLARIA_STATE_ENABLED) {
-                if (stellaria_status.driver_enabled) {
+                if (stellaria_status.driver_output_enabled) {
                     ESP_LOGI(TAG, "Auto mode disabled - remaining in ENABLED mode (lights ON)");
                 } else {
                     // Lights are OFF - transition to DISABLED
@@ -697,7 +710,7 @@ esp_err_t stellaria_update_light_intensity(float averaged_light_voltage)
             return ESP_OK;  // Auto mode configured but stellaria disabled - do nothing
         }
 
-        bool currently_on = stellaria_status.driver_enabled;
+        bool currently_on = stellaria_status.driver_output_enabled;
         bool should_be_on = false;
 
         // Hysteresis logic: low voltage = bright light, high voltage = dark
@@ -715,12 +728,12 @@ esp_err_t stellaria_update_light_intensity(float averaged_light_voltage)
         if (should_be_on && !currently_on) {
             ESP_LOGI(TAG, "Auto mode: Turning ON (%.3fV > %.3fV - dark)",
                      averaged_light_voltage, STELLARIA_LIGHT_TURN_ON_THRESHOLD);
-            ret = stellaria_on_state();
+            ret = stellaria_enable_output();
 
         } else if (!should_be_on && currently_on) {
             ESP_LOGI(TAG, "Auto mode: Turning OFF (%.3fV < %.3fV - bright)",
                      averaged_light_voltage, STELLARIA_LIGHT_TURN_OFF_THRESHOLD);
-            ret = stellaria_off_state();
+            ret = stellaria_disable_output();
         }
 
         xSemaphoreGive(xStellariaMutex);
@@ -736,20 +749,20 @@ esp_err_t stellaria_update_light_intensity(float averaged_light_voltage)
  */
 esp_err_t stellaria_request_irrigation_dim(bool dim)
 {
-    if (!stellaria_status.initialized) {
+    if (!stellaria_status.initialized || stellaria_status.state != STELLARIA_STATE_ENABLED) {
         return ESP_ERR_INVALID_STATE;
     }
 
     if (xSemaphoreTake(xStellariaMutex, pdMS_TO_TICKS(STELLARIA_MUTEX_TIMEOUT_MS)) == pdTRUE) {
         if (dim && !irrigation_dimming_active) {
-            // Start dimming: activate flag and ramp to minimum
+            // START DIMMING: activate flag and ramp to minimum
             irrigation_dimming_active = true;
 
             stellaria_start_ramp(STELLARIA_MIN_INTENSITY);
             ESP_LOGI(TAG, "Irrigation dimming: ramping to MIN (%d)", STELLARIA_MIN_INTENSITY);
 
         } else if (!dim && irrigation_dimming_active) {
-            // End dimming: deactivate flag and restore appropriate target
+            // END DIMMING: deactivate flag and restore appropriate target
             irrigation_dimming_active = false;
 
             // In auto mode, check light conditions to decide target
@@ -758,8 +771,8 @@ esp_err_t stellaria_request_irrigation_dim(bool dim)
                 bool should_be_on = (stellaria_status.last_light_reading > STELLARIA_LIGHT_TURN_ON_THRESHOLD);
                 if (should_be_on) {
                     // Lights should be ON - ensure bus power and ramp
-                    if (!stellaria_status.driver_enabled) {
-                        stellaria_on_state();
+                    if (!stellaria_status.driver_output_enabled) {
+                        stellaria_enable_output();
                     } else {
                         uint16_t restore_target = stellaria_clamp_intensity(auto_mode_intensity, stellaria_status.state, stellaria_status.power_save_mode);
                         stellaria_start_ramp(restore_target);
@@ -767,8 +780,8 @@ esp_err_t stellaria_request_irrigation_dim(bool dim)
                     ESP_LOGI(TAG, "Irrigation complete: restoring auto mode ON");
                 } else {
                     // Lights should be OFF - release bus power
-                    if (stellaria_status.driver_enabled) {
-                        stellaria_off_state();
+                    if (stellaria_status.driver_output_enabled) {
+                        stellaria_disable_output();
                     }
                     ESP_LOGI(TAG, "Irrigation complete: restoring auto mode OFF");
                 }

@@ -59,11 +59,11 @@ uint32_t impluvium_power_save_interval_ms;    // Power save mode interval
 uint32_t impluvium_night_minimum_ms;          // Nighttime minimum interval
 
 // GPIO mapping for zones
-const gpio_num_t zone_valve_gpios[IRRIGATION_ZONE_COUNT] = {VALVE_GPIO_ZONE_1,
+const gpio_num_t zone_valve_gpios[IRRIGATION_ZONE_COUNT] = {VALVE_GPIO_ZONE_0,
+                                                            VALVE_GPIO_ZONE_1,
                                                             VALVE_GPIO_ZONE_2,
                                                             VALVE_GPIO_ZONE_3,
-                                                            VALVE_GPIO_ZONE_4,
-                                                            VALVE_GPIO_ZONE_5};
+                                                            VALVE_GPIO_ZONE_4};
 
 // ABP sensor handle
 abp_t abp_dev = {0};
@@ -168,6 +168,55 @@ esp_err_t impluvium_init(void)
         return ret;
     }
 
+    // Test read water level sensor (hardware validation)
+    ESP_LOGI(TAG, "Testing water level sensor...");
+    FLUCTUS_REQUEST_BUS_OR_FAIL(POWER_BUS_3V3, "IMPLUVIUM_TEST", {
+        ESP_LOGW(TAG, "Failed to power on 3.3V bus for water level sensor test");
+    });
+    vTaskDelay(pdMS_TO_TICKS(SENSOR_POWERUP_DELAY_MS)); // Wait for sensor stabilization
+
+    float test_water_level = 0.0f;
+    ret = impluvium_read_water_level(&test_water_level);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "Water level sensor test SUCCESS: %.1f%%", test_water_level);
+    } else {
+        ESP_LOGE(TAG, "Water level sensor test FAILED: %s", esp_err_to_name(ret));
+        ESP_LOGW(TAG, "Check ABP sensor wiring, power supply, and SPI2 connection");
+    }
+    fluctus_release_bus_power(POWER_BUS_3V3, "IMPLUVIUM_TEST");
+/*
+    // TODO: TEMPORARY - Remove after testing
+    // Continuous polling loop for water level sensor testing (30 readings @ 1Hz)
+    ESP_LOGI(TAG, "=== STARTING 30-SECOND WATER LEVEL POLLING TEST ===");
+    for (int i = 0; i < 30; i++) {
+        float water_level_test = 0.0f;
+        float water_level_mbar = 0.0f;
+
+        // Read raw mbar value for better debugging
+        esp_err_t poll_ret = abp_read_pressure_mbar(&abp_dev, &water_level_mbar);
+
+        if (poll_ret == ESP_OK) {
+            // Convert to percentage using same logic as impluvium_read_water_level
+            if (water_level_mbar < WATER_LEVEL_MIN_MBAR)
+                water_level_mbar = WATER_LEVEL_MIN_MBAR;
+            if (water_level_mbar > WATER_LEVEL_MAX_MBAR)
+                water_level_mbar = WATER_LEVEL_MAX_MBAR;
+
+            water_level_test = ((water_level_mbar - WATER_LEVEL_MIN_MBAR) /
+                               (WATER_LEVEL_MAX_MBAR - WATER_LEVEL_MIN_MBAR)) * 100.0f;
+
+            ESP_LOGI(TAG, "[%02d/30] Water level: %.1f%% (%.2f mbar, raw)",
+                     i + 1, water_level_test, water_level_mbar);
+        } else {
+            ESP_LOGE(TAG, "[%02d/30] Read FAILED: %s", i + 1, esp_err_to_name(poll_ret));
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(1000)); // 1 second interval
+    }
+    ESP_LOGI(TAG, "=== WATER LEVEL POLLING TEST COMPLETE ===");
+
+    
+*/
     // Load zone configurations from LittleFS (user-editable settings)
     ret = impluvium_load_zone_config();
     if (ret != ESP_OK) {
@@ -253,9 +302,20 @@ esp_err_t impluvium_request_power_buses(power_level_t level, const char *tag)
         return ESP_FAIL;
     });
 
-    // Request 12V bus for watering operations
+    // Request level shifter and 12V bus for watering operations
     if (level == POWER_ALL_DEVICES) {
+        // Enable level shifter first (required for valve and pump MOSFET gate drivers)
+        esp_err_t ret = fluctus_request_level_shifter("IMPLUVIUM");
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to enable level shifter for irrigation");
+            fluctus_release_bus_power(POWER_BUS_5V, tag);
+            fluctus_release_bus_power(POWER_BUS_3V3, tag);
+            return ESP_FAIL;
+        }
+
+        // Then enable 12V bus
         FLUCTUS_REQUEST_BUS_OR_FAIL(POWER_BUS_12V, tag, {
+            fluctus_release_level_shifter("IMPLUVIUM");
             fluctus_release_bus_power(POWER_BUS_5V, tag);
             fluctus_release_bus_power(POWER_BUS_3V3, tag);
             return ESP_FAIL;
@@ -274,9 +334,10 @@ esp_err_t impluvium_request_power_buses(power_level_t level, const char *tag)
  */
 esp_err_t impluvium_release_power_buses(power_level_t level, const char *tag)
 {
-    // Release in reverse order
+    // Release in reverse order (12V bus, then level shifter, then sensor buses)
     if (level == POWER_ALL_DEVICES) {
         fluctus_release_bus_power(POWER_BUS_12V, tag);
+        fluctus_release_level_shifter("IMPLUVIUM");
     }
     fluctus_release_bus_power(POWER_BUS_5V, tag);
     fluctus_release_bus_power(POWER_BUS_3V3, tag);
@@ -296,6 +357,12 @@ esp_err_t impluvium_release_power_buses(power_level_t level, const char *tag)
  */
 static void vTimerCallbackMoistureCheck(TimerHandle_t xTimer)
 {
+    // Don't trigger moisture checks if system is disabled or in load shedding shutdown
+    if (irrigation_system.state == IMPLUVIUM_DISABLED || irrigation_system.load_shed_shutdown) {
+        ESP_LOGD("IMPLUVIUM(Timer)", "System disabled or shutdown active - skipping moisture check");
+        return;
+    }
+
     // Get current temperature to determine next interval
     float current_temperature = tempesta_get_temperature();
     uint32_t next_interval_ms = impluvium_calc_moisture_check_interval(current_temperature);
@@ -342,8 +409,6 @@ static void impluvium_task(void *pvParameters)
     // Wait for other systems to initialize
     vTaskDelay(pdMS_TO_TICKS(3000));
 
-    ESP_LOGI(task_tag, "Starting state machine in IDLE state");
-
     // Start the periodic moisture check timer
     xTimerStart(xMoistureCheckTimer, 0);
     uint32_t notification_value = 0;
@@ -355,6 +420,10 @@ static void impluvium_task(void *pvParameters)
                         ULONG_MAX,           /* Clear all bits on exit */
                         &notification_value, /* Receives the notification value */
                         portMAX_DELAY);      /* Block indefinitely */
+                        
+        // Monitor stack usage (debug - watermark shows minimum free stack ever reached)
+        UBaseType_t stack_high_water = uxTaskGetStackHighWaterMark(NULL);
+        ESP_LOGI(TAG, "[STACK] High water mark: %u bytes free (min ever)", stack_high_water * sizeof(StackType_t));
 
         // Take mutex to ensure exclusive access to the state machine
         if (xSemaphoreTake(xIrrigationMutex, portMAX_DELAY) == pdTRUE) {
@@ -652,6 +721,70 @@ esp_err_t impluvium_write_realtime_to_telemetry_cache(impluvium_snapshot_rt_t *c
     return ESP_OK;
 }
 
+// ########################## Emergency Shutdown Logic ##########################
+
+/**
+ * @brief Immediately stop all irrigation operations (internal helper)
+ *
+ * Performs emergency abort bypassing normal state machine flow.
+ * Must be called with xIrrigationMutex already held.
+ * Safe to call from any state - performs minimal necessary cleanup.
+ *
+ * Actions:
+ * - Stop pump immediately (PWM = 0)
+ * - Close all zone valves
+ * - Release level shifter
+ * - Release all power buses
+ * - Notify monitoring task to stop
+ * - Restore Stellaria lighting
+ * - Transition to DISABLED state
+ */
+static void impluvium_perform_emergency_stop(void)
+{
+    ESP_LOGW(TAG, "EMERGENCY STOP - Immediate abort of all irrigation operations");
+
+    // Stop pump immediately (no ramp-down)
+    impluvium_set_pump_speed(0);
+
+    // Close all valves (safety measure - close all even if only one was active)
+    for (uint8_t i = 0; i < IRRIGATION_ZONE_COUNT; i++) {
+        if (irrigation_zones[i].watering_in_progress) {
+            impluvium_close_valve(i);
+            irrigation_zones[i].watering_in_progress = false;
+        }
+    }
+
+    // Release level shifter (SN74AHCT125)
+    fluctus_release_level_shifter("IMPLUVIUM");
+
+    // Release all power buses
+    fluctus_release_bus_power(POWER_BUS_12V, "IMPLUVIUM");
+    fluctus_release_bus_power(POWER_BUS_5V, "IMPLUVIUM");
+    fluctus_release_bus_power(POWER_BUS_3V3, "IMPLUVIUM");
+
+    // Notify monitoring task to stop (if active)
+    if (xIrrigationMonitoringTaskHandle != NULL) {
+        xTaskNotify(xIrrigationMonitoringTaskHandle, MONITORING_TASK_NOTIFY_STOP_MONITORING, eSetBits);
+    }
+
+    // Restore Stellaria lighting (cancel irrigation dimming)
+    stellaria_request_irrigation_dim(false);
+
+    // Reset active zone
+    irrigation_system.active_zone = NO_ACTIVE_ZONE_ID;
+
+    // Clear any manual watering flags
+    irrigation_system.manual_watering_active = false;
+    irrigation_system.manual_water_zone = 0;
+    irrigation_system.manual_water_duration_sec = 0;
+    irrigation_system.manual_water_end_time = 0;
+
+    // Transition to DISABLED state
+    impluvium_change_state(IMPLUVIUM_DISABLED);
+
+    ESP_LOGI(TAG, "Emergency stop complete - all actuators disabled, buses released");
+}
+
 // ########################## Public API Functions ##########################
 
 /**
@@ -693,15 +826,17 @@ esp_err_t impluvium_set_system_enabled(bool enable)
 
     if (!enable) {
         ESP_LOGI(TAG, "System disabled via master switch");
-        // Allow current watering to finish if in progress
+
+        // EMERGENCY OVERRIDE: Immediately abort watering if in progress
         if (irrigation_system.state == IMPLUVIUM_WATERING ||
             irrigation_system.state == IMPLUVIUM_STOPPING) {
-            ESP_LOGI(TAG, "Watering in progress - will transition to DISABLED after completion");
-            // Will transition to DISABLED naturally after STOPPING completes
+            ESP_LOGW(TAG, "Watering in progress - performing emergency stop (override)");
+            impluvium_perform_emergency_stop();
         } else {
-            // Immediately transition to DISABLED for other states
+            // Normal transition for other states
             impluvium_change_state(IMPLUVIUM_DISABLED);
         }
+
         // Stop moisture check timer
         xTimerStop(xMoistureCheckTimer, 0);
     } else {
@@ -890,7 +1025,11 @@ esp_err_t impluvium_force_water_zone(uint8_t zone_id, uint16_t duration_sec)
  */
 esp_err_t impluvium_set_shutdown(bool shutdown)
 {
-    if (xSemaphoreTake(xIrrigationMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+    // CRITICAL: Use longer timeout for load shedding shutdown (monitoring task may be holding mutex)
+    // Safety-critical operation - MUST succeed even if monitoring task is active
+    if (xSemaphoreTake(xIrrigationMutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        ESP_LOGE(TAG, "CRITICAL: Failed to acquire mutex for load shedding shutdown - continuing anyway");
+        // This should never happen, but log and return failure
         return ESP_FAIL;
     }
 
@@ -898,15 +1037,18 @@ esp_err_t impluvium_set_shutdown(bool shutdown)
 
     if (shutdown) {
         ESP_LOGI(TAG, "Load shedding shutdown - transitioning to DISABLED state");
-        // Allow current watering to finish if in progress
+
+        // EMERGENCY OVERRIDE: Immediately abort watering if in progress
+        // (FLUCTUS has revoked 12V bus power - cannot continue safely)
         if (irrigation_system.state == IMPLUVIUM_WATERING ||
             irrigation_system.state == IMPLUVIUM_STOPPING) {
-            ESP_LOGI(TAG, "Watering in progress - will transition to DISABLED after completion");
-            // State will transition to DISABLED naturally after STOPPING completes
+            ESP_LOGW(TAG, "Watering in progress - performing emergency stop (load shedding override)");
+            impluvium_perform_emergency_stop();
         } else {
-            // Immediately transition to DISABLED for other states
+            // Normal transition for other states
             impluvium_change_state(IMPLUVIUM_DISABLED);
         }
+
         // Stop moisture check timer
         xTimerStop(xMoistureCheckTimer, 0);
     } else {

@@ -16,6 +16,8 @@
  * - Active: Constant monitoring (500ms) when buses powered
  * - Steady: 15s probes every 15min (Stellaria-only or idle)
  * - Shutdown: INA power-down at night (saves ~2mA)
+ * - PV daytime check: Cached for 5min (reduces photoresistor reads 96%)
+ * - 3V3 voltage check: Cached for 5min (reduces ADS1115 reads 96%)
  *
  * THREAD SAFETY:
  * - Protected by xMonitoringMutex (100ms timeout)
@@ -34,6 +36,7 @@
 #include "ads1115_helper.h"
 #include "telemetry.h"
 #include "solar_calc.h"
+#include "main.h"
 #include "esp_timer.h"
 #include <string.h>
 #include <math.h>
@@ -58,6 +61,36 @@ bool overcurrent_timer_active = false;
 // Power metering state
 int64_t steady_state_probe_start = 0;  // Steady state probe timer
 
+// Battery state change debouncing (prevents false triggers from transient voltage drops)
+static fluctus_power_state_t debounce_pending_state = FLUCTUS_POWER_STATE_NORMAL;
+static uint8_t debounce_confirmation_count = 0;
+
+/**
+ * @brief Helper to check if cached operation should refresh
+ *
+ * Updates timestamp when refresh is needed, preventing retry storms on failures.
+ * Rate-limits expensive operations (ADC reads, sensor checks) from 500ms to N minutes.
+ *
+ * @param last_check_time Pointer to timestamp variable (updated on refresh decision)
+ * @param interval_ms Minimum interval between refreshes in milliseconds
+ * @return true if operation should be performed, false if using cached value
+ */
+static inline bool should_refresh_cache(int64_t last_check_time, int64_t interval_ms) {
+    int64_t now = esp_timer_get_time() / 1000;
+    return (last_check_time == 0 || (now - last_check_time) >= interval_ms);
+}
+
+// PV daytime detection cache (reduces expensive photoresistor reads from 500ms to 5min)
+static bool pv_daytime_cache = false;           // Cached daytime detection result
+static int64_t last_pv_check_time = 0;          // Last PV daytime check timestamp (ms)
+#define FLUCTUS_PV_CHECK_INTERVAL_MS (5 * 60 * 1000)  // 5 minutes between checks
+
+// 3V3 bus voltage check cache (reduces expensive ADS1115 reads from 500ms to 5min)
+static int64_t last_3v3_check_time = 0;         // Last 3V3 voltage check timestamp (ms)
+#define FLUCTUS_3V3_CHECK_INTERVAL_MS (15 * 60 * 1000)  // 15 minutes between checks
+
+
+
 // ########################## INA219 Initialization ##########################
 
 /**
@@ -75,9 +108,38 @@ esp_err_t fluctus_ina219_init(void)
 {
     ESP_LOGI(TAG, "Initializing INA219 power monitoring sensors...");
 
-    // Initialize "Solar PV" sensor (0x40) descriptor
-    esp_err_t ret = ina219_init_desc(&ina219_dev[0], FLUCTUS_INA219_SOLAR_PV_ADDR,
-                                     I2C_NUM_0, CONFIG_I2CDEV_DEFAULT_SDA_PIN, CONFIG_I2CDEV_DEFAULT_SCL_PIN);
+    // Initialize "Battery Output" sensor (0x41) descriptor (Bus A - always powered)
+    esp_err_t ret = ina219_init_desc(&ina219_dev[1], FLUCTUS_INA219_BATTERY_OUT_ADDR,
+                          I2C_BUS_A_PORT, I2C_BUS_A_SDA_PIN, I2C_BUS_A_SCL_PIN);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize Battery/Input INA219: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ret = ina219_init(&ina219_dev[1]);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize Battery/Input INA219: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    // Configure Battery Output INA219 (higher current range)
+    ret = ina219_configure(&ina219_dev[1], INA219_BUS_RANGE_32V, INA219_GAIN_0_125,
+                          INA219_RES_12BIT_8S, INA219_RES_12BIT_8S, INA219_MODE_CONT_SHUNT_BUS);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to configure Battery/Input INA219: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    // Calibrate with 0.01 ohm shunt for Battery Output (higher current range)
+    ret = ina219_calibrate(&ina219_dev[1], 0.01f);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to calibrate Battery/Input INA219: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    // Initialize "Solar PV" sensor (0x40) descriptor (Bus A - always powered)
+    ret = ina219_init_desc(&ina219_dev[0], FLUCTUS_INA219_SOLAR_PV_ADDR,
+                                     I2C_BUS_A_PORT, I2C_BUS_A_SDA_PIN, I2C_BUS_A_SCL_PIN);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to initialize description Solar PV INA219: %s", esp_err_to_name(ret));
         return ret;
@@ -104,36 +166,7 @@ esp_err_t fluctus_ina219_init(void)
         return ret;
     }
 
-    // Initialize "Battery Output" sensor (0x41) descriptor
-    ret = ina219_init_desc(&ina219_dev[1], FLUCTUS_INA219_BATTERY_OUT_ADDR,
-                          I2C_NUM_0, CONFIG_I2CDEV_DEFAULT_SDA_PIN, CONFIG_I2CDEV_DEFAULT_SCL_PIN);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to initialize Battery Output INA219: %s", esp_err_to_name(ret));
-        return ret;
-    }
-
-    ret = ina219_init(&ina219_dev[1]);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to initialize Battery Output INA219: %s", esp_err_to_name(ret));
-        return ret;
-    }
-
-    // Configure Battery Output INA219 (higher current range)
-    ret = ina219_configure(&ina219_dev[1], INA219_BUS_RANGE_32V, INA219_GAIN_0_125,
-                          INA219_RES_12BIT_8S, INA219_RES_12BIT_8S, INA219_MODE_CONT_SHUNT_BUS);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to configure Battery Output INA219: %s", esp_err_to_name(ret));
-        return ret;
-    }
-
-    // Calibrate with 0.01 ohm shunt for Battery Output (higher current range)
-    ret = ina219_calibrate(&ina219_dev[1], 0.01f);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to calibrate Battery Output INA219: %s", esp_err_to_name(ret));
-        return ret;
-    }
-
-    ESP_LOGI(TAG, "INA219 sensors initialized successfully");
+    ESP_LOGI(TAG, "Both INA219 sensors initialized successfully");
     return ESP_OK;
 }
 
@@ -221,7 +254,7 @@ esp_err_t fluctus_ina219_set_power_mode(uint8_t device_index, bool active)
                                     mode);
 
     if (ret == ESP_OK) {
-        const char *ina_name = (device_index == 0) ? "PV" : "Battery";
+        const char *ina_name = (device_index == 0) ? "PV Output" : "Battery/Input";
         ESP_LOGD(TAG, "INA219 %s %s", ina_name, active ? "activated" : "powered down");
     }
 
@@ -233,8 +266,10 @@ esp_err_t fluctus_ina219_set_power_mode(uint8_t device_index, bool active)
  *
  * Manages INA219 power modes with 3-tier strategy:
  * 1. PV INA: Active during daytime, powered down at night (saves ~1mA)
+ *    - Daytime detection cached for 5 minutes (reduces ADC reads 96%)
  * 2. Battery INA Active: Continuous monitoring when buses active
  * 3. Battery INA Steady: 15s probes every 15min (Stellaria-only or idle)
+ *    - Critical timing requires 500ms check frequency for accumulator accuracy
  *
  * @param monitoring_active Is power monitoring currently active?
  */
@@ -242,10 +277,25 @@ void fluctus_set_ina_metering_mode(bool monitoring_active)
 {
     // ====== PV INA219 Power Management (Daytime Only) ======
 
-    // Use centralized daytime/light detection (independent of tracking state)
-    bool should_pv_be_active = fluctus_is_daytime_with_sufficient_light();
+    // Cache daytime detection to avoid expensive photoresistor reads every 500ms
+    // Only refresh every 5 minutes (sufficient for sunrise/sunset detection)
+    bool should_pv_be_active;
 
-    // Update PV INA power state
+    if (should_refresh_cache(last_pv_check_time, FLUCTUS_PV_CHECK_INTERVAL_MS)) {
+        // Refresh cache: Read photoresistors and update daytime state
+        should_pv_be_active = fluctus_is_daytime_with_sufficient_light();
+        pv_daytime_cache = should_pv_be_active;
+        if (cached_solar_data.valid) {
+            last_pv_check_time = esp_timer_get_time() / 1000;
+            ESP_LOGD(TAG, "PV daytime check refreshed: %s", should_pv_be_active ? "day" : "night");
+        }
+    } else {
+        // Use cached value (avoids ADC reads)
+        should_pv_be_active = pv_daytime_cache;
+        ESP_LOGV(TAG, "PV daytime check: less than %ds ago, using cached value: %s", (FLUCTUS_PV_CHECK_INTERVAL_MS / 1000), pv_daytime_cache ? "day" : "night");
+    }
+
+    // Update PV INA power state (only when state changes)
     if (should_pv_be_active != monitoring_data.pv_ina_active) {
         if (fluctus_ina219_set_power_mode(0, should_pv_be_active) == ESP_OK) {
             monitoring_data.pv_ina_active = should_pv_be_active;
@@ -304,7 +354,7 @@ void fluctus_set_ina_metering_mode(bool monitoring_active)
             if (!monitoring_data.battery_ina_active) {
                 fluctus_ina219_set_power_mode(1, true);
                 monitoring_data.battery_ina_active = true;
-                ESP_LOGD(TAG, "Battery INA: Starting steady state probe");
+                ESP_LOGD(TAG, "Battery/Input INA219: Starting steady state probe");
             }
         } else if ((current_time_ms - steady_state_probe_start) < FLUCTUS_POWER_STEADY_PROBE_DURATION_MS) {
             // Within probe duration - keep active
@@ -317,7 +367,7 @@ void fluctus_set_ina_metering_mode(bool monitoring_active)
             if (monitoring_data.battery_ina_active) {
                 fluctus_ina219_set_power_mode(1, false);
                 monitoring_data.battery_ina_active = false;
-                ESP_LOGD(TAG, "Battery INA: Ending steady state probe");
+                ESP_LOGD(TAG, "Battery/Input INA219: Ending steady state probe");
             }
         } else {
             // Cycle complete - reset for next probe
@@ -328,7 +378,7 @@ void fluctus_set_ina_metering_mode(bool monitoring_active)
         if (!monitoring_data.battery_ina_active) {
             fluctus_ina219_set_power_mode(1, true);
             monitoring_data.battery_ina_active = true;
-            ESP_LOGD(TAG, "Battery INA: Activated for active monitoring");
+            ESP_LOGD(TAG, "Battery/Input INA219: Activated for active monitoring");
         }
         steady_state_probe_start = 0;  // Reset steady state timer
     }
@@ -408,14 +458,30 @@ void fluctus_check_overcurrent(void)
  *
  * Reads ADS1115 device #1, channel 3 and warns if voltage is outside ±0.1V of 3.3V.
  * Used for early detection of buck converter issues.
+ *
+ * OPPORTUNISTIC: Only checks when 3V3 bus is already powered (doesn't force it ON).
+ * This is a debug/informational feature, not critical for operation.
+ *
+ * CACHED: Rate-limited to 5 min intervals (reduces ADS1115 reads from 500ms to 5min).
  */
 void fluctus_check_3v3_bus_voltage(void)
 {
+    // Only check if 3V3 bus is already powered (don't force it on for monitoring)
+    if (!fluctus_is_bus_powered(POWER_BUS_3V3)) {
+        return;
+    }
+
+    // Rate-limit ADC reads to 5 minute intervals
+    if (!should_refresh_cache(last_3v3_check_time, FLUCTUS_3V3_CHECK_INTERVAL_MS)) {
+        return;  // Skip check, using cached interval
+    }
+    last_3v3_check_time = esp_timer_get_time() / 1000;
+
     int16_t raw_value;
     float voltage;
 
-    // Read 3V3 bus voltage from ADS1115 device #1, Channel 3
-    esp_err_t ret = ads1115_helper_read_channel(1, ADS111X_MUX_3_GND, &raw_value, &voltage);
+    // Read 3V3 bus voltage from ADS1115 device #1, Channel 3 (AIN2)
+    esp_err_t ret = ads1115_helper_read_channel(1, ADS111X_MUX_2_GND, &raw_value, &voltage);
     if (ret != ESP_OK) {
         ESP_LOGD(TAG, "Failed to read 3V3 bus voltage: %s", esp_err_to_name(ret));
         return;
@@ -498,27 +564,64 @@ void fluctus_monitor_check_power_state_change(void)
         }
     }
 
-    // If state changed, notify core orchestration task
+    // Debouncing: Only trigger state change if voltage stays at new level for consecutive readings
+    // This prevents false triggers from transient voltage drops (capacitor inrush, brief loads)
     if (new_state != current_state) {
-        ESP_LOGI(TAG, "Power state change detected: %s -> %s (battery: %.2fV)",
-                 fluctus_power_state_to_string(current_state),
-                 fluctus_power_state_to_string(new_state),
-                 battery_voltage);
-
-        // Update state immediately (prevents duplicate notifications)
-        system_status.power_state = new_state;
-
-        // Notify core orchestration task with new power state
-        if (xFluctusCoreOrchestrationTaskHandle != NULL) {
-            // Encode power state in notification value (bits 8-15)
-            uint32_t notification_value = FLUCTUS_NOTIFY_POWER_STATE_CHANGE |
-                                         ((uint32_t)new_state << 8);
-            xTaskNotify(xFluctusCoreOrchestrationTaskHandle,
-                       notification_value,
-                       eSetValueWithOverwrite);
-            ESP_LOGD(TAG, "Power state change notification sent to core task");
+        // Potential state change detected
+        if (new_state == debounce_pending_state) {
+            // Same pending state as last check - increment confirmation count
+            debounce_confirmation_count++;
+            ESP_LOGD(TAG, "State change pending: %s -> %s (confirmation: %d/%d, battery: %.2fV)",
+                     fluctus_power_state_to_string(current_state),
+                     fluctus_power_state_to_string(new_state),
+                     debounce_confirmation_count,
+                     FLUCTUS_STATE_DEBOUNCE_REQUIRED_COUNT,
+                     battery_voltage);
         } else {
-            ESP_LOGW(TAG, "Core orchestration task not initialized - cannot notify power state change!");
+            // New pending state - reset debounce counter
+            debounce_pending_state = new_state;
+            debounce_confirmation_count = 1;
+            ESP_LOGD(TAG, "New state change detected: %s -> %s (debouncing, battery: %.2fV)",
+                     fluctus_power_state_to_string(current_state),
+                     fluctus_power_state_to_string(new_state),
+                     battery_voltage);
+        }
+
+        // Only trigger state change after sufficient consecutive confirmations
+        if (debounce_confirmation_count >= FLUCTUS_STATE_DEBOUNCE_REQUIRED_COUNT) {
+            ESP_LOGI(TAG, "Power state change confirmed: %s -> %s (battery: %.2fV)",
+                     fluctus_power_state_to_string(current_state),
+                     fluctus_power_state_to_string(new_state),
+                     battery_voltage);
+
+            // Update state immediately (prevents duplicate notifications)
+            system_status.power_state = new_state;
+
+            // Reset debounce state
+            debounce_pending_state = new_state;
+            debounce_confirmation_count = 0;
+
+            // Notify core orchestration task with new power state
+            if (xFluctusCoreOrchestrationTaskHandle != NULL) {
+                // Encode power state in notification value (bits 8-15)
+                uint32_t notification_value = FLUCTUS_NOTIFY_POWER_STATE_CHANGE |
+                                             ((uint32_t)new_state << 8);
+                xTaskNotify(xFluctusCoreOrchestrationTaskHandle,
+                           notification_value,
+                           eSetValueWithOverwrite);
+                ESP_LOGD(TAG, "Power state change notification sent to core task");
+            } else {
+                ESP_LOGW(TAG, "Core orchestration task not initialized - cannot notify power state change!");
+            }
+        }
+    } else {
+        // Voltage back to current state range - reset debounce
+        if (debounce_confirmation_count > 0) {
+            ESP_LOGD(TAG, "Voltage stabilized at current state %s (%.2fV) - debounce reset",
+                     fluctus_power_state_to_string(current_state),
+                     battery_voltage);
+            debounce_confirmation_count = 0;
+            debounce_pending_state = current_state;
         }
     }
 }
@@ -552,13 +655,13 @@ void fluctus_monitoring_task(void *parameters)
     while (true) {
         uint32_t notification_value = 0;
         TickType_t timeout;
-
+        
         // Determine timeout based on monitoring state and time of day
         if (monitoring_active) {
-            // Active monitoring - short timeout for continuous monitoring
+            // Active monitoring - short (500ms) timeout for continuous monitoring
             timeout = pdMS_TO_TICKS(FLUCTUS_POWER_ACTIVE_MONITOR_INTERVAL_MS);
         } else {
-            // Idle monitoring - use day/night aware interval (from config)
+            // Idle monitoring - periodic checks - use day/night aware interval (from config)
             uint32_t idle_interval_ms = solar_calc_is_daytime_buffered() ?
                                        fluctus_power_day_interval_ms :
                                        fluctus_power_night_interval_ms;
@@ -566,18 +669,18 @@ void fluctus_monitoring_task(void *parameters)
         }
 
         // Wait for notification or timeout
-        BaseType_t notified = xTaskNotifyWait(0x00,              // Don't clear on entry
-                                              ULONG_MAX,          // Clear all on exit
+        BaseType_t notified = xTaskNotifyWait(0x00,                // Don't clear on entry
+                                              ULONG_MAX,           // Clear all on exit
                                               &notification_value, // Store notification
                                               timeout);            // Timeout
 
-        // Handle power activity notification
+        // Handle power activity notification - when any power bus is requested
         if (notified == pdTRUE && (notification_value & FLUCTUS_NOTIFY_POWER_ACTIVITY)) {
             ESP_LOGI(TAG, "Power activity notification received - starting active monitoring");
             monitoring_active = true;
         }
 
-        // Handle config update notification (causes immediate recalculation of timeout)
+        // Handle config update notification - when intevals had been changed (causes immediate recalculation of timeout)
         if (notified == pdTRUE && (notification_value & FLUCTUS_NOTIFY_CONFIG_UPDATE)) {
             ESP_LOGI(TAG, "Configuration update notification - recalculating timeout");
             // Loop immediately to apply new timeout
@@ -594,10 +697,7 @@ void fluctus_monitoring_task(void *parameters)
             fluctus_handle_temperature_monitoring(monitoring_active);  // Temperature monitoring
 
             // Update energy accumulator with current power readings
-            fluctus_update_energy_accumulator(
-                monitoring_data.solar_pv.power,
-                monitoring_data.battery_out.power
-            );
+            fluctus_update_energy_accumulator();
 
             // Check for hourly rollover (updates daily totals, resets hourly counters)
             fluctus_check_hourly_rollover();

@@ -4,30 +4,43 @@
 #include <stdbool.h>
 #include <time.h>
 #include "esp_err.h"
+#include "driver/ledc.h"
 
 
 // ########################## FLUCTUS Configuration ##########################
 
 // Power Bus Control GPIOs - Hardware Configuration
-// 3.3V: Push-pull output, HIGH=ON (controls N-MOSFET via SN74AHCT125N buffer)
-// 5V:   Open-drain output, FLOAT=ON, LOW=OFF (100kΩ series to buck EN pin)
+// 3.3V: Open-drain output, LOW=ON (P-MOSFET with external pullup on gate)
+// 5V:   Push-pull output, HIGH=ON (pulls converter EN to 3.3V via Schottky diode, 100kΩ pulldown=OFF)
 // 6.6V: Open-drain output, LOW=ON (inverted logic buck, 100kΩ pullup to 3.3V)
-// 12V:  Push-pull output, HIGH=ON (controls N-MOSFET)
+// 12V:  Push-pull output, HIGH=ON (pulls converter EN to 3.3V via Schottky diode, 100kΩ pulldown=OFF)
 
-#define FLUCTUS_3V3_BUS_ENABLE_GPIO         GPIO_NUM_2   // 3.3V non-essential sensor bus
-#define FLUCTUS_5V_BUS_ENABLE_GPIO          GPIO_NUM_4   // 5V bus (MOSFET drivers + some sensors)
-#define FLUCTUS_6V6_BUS_ENABLE_GPIO         GPIO_NUM_5   // 6.6V servo bus (inverted logic)
-#define FLUCTUS_12V_BUS_ENABLE_GPIO         GPIO_NUM_6   // 12V bus enable (Valves + pump)
+#define FLUCTUS_3V3_BUS_ENABLE_GPIO         GPIO_NUM_4   // 3.3V non-essential sensor bus
+#define FLUCTUS_5V_BUS_ENABLE_GPIO          GPIO_NUM_5   // 5V bus (MOSFET drivers + some sensors)
+#define FLUCTUS_6V6_BUS_ENABLE_GPIO         GPIO_NUM_6   // 6.6V servo bus (inverted logic)
+#define FLUCTUS_12V_BUS_ENABLE_GPIO         GPIO_NUM_7   // 12V bus enable (Valves + pump)
 
-#define FLUCTUS_3V3_HALL_ARRAY_ENABLE_GPIO  GPIO_NUM_7   // allowing 3.3V to Hall sensor array (MOSFET controlled) 
-#define FLUCTUS_12V_FAN_ENABLE_GPIO         GPIO_NUM_1   // 12V Fan enable
+//#define FLUCTUS_3V3_HALL_ARRAY_ENABLE_GPIO  GPIO_NUM_7   // Legacy define - now MCP23008 GP5 (mcp23008_helper.h)
+#define FLUCTUS_12V_FAN_ENABLE_GPIO         GPIO_NUM_3   // 12V Fan enable
+
+// Level Shifter Configuration
+// SN74AHCT125 Level Shifter Control GPIO (for 12V actuators: valves, pump, fan)
+// Open-drain: LOW (pull to GND) = OE enabled (buffers active, 3.3V→5V translation)
+//             FLOAT (input mode) = OE disabled via external pullup (buffers tri-state)
+#define FLUCTUS_LEVEL_SHIFTER_OE_GPIO       GPIO_NUM_0   // SN74AHCT125 Output Enable (active-low)
+#define FLUCTUS_LEVEL_SHIFTER_STABILIZATION_MS  10       // Stabilization delay after enabling buffers
 
 // Solar Tracking Servo GPIOs
 #define FLUCTUS_SERVO_PWM_YAW_GPIO          GPIO_NUM_47  // Yaw servo control
-#define FLUCTUS_SERVO_PWM_PITCH_GPIO        GPIO_NUM_48  // Pitch servo control
+#define FLUCTUS_SERVO_PWM_PITCH_GPIO        GPIO_NUM_21  // Pitch servo control
 
 // Temperature Monitoring GPIO
-#define FLUCTUS_DS18B20_GPIO            GPIO_NUM_15  // DS18B20 OneWire temperature sensor
+#define FLUCTUS_DS18B20_GPIO            GPIO_NUM_17  // DS18B20 OneWire temperature sensor
+
+// Power bus consumer limits
+#define FLUCTUS_POWER_BUS_MAX_CONSUMERS         16
+#define FLUCTUS_LEVEL_SHIFTER_MAX_CONSUMERS     8
+#define FLUCTUS_POWER_BUS_OFF_DELAY_MS          500  // Debounce delay, wait if another consumer requests the bus, prevents rapid power cycling
 
 // INA219 Configuration
 #define FLUCTUS_INA219_DEVICE_COUNT     2
@@ -49,15 +62,15 @@
 #define FLUCTUS_MAX_SERVO_ADJUSTMENT    250          // Maximum adjustment per cycle
 
 // Solar Tracking Configuration
-#define FLUCTUS_PHOTORESISTOR_THRESHOLD 0.050f       // Minimum error threshold (V)
+#define FLUCTUS_PHOTORESISTOR_THRESHOLD 0.010f       // Minimum error threshold (V)
 #define FLUCTUS_SERVO_POWERUP_DELAY_MS  100          // Servo power stabilization
 
 // Solar Tracking Automation Configuration
-#define FLUCTUS_TRACKING_CORRECTION_INTERVAL_MS     (15 * 60 * 1000)  // 15 minutes between correction cycles
-#define FLUCTUS_TRACKING_CORRECTION_DURATION_MS     5000         // Tracking update interval (when correcting)
-#define FLUCTUS_TRACKING_CORRECTION_TIMEOUT_MS      30000    // 30 seconds max correction time
-#define FLUCTUS_TRACKING_SUNRISE_BUFFER_MINUTES     30       // Start tracking 30 min before sunrise
-#define FLUCTUS_TRACKING_SUNSET_BUFFER_MINUTES      30       // Allow disable 30 min before sunset
+#define FLUCTUS_TRACKING_CORRECTION_INTERVAL_MS         (15 * 60 * 1000)  // 15 minutes between correction cycles
+#define FLUCTUS_TRACKING_ADJUSTMENT_DURATION_MS         3000              // Tracking update interval (when correcting)
+#define FLUCTUS_TRACKING_ADJUSTMENT_CYCLE_TIMEOUT_MS    30000             // 30 seconds max correction time
+#define FLUCTUS_TRACKING_SUNRISE_BUFFER_MINUTES         30                // Start tracking 30 min before sunrise
+#define FLUCTUS_TRACKING_SUNSET_BUFFER_MINUTES          30                // Allow disable 30 min before sunset
 
 // Solar Tracking Parking Positions (duty cycle percentages)
 #define FLUCTUS_SERVO_NIGHT_PARK_YAW_PERCENT        10.0f    // 10% from left (east-facing)
@@ -65,20 +78,21 @@
 #define FLUCTUS_SERVO_ERROR_PARK_YAW_PERCENT        50.0f    // 50% center position (yaw)
 #define FLUCTUS_SERVO_ERROR_PARK_PITCH_PERCENT      50.0f    // 50% center position (pitch)
 
+
 // Fan PWM Configuration (Intel cooler with PWM input)
-#define FLUCTUS_FAN_PWM_GPIO            GPIO_NUM_0  // 12V cooling fan PWM (Intel cooler)
+#define FLUCTUS_FAN_PWM_GPIO            GPIO_NUM_8  // 12V cooling fan PWM (Intel cooler)
 #define FLUCTUS_FAN_PWM_FREQUENCY       25000        // 25kHz for 4-pin fan control
 #define FLUCTUS_FAN_PWM_RESOLUTION      LEDC_TIMER_8_BIT   // 8-bit resolution (0-255)
 #define FLUCTUS_FAN_PWM_TIMER           LEDC_TIMER_3
 #define FLUCTUS_FAN_PWM_CHANNEL         LEDC_CHANNEL_3
 
 // Temperature Monitoring Configuration
-#define FLUCTUS_FAN_TURN_ON_TEMP_THRESHOLD      30.0f    // Turn on fan at 30°C
+#define FLUCTUS_FAN_TURN_ON_TEMP_THRESHOLD      32.0f    // Turn on fan at 32°C
 #define FLUCTUS_FAN_TURN_OFF_TEMP_THRESHOLD     28.0f    // Turn off fan at 28°C (hysteresis)
-#define FLUCTUS_FAN_MAX_TEMP_THRESHOLD          40.0f    // 100% fan speed at 40°C
-#define FLUCTUS_FAN_MIN_DUTY                    10       // Minimum fan speed (10% at 30°C)
-#define FLUCTUS_FAN_MAX_DUTY                    100      // Maximum fan speed (100% at 40°C)
-#define FLUCTUS_TEMP_ACTIVE_INTERVAL_MS         5000     // Read temp every 5s during active monitoring
+#define FLUCTUS_FAN_MAX_TEMP_THRESHOLD          42.0f    // 100% fan speed at 42°C
+#define FLUCTUS_FAN_MIN_DUTY                    10       // Minimum fan speed (10% at 32°C)
+#define FLUCTUS_FAN_MAX_DUTY                    100      // Maximum fan speed (100% at 42°C)
+#define FLUCTUS_TEMP_ACTIVE_INTERVAL_MS         30000    // Read temp every 30s during active monitoring
 #define FLUCTUS_TEMP_THERMAL_INTERVAL_MS        60000    // Read temp every 1min during thermal event
 #define FLUCTUS_TEMP_CONVERSION_DELAY_MS        750      // DS18B20 12-bit conversion time
 
@@ -90,7 +104,7 @@
 #define FLUCTUS_POWER_PERIODIC_CHECK_INTERVAL_NIGHT_MS (60 * 60 * 1000)  // 1 hour when idle (nighttime)
 
 // Power Metering Configuration
-#define FLUCTUS_PV_LIGHT_THRESHOLD      0.5f    // Photoresistor threshold for nighttime (V)
+#define FLUCTUS_SOLAR_LIGHT_THRESHOLD      0.4f    // Photoresistor threshold for nighttime (V)
 
 // Tasks Notification Bits
 #define FLUCTUS_NOTIFY_POWER_ACTIVITY        (1UL << 0)  // Power bus activity detected (monitoring task)
@@ -106,6 +120,8 @@
 #define FLUCTUS_BATTERY_LEVEL_VERY_LOW        12.23f  // 15% SOC - Turn off IMPLUVIUM  
 #define FLUCTUS_BATTERY_LEVEL_CRITICAL        12.08f  // 0% SOC  - Turn off TEMPESTA + Solar
 
+#define FLUCTUS_STATE_DEBOUNCE_REQUIRED_COUNT 5  // Require 5 consecutive readings to change state
+
 // Battery Voltage Hysteresis (+0.1V for turn-on)
 #define FLUCTUS_BATTERY_HYSTERESIS            0.10f
 #define FLUCTUS_BATTERY_LEVEL_POWER_SAVING_ON (FLUCTUS_BATTERY_LEVEL_POWER_SAVING + FLUCTUS_BATTERY_HYSTERESIS)
@@ -114,9 +130,9 @@
 #define FLUCTUS_BATTERY_LEVEL_CRITICAL_ON     (FLUCTUS_BATTERY_LEVEL_CRITICAL + FLUCTUS_BATTERY_HYSTERESIS)
 
 // Overcurrent Protection
-#define FLUCTUS_OVERCURRENT_THRESHOLD_1       3.0f    // Amps, 3-second delay
-#define FLUCTUS_OVERCURRENT_THRESHOLD_2       4.0f    // Amps, immediate shutdown
-#define FLUCTUS_OVERCURRENT_DELAY_MS          3000    // Delay for threshold 1
+#define FLUCTUS_OVERCURRENT_THRESHOLD_1       3.0f    // Amps, 5-second delay
+#define FLUCTUS_OVERCURRENT_THRESHOLD_2       5.0f    // Amps, immediate shutdown
+#define FLUCTUS_OVERCURRENT_DELAY_MS          5000    // Delay for threshold 1
 
 // Mutex timeout constants
 #define FLUCTUS_MUTEX_TIMEOUT_QUICK_MS        100     // Quick operations
@@ -160,7 +176,7 @@ typedef enum {
 typedef struct {
     bool bus_enabled[POWER_BUS_COUNT];          // Individual bus states
     uint8_t bus_ref_count[POWER_BUS_COUNT];     // Reference counting for consumers
-    char bus_consumers[POWER_BUS_COUNT][8][16]; // Consumer names per bus (max 8 per bus)
+    char bus_consumers[POWER_BUS_COUNT][FLUCTUS_POWER_BUS_MAX_CONSUMERS][16]; // Consumer names per bus (DEFINE sets max per bus)
     fluctus_power_state_t power_state;          // Current power management state
     solar_tracking_state_t solar_tracking_state; // Solar tracking state machine
     uint32_t current_yaw_duty;                  // Current yaw servo position
@@ -168,6 +184,11 @@ typedef struct {
     bool safety_shutdown;                       // Overcurrent safety shutdown flag
     bool manual_reset_required;                 // Manual reset flag for safety
     time_t last_activity_time;                  // Last consumer activity timestamp
+
+    // SN74AHCT125 level shifter control (for 12V actuators: pump, valves, fan)
+    bool level_shifter_enabled;                 // SN74AHCT125 output enable state
+    uint8_t level_shifter_ref_count;            // Reference counting for level shifter
+    char level_shifter_consumers[8][16];        // Consumer names for level shifter (max 8)
 } fluctus_power_status_t;
 
 typedef struct {
@@ -302,6 +323,45 @@ esp_err_t fluctus_enable_solar_tracking(void);
 esp_err_t fluctus_disable_solar_tracking(void);
 
 /**
+ * @brief Enable solar tracking debug mode (continuous operation for 90 seconds)
+ *
+ * Forces solar tracking to run continuously regardless of daytime conditions.
+ * Useful for testing and debugging servo positioning and photoresistor readings.
+ * Automatically times out after 90 seconds to prevent excessive servo wear.
+ *
+ * @return ESP_OK on success
+ * @return ESP_ERR_INVALID_STATE if solar tracking is disabled
+ */
+esp_err_t fluctus_enable_solar_debug_mode(void);
+
+/**
+ * @brief Disable solar tracking debug mode (return to normal operation)
+ * @return ESP_OK on success
+ */
+esp_err_t fluctus_disable_solar_debug_mode(void);
+
+/**
+ * @brief Check if solar debug mode is currently active
+ * @return true if debug mode active, false otherwise
+ */
+bool fluctus_is_solar_debug_mode_active(void);
+
+/**
+ * @brief Set servo position directly for debug/testing purposes
+ *
+ * This function bypasses the solar tracking state machine and directly
+ * sets the servo position. It also updates the internal state so the
+ * position is correctly reflected in telemetry and HMI.
+ *
+ * Thread-safe with xSolarMutex (100ms timeout).
+ *
+ * @param channel LEDC channel (FLUCTUS_SERVO_YAW_CHANNEL or FLUCTUS_SERVO_PITCH_CHANNEL)
+ * @param duty_cycle Desired duty cycle value (automatically clamped to FLUCTUS_SERVO_MIN_DUTY..FLUCTUS_SERVO_MAX_DUTY)
+ * @return ESP_OK on success, ESP_FAIL on mutex timeout or hardware error
+ */
+esp_err_t fluctus_servo_debug_set_position(ledc_channel_t channel, uint32_t duty_cycle);
+
+/**
  * @brief Set 12V cooling fan speed
  * @param duty_percent Fan speed percentage (0-100)
  * @return ESP_OK on success
@@ -313,6 +373,40 @@ esp_err_t fluctus_set_cooling_fan_speed(uint8_t duty_percent);
  * @param enable true to power on hall array, false to power off
  */
 void fluctus_hall_array_enable(bool enable);
+
+// ################ SN74AHCT125 Level Shifter Control ################
+
+/**
+ * @brief Request SN74AHCT125 level shifter enable (reference counted)
+ *
+ * Enables the SN74AHCT125 level shifter buffers that translate 3.3V logic to
+ * 5V for driving 12V actuator MOSFETs (pump, valves, fan). Uses reference
+ * counting to safely handle multiple concurrent actuator operations.
+ * Includes 10ms stabilization delay on first enable.
+ *
+ * MUST be called before operating any 12V actuator to ensure proper signal levels.
+ *
+ * Thread-safe with xPowerBusMutex (1000ms timeout).
+ *
+ * @param consumer_id String identifier for the requesting consumer (max 15 chars)
+ * @return ESP_OK on success, ESP_ERR_INVALID_ARG if consumer_id is NULL
+ * @return ESP_FAIL on mutex timeout
+ */
+esp_err_t fluctus_request_level_shifter(const char* consumer_id);
+
+/**
+ * @brief Release SN74AHCT125 level shifter (decrements reference count)
+ *
+ * Decrements the reference count for the level shifter. When count reaches
+ * zero, the SN74AHCT125 is disabled (all outputs tri-state, saving power).
+ *
+ * Thread-safe with xPowerBusMutex (1000ms timeout).
+ *
+ * @param consumer_id String identifier for the releasing consumer
+ * @return ESP_OK on success, ESP_ERR_INVALID_ARG if consumer_id is NULL
+ * @return ESP_FAIL on mutex timeout
+ */
+esp_err_t fluctus_release_level_shifter(const char* consumer_id);
 
 /**
  * @brief Get human-readable power state string
@@ -337,7 +431,7 @@ typedef struct {
 
     // Daily tracking (reset at midnight)
     time_t current_day_start;               // Day start timestamp
-    float pv_energy_wh_day;                 // Daily PV energy generation total
+    float pv_produced_wh_day;                 // Daily PV energy generation total
     float battery_consumed_wh_day;          // Daily battery consumption
     float pv_peak_w_day;                    // Daily peak generation
     float battery_peak_w_day;               // Daily peak consumption
@@ -460,15 +554,15 @@ typedef struct {
     // ============ Energy Statistics - Hourly (5 fields) ============
     // Written by: Normal only (updated at 15min intervals, reset hourly)
     time_t current_hour_start;         // Normal: Start timestamp of current hour
-    float pv_energy_wh_hour;           // Normal: Hourly PV energy total (Wh)
-    float battery_energy_wh_hour;      // Normal: Hourly battery consumption (Wh)
+    float pv_produced_wh_hour;           // Normal: Hourly PV energy total (Wh)
+    float battery_consumed_wh_hour;      // Normal: Hourly battery consumption (Wh)
     float pv_peak_w_hour;              // Normal: Hourly peak PV power (W)
     float battery_peak_w_hour;         // Normal: Hourly peak battery power (W)
 
     // ============ Energy Statistics - Daily (6 fields) ============
     // Written by: Normal only (updated at 15min intervals, reset daily)
     time_t current_day_start;          // Normal: Start timestamp of current day
-    float pv_energy_wh_day;            // Normal: Daily PV energy total (Wh)
+    float pv_produced_wh_day;            // Normal: Daily PV energy total (Wh)
     float battery_consumed_wh_day;     // Normal: Daily battery consumption (Wh)
     float pv_peak_w_day;               // Normal: Daily peak PV power (W)
     float battery_peak_w_day;          // Normal: Daily peak battery power (W)

@@ -26,8 +26,8 @@
 #define WEATHER_MUTEX_TIMEOUT_UPDATE_MS 1000 // For data updates/init
 
 // GPIO Configuration
-#define WEATHER_RAINFALL_GPIO GPIO_NUM_3    // Tipbucket pulse counter for rainfall measurement
-#define WEATHER_TANK_INTAKE_GPIO GPIO_NUM_8 // Tipbucket pulse counter for water tank ingress
+//#define WEATHER_RAINFALL_GPIO GPIO_NUM_3    // Tipbucket pulse counter for rainfall measurement
+//#define WEATHER_TANK_INTAKE_GPIO GPIO_NUM_8 // Tipbucket pulse counter for water tank ingress
 #define WEATHER_PMS5003_TX_GPIO GPIO_NUM_43 // PMS5003 UART TX (GPIO43)
 #define WEATHER_PMS5003_RX_GPIO GPIO_NUM_44 // PMS5003 UART RX (GPIO44)
 #define WEATHER_PMS5003_UART_NUM UART_NUM_2 // UART2 (UART0 reserved for console)
@@ -85,7 +85,7 @@ typedef struct {
     float wind_speed_rpm;                // Wind speed in RPM
     float wind_speed_ms;                 // Wind speed in m/s
     float wind_direction_deg;            // Wind direction in degrees (0-360, 0=North, clockwise)
-    const char *wind_direction_cardinal; // Wind direction (N/NE/E/SE/S/SW/W/NW)
+    char wind_direction_cardinal[4];     // Wind direction (N/NE/E/SE/S/SW/W/NW)
 
     // Rainfall measurements (rain gauge) - weekly reset based on boot day
     float rainfall_last_hour_mm;    // Last completed hour measurement (mm, stable value)

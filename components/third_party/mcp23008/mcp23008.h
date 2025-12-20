@@ -263,6 +263,25 @@ esp_err_t mcp23008_port_set_interrupt(i2c_dev_t *dev, uint8_t mask, mcp23008_gpi
  */
 esp_err_t mcp23008_set_interrupt(i2c_dev_t *dev, uint8_t pin, mcp23008_gpio_intr_t intr);
 
+/**
+ * @brief Read interrupt flag register (INTF)
+ * Shows which pin(s) caused the interrupt
+ * @param dev Pointer to I2C device descriptor
+ * @param[out] val Interrupt flags, 1 bit = pin triggered interrupt
+ * @return `ESP_OK` on success
+ */
+esp_err_t mcp23008_port_get_interrupt_flags(i2c_dev_t *dev, uint8_t *val);
+
+/**
+ * @brief Read interrupt capture register (INTCAP)
+ * Captures GPIO state at time of interrupt
+ * Reading this register clears the interrupt
+ * @param dev Pointer to I2C device descriptor
+ * @param[out] val Captured pin states at interrupt time
+ * @return `ESP_OK` on success
+ */
+esp_err_t mcp23008_port_get_interrupt_capture(i2c_dev_t *dev, uint8_t *val);
+
 
 #ifdef __cplusplus
 }

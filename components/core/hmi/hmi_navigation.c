@@ -8,7 +8,7 @@
  *
  * Structure:
  * - Action handler function declarations (~50 functions)
- * - Transition tables (one per menu, 99 total)
+ * - Transition tables (one per menu)
  * - Master metadata table (maps menu state → metadata)
  * - Navigation engine (lookup + dispatch)
  */
@@ -30,6 +30,10 @@ static void hmi_action_fluctus_intervals_back(void);
 static void hmi_action_edit_fluctus_power_day(void);
 static void hmi_action_edit_fluctus_power_night(void);
 static void hmi_action_edit_fluctus_solar_correction(void);
+static void hmi_action_toggle_solar_debug_mode(void);
+static void hmi_action_enter_servo_control_yaw(void);
+static void hmi_action_enter_servo_control_pitch(void);
+static void hmi_action_exit_servo_control(void);
 
 // TEMPESTA Actions
 static void hmi_action_toggle_tempesta(void);
@@ -50,6 +54,7 @@ static void hmi_action_emergency_stop_reset(void);
 static void hmi_action_clear_diagnostics(void);
 static void hmi_action_confirm_reset_all_learning(void);
 static void hmi_action_enter_zone_edit(void);  // Generic for zones 1-5
+static void hmi_action_toggle_all_zones(void);  // Enable/Disable All Zones
 static void hmi_action_zone_edit_cancel(void);
 static void hmi_action_zone_edit_toggle_enabled(void);
 static void hmi_action_zone_edit_toggle_target(void);
@@ -95,20 +100,27 @@ static const nav_transition_t main_menu_transitions[] = {
 
 // FLUCTUS Menus
 static const nav_transition_t fluctus_menu_transitions[] = {
-    { .item_index = 0, .next_menu = HMI_MENU_MAIN,              .action = NAV_ACTION_NAVIGATE, .handler = NULL },
-    { .item_index = 1, .next_menu = HMI_MENU_FLUCTUS_OVERVIEW,  .action = NAV_ACTION_NAVIGATE, .handler = NULL },
-    { .item_index = 2, .next_menu = HMI_MENU_FLUCTUS_ENERGY,    .action = NAV_ACTION_NAVIGATE, .handler = NULL },
-    { .item_index = 3, .next_menu = HMI_MENU_FLUCTUS_LIVE_POWER,.action = NAV_ACTION_NAVIGATE, .handler = NULL },
-    { .item_index = 4, .next_menu = HMI_MENU_FLUCTUS_BUSES,     .action = NAV_ACTION_NAVIGATE, .handler = NULL },
-    { .item_index = 5, .next_menu = HMI_MENU_FLUCTUS_TRACKING,  .action = NAV_ACTION_NAVIGATE, .handler = NULL },
-    { .item_index = 6, .next_menu = HMI_MENU_FLUCTUS_SOLAR_DEBUG,.action = NAV_ACTION_NAVIGATE, .handler = NULL },
-    { .item_index = 7, .next_menu = HMI_MENU_FLUCTUS_CONTROLS,  .action = NAV_ACTION_NAVIGATE, .handler = NULL },
-    { .item_index = 8, .next_menu = HMI_MENU_FLUCTUS_INTERVALS, .action = NAV_ACTION_NAVIGATE, .handler = NULL },
+    { .item_index = 0, .next_menu = HMI_MENU_MAIN,                  .action = NAV_ACTION_NAVIGATE, .handler = NULL },
+    { .item_index = 1, .next_menu = HMI_MENU_FLUCTUS_OVERVIEW,      .action = NAV_ACTION_NAVIGATE, .handler = NULL },
+    { .item_index = 2, .next_menu = HMI_MENU_FLUCTUS_ENERGY,        .action = NAV_ACTION_NAVIGATE, .handler = NULL },
+    { .item_index = 3, .next_menu = HMI_MENU_FLUCTUS_LIVE_POWER,    .action = NAV_ACTION_NAVIGATE, .handler = NULL },
+    { .item_index = 4, .next_menu = HMI_MENU_FLUCTUS_BUSES,         .action = NAV_ACTION_NAVIGATE, .handler = NULL },
+    { .item_index = 5, .next_menu = HMI_MENU_FLUCTUS_SOLAR,         .action = NAV_ACTION_NAVIGATE, .handler = NULL },
+    { .item_index = 6, .next_menu = HMI_MENU_FLUCTUS_SERVO_DEBUG,   .action = NAV_ACTION_NAVIGATE, .handler = NULL },
+    { .item_index = 7, .next_menu = HMI_MENU_FLUCTUS_CONTROLS,      .action = NAV_ACTION_NAVIGATE, .handler = NULL },
+    { .item_index = 8, .next_menu = HMI_MENU_FLUCTUS_INTERVALS,     .action = NAV_ACTION_NAVIGATE, .handler = NULL },
 };
 
 static const nav_transition_t fluctus_detail_page_transitions[] = {
     // All detail pages return to parent on any button press
     { .item_index = 0xFF, .next_menu = HMI_MENU_FLUCTUS, .action = NAV_ACTION_NAVIGATE, .handler = NULL },
+};
+
+static const nav_transition_t fluctus_solar_transitions[] = {
+    // Page 4 has interactive controls
+    // Item 0 (< Back) navigates back, Item 1 (Debug toggle) triggers action
+    { .item_index = 0, .next_menu = HMI_MENU_FLUCTUS,               .action = NAV_ACTION_NAVIGATE, .handler = NULL },
+    { .item_index = 1, .next_menu = HMI_MENU_FLUCTUS_SOLAR, .action = NAV_ACTION_TOGGLE,   .handler = hmi_action_toggle_solar_debug_mode },
 };
 
 static const nav_transition_t fluctus_controls_transitions[] = {
@@ -124,16 +136,23 @@ static const nav_transition_t fluctus_intervals_transitions[] = {
     { .item_index = 3, .next_menu = HMI_MENU_FLUCTUS_INTERVALS,.action = NAV_ACTION_EDIT_START,  .handler = hmi_action_edit_fluctus_solar_correction },
 };
 
+static const nav_transition_t fluctus_servo_debug_transitions[] = {
+    { .item_index = 0, .next_menu = HMI_MENU_FLUCTUS,                     .action = NAV_ACTION_NAVIGATE, .handler = NULL },
+    { .item_index = 1, .next_menu = HMI_MENU_FLUCTUS_SERVO_CONTROL_YAW,   .action = NAV_ACTION_EXECUTE,  .handler = hmi_action_enter_servo_control_yaw },
+    { .item_index = 2, .next_menu = HMI_MENU_FLUCTUS_SERVO_CONTROL_PITCH, .action = NAV_ACTION_EXECUTE,  .handler = hmi_action_enter_servo_control_pitch },
+};
+
+static const nav_transition_t fluctus_servo_control_transitions[] = {
+    // Button press exits servo control mode (handler cleans up power, returns to servo debug menu)
+    { .item_index = 0xFF, .next_menu = HMI_MENU_FLUCTUS_SERVO_DEBUG, .action = NAV_ACTION_EXECUTE, .handler = hmi_action_exit_servo_control },
+};
+
 // TEMPESTA Menus
 static const nav_transition_t tempesta_menu_transitions[] = {
-    { .item_index = 0, .next_menu = HMI_MENU_MAIN,             .action = NAV_ACTION_NAVIGATE, .handler = NULL },
-    { .item_index = 1, .next_menu = HMI_MENU_TEMPESTA_ENV,     .action = NAV_ACTION_NAVIGATE, .handler = NULL },
-    { .item_index = 2, .next_menu = HMI_MENU_TEMPESTA_WIND,    .action = NAV_ACTION_NAVIGATE, .handler = NULL },
-    { .item_index = 3, .next_menu = HMI_MENU_TEMPESTA_RAIN,    .action = NAV_ACTION_NAVIGATE, .handler = NULL },
-    { .item_index = 4, .next_menu = HMI_MENU_TEMPESTA_TANK,    .action = NAV_ACTION_NAVIGATE, .handler = NULL },
-    { .item_index = 5, .next_menu = HMI_MENU_TEMPESTA_AIR,     .action = NAV_ACTION_NAVIGATE, .handler = NULL },
-    { .item_index = 6, .next_menu = HMI_MENU_TEMPESTA_CONTROLS,.action = NAV_ACTION_NAVIGATE, .handler = NULL },
-    { .item_index = 7, .next_menu = HMI_MENU_TEMPESTA_INTERVALS,.action = NAV_ACTION_NAVIGATE, .handler = NULL },
+    { .item_index = 0, .next_menu = HMI_MENU_MAIN,              .action = NAV_ACTION_NAVIGATE, .handler = NULL },
+    { .item_index = 1, .next_menu = HMI_MENU_TEMPESTA_SENSORS,  .action = NAV_ACTION_NAVIGATE, .handler = NULL },
+    { .item_index = 2, .next_menu = HMI_MENU_TEMPESTA_CONTROLS, .action = NAV_ACTION_NAVIGATE, .handler = NULL },
+    { .item_index = 3, .next_menu = HMI_MENU_TEMPESTA_INTERVALS,.action = NAV_ACTION_NAVIGATE, .handler = NULL },
 };
 
 static const nav_transition_t tempesta_detail_page_transitions[] = {
@@ -159,15 +178,14 @@ static const nav_transition_t tempesta_intervals_transitions[] = {
 
 // IMPLUVIUM Menus
 static const nav_transition_t impluvium_menu_transitions[] = {
-    { .item_index = 0, .next_menu = HMI_MENU_MAIN,                .action = NAV_ACTION_NAVIGATE, .handler = NULL },
-    { .item_index = 1, .next_menu = HMI_MENU_IMPLUVIUM_OVERVIEW,  .action = NAV_ACTION_NAVIGATE, .handler = NULL },
-    { .item_index = 2, .next_menu = HMI_MENU_IMPLUVIUM_STATISTICS,.action = NAV_ACTION_NAVIGATE, .handler = NULL },
-    { .item_index = 3, .next_menu = HMI_MENU_IMPLUVIUM_ZONES,     .action = NAV_ACTION_NAVIGATE, .handler = NULL },
-    { .item_index = 4, .next_menu = HMI_MENU_IMPLUVIUM_LEARNING,  .action = NAV_ACTION_NAVIGATE, .handler = NULL },
-    { .item_index = 5, .next_menu = HMI_MENU_IMPLUVIUM_MONITOR,   .action = NAV_ACTION_NAVIGATE, .handler = NULL },
-    { .item_index = 6, .next_menu = HMI_MENU_IMPLUVIUM_CONTROLS,  .action = NAV_ACTION_NAVIGATE, .handler = NULL },
-    { .item_index = 7, .next_menu = HMI_MENU_IMPLUVIUM_ZONE_CONFIG,.action = NAV_ACTION_NAVIGATE, .handler = NULL },
-    { .item_index = 8, .next_menu = HMI_MENU_IMPLUVIUM_INTERVALS, .action = NAV_ACTION_NAVIGATE, .handler = NULL },
+    { .item_index = 0, .next_menu = HMI_MENU_MAIN,                     .action = NAV_ACTION_NAVIGATE, .handler = NULL },
+    { .item_index = 1, .next_menu = HMI_MENU_IMPLUVIUM_OVERVIEW_STATS, .action = NAV_ACTION_NAVIGATE, .handler = NULL },
+    { .item_index = 2, .next_menu = HMI_MENU_IMPLUVIUM_MONITOR,        .action = NAV_ACTION_NAVIGATE, .handler = NULL },
+    { .item_index = 3, .next_menu = HMI_MENU_IMPLUVIUM_ZONES,          .action = NAV_ACTION_NAVIGATE, .handler = NULL },
+    { .item_index = 4, .next_menu = HMI_MENU_IMPLUVIUM_ZONE_CONFIG,    .action = NAV_ACTION_NAVIGATE, .handler = NULL },
+    { .item_index = 5, .next_menu = HMI_MENU_IMPLUVIUM_LEARNING,       .action = NAV_ACTION_NAVIGATE, .handler = NULL },
+    { .item_index = 6, .next_menu = HMI_MENU_IMPLUVIUM_CONTROLS,       .action = NAV_ACTION_NAVIGATE, .handler = NULL },
+    { .item_index = 7, .next_menu = HMI_MENU_IMPLUVIUM_INTERVALS,      .action = NAV_ACTION_NAVIGATE, .handler = NULL },
 };
 
 static const nav_transition_t impluvium_detail_page_transitions[] = {
@@ -218,6 +236,7 @@ static const nav_transition_t impluvium_zone_config_transitions[] = {
     { .item_index = 3, .next_menu = HMI_MENU_IMPLUVIUM_ZONE_EDIT,.action = NAV_ACTION_EXECUTE, .handler = hmi_action_enter_zone_edit },
     { .item_index = 4, .next_menu = HMI_MENU_IMPLUVIUM_ZONE_EDIT,.action = NAV_ACTION_EXECUTE, .handler = hmi_action_enter_zone_edit },
     { .item_index = 5, .next_menu = HMI_MENU_IMPLUVIUM_ZONE_EDIT,.action = NAV_ACTION_EXECUTE, .handler = hmi_action_enter_zone_edit },
+    { .item_index = 6, .next_menu = HMI_MENU_IMPLUVIUM_ZONE_CONFIG,.action = NAV_ACTION_TOGGLE, .handler = hmi_action_toggle_all_zones },
 };
 
 static const nav_transition_t impluvium_zone_edit_transitions[] = {
@@ -306,30 +325,27 @@ static const nav_menu_metadata_t menu_metadata_table[] = {
     { .state = HMI_MENU_MAIN, .item_count = 5, .transitions = main_menu_transitions, .transition_count = 5, .is_realtime = false },
 
     // FLUCTUS Menus
-    { .state = HMI_MENU_FLUCTUS,             .item_count = 9, .transitions = fluctus_menu_transitions,        .transition_count = 9, .is_realtime = false },
-    { .state = HMI_MENU_FLUCTUS_OVERVIEW,    .item_count = 1, .transitions = fluctus_detail_page_transitions, .transition_count = 1, .is_realtime = false },
-    { .state = HMI_MENU_FLUCTUS_ENERGY,      .item_count = 1, .transitions = fluctus_detail_page_transitions, .transition_count = 1, .is_realtime = false },
-    { .state = HMI_MENU_FLUCTUS_LIVE_POWER,  .item_count = 1, .transitions = fluctus_detail_page_transitions, .transition_count = 1, .is_realtime = true },
-    { .state = HMI_MENU_FLUCTUS_BUSES,       .item_count = 1, .transitions = fluctus_detail_page_transitions, .transition_count = 1, .is_realtime = false },
-    { .state = HMI_MENU_FLUCTUS_TRACKING,    .item_count = 1, .transitions = fluctus_detail_page_transitions, .transition_count = 1, .is_realtime = false },
-    { .state = HMI_MENU_FLUCTUS_SOLAR_DEBUG, .item_count = 1, .transitions = fluctus_detail_page_transitions, .transition_count = 1, .is_realtime = true },
-    { .state = HMI_MENU_FLUCTUS_CONTROLS,    .item_count = 3, .transitions = fluctus_controls_transitions,    .transition_count = 3, .is_realtime = false },
-    { .state = HMI_MENU_FLUCTUS_INTERVALS,   .item_count = 4, .transitions = fluctus_intervals_transitions,   .transition_count = 4, .is_realtime = false },
+    { .state = HMI_MENU_FLUCTUS,                .item_count = 9, .transitions = fluctus_menu_transitions,        .transition_count = 9, .is_realtime = false },
+    { .state = HMI_MENU_FLUCTUS_OVERVIEW,       .item_count = 1, .transitions = fluctus_detail_page_transitions, .transition_count = 1, .is_realtime = false },
+    { .state = HMI_MENU_FLUCTUS_ENERGY,         .item_count = 1, .transitions = fluctus_detail_page_transitions, .transition_count = 1, .is_realtime = false },
+    { .state = HMI_MENU_FLUCTUS_LIVE_POWER,     .item_count = 1, .transitions = fluctus_detail_page_transitions, .transition_count = 1, .is_realtime = true },
+    { .state = HMI_MENU_FLUCTUS_BUSES,          .item_count = 1, .transitions = fluctus_detail_page_transitions, .transition_count = 1, .is_realtime = false },
+    { .state = HMI_MENU_FLUCTUS_SOLAR,          .item_count = 2, .transitions = fluctus_solar_transitions,       .transition_count = 2, .is_realtime = true },
+    { .state = HMI_MENU_FLUCTUS_SERVO_DEBUG,    .item_count = 3, .transitions = fluctus_servo_debug_transitions, .transition_count = 3, .is_realtime = false },
+    { .state = HMI_MENU_FLUCTUS_SERVO_CONTROL_YAW,   .item_count = 1, .transitions = fluctus_servo_control_transitions, .transition_count = 1, .is_realtime = true },
+    { .state = HMI_MENU_FLUCTUS_SERVO_CONTROL_PITCH, .item_count = 1, .transitions = fluctus_servo_control_transitions, .transition_count = 1, .is_realtime = true },
+    { .state = HMI_MENU_FLUCTUS_CONTROLS,       .item_count = 3, .transitions = fluctus_controls_transitions,    .transition_count = 3, .is_realtime = false },
+    { .state = HMI_MENU_FLUCTUS_INTERVALS,      .item_count = 4, .transitions = fluctus_intervals_transitions,   .transition_count = 4, .is_realtime = false },
 
     // TEMPESTA Menus
-    { .state = HMI_MENU_TEMPESTA,          .item_count = 8, .transitions = tempesta_menu_transitions,        .transition_count = 8, .is_realtime = false },
-    { .state = HMI_MENU_TEMPESTA_ENV,      .item_count = 1, .transitions = tempesta_detail_page_transitions, .transition_count = 1, .is_realtime = false },
-    { .state = HMI_MENU_TEMPESTA_WIND,     .item_count = 1, .transitions = tempesta_detail_page_transitions, .transition_count = 1, .is_realtime = false },
-    { .state = HMI_MENU_TEMPESTA_RAIN,     .item_count = 1, .transitions = tempesta_detail_page_transitions, .transition_count = 1, .is_realtime = false },
-    { .state = HMI_MENU_TEMPESTA_TANK,     .item_count = 1, .transitions = tempesta_detail_page_transitions, .transition_count = 1, .is_realtime = false },
-    { .state = HMI_MENU_TEMPESTA_AIR,      .item_count = 1, .transitions = tempesta_detail_page_transitions, .transition_count = 1, .is_realtime = false },
+    { .state = HMI_MENU_TEMPESTA,          .item_count = 4, .transitions = tempesta_menu_transitions,        .transition_count = 4, .is_realtime = false },
+    { .state = HMI_MENU_TEMPESTA_SENSORS,  .item_count = 1, .transitions = tempesta_detail_page_transitions, .transition_count = 1, .is_realtime = false },
     { .state = HMI_MENU_TEMPESTA_CONTROLS, .item_count = 8, .transitions = tempesta_controls_transitions,    .transition_count = 8, .is_realtime = false },
     { .state = HMI_MENU_TEMPESTA_INTERVALS,.item_count = 3, .transitions = tempesta_intervals_transitions,   .transition_count = 3, .is_realtime = false },
 
     // IMPLUVIUM Menus
-    { .state = HMI_MENU_IMPLUVIUM,              .item_count = 9, .transitions = impluvium_menu_transitions,           .transition_count = 9, .is_realtime = false },
-    { .state = HMI_MENU_IMPLUVIUM_OVERVIEW,     .item_count = 1, .transitions = impluvium_detail_page_transitions,    .transition_count = 1, .is_realtime = false },
-    { .state = HMI_MENU_IMPLUVIUM_STATISTICS,   .item_count = 1, .transitions = impluvium_detail_page_transitions,    .transition_count = 1, .is_realtime = false },
+    { .state = HMI_MENU_IMPLUVIUM,              .item_count = 8, .transitions = impluvium_menu_transitions,           .transition_count = 8, .is_realtime = false },
+    { .state = HMI_MENU_IMPLUVIUM_OVERVIEW_STATS,.item_count = 1, .transitions = impluvium_detail_page_transitions,    .transition_count = 1, .is_realtime = false },
     { .state = HMI_MENU_IMPLUVIUM_ZONES,        .item_count = 7, .transitions = impluvium_zones_menu_transitions,     .transition_count = 7, .is_realtime = false },
     { .state = HMI_MENU_IMPLUVIUM_ZONES_ALL,    .item_count = 1, .transitions = impluvium_zone_detail_transitions,    .transition_count = 1, .is_realtime = false },
     { .state = HMI_MENU_IMPLUVIUM_ZONE_1,       .item_count = 1, .transitions = impluvium_zone_detail_transitions,    .transition_count = 1, .is_realtime = false },
@@ -346,7 +362,7 @@ static const nav_menu_metadata_t menu_metadata_table[] = {
     { .state = HMI_MENU_IMPLUVIUM_LEARNING_5,   .item_count = 1, .transitions = impluvium_learning_detail_transitions,.transition_count = 1, .is_realtime = false },
     { .state = HMI_MENU_IMPLUVIUM_MONITOR,      .item_count = 1, .transitions = impluvium_detail_page_transitions,    .transition_count = 1, .is_realtime = true },
     { .state = HMI_MENU_IMPLUVIUM_CONTROLS,     .item_count = 6, .transitions = impluvium_controls_transitions,       .transition_count = 6, .is_realtime = false },
-    { .state = HMI_MENU_IMPLUVIUM_ZONE_CONFIG,  .item_count = 6, .transitions = impluvium_zone_config_transitions,    .transition_count = 6, .is_realtime = false },
+    { .state = HMI_MENU_IMPLUVIUM_ZONE_CONFIG,  .item_count = 7, .transitions = impluvium_zone_config_transitions,    .transition_count = 7, .is_realtime = false },
     { .state = HMI_MENU_IMPLUVIUM_ZONE_EDIT,    .item_count = 7, .transitions = impluvium_zone_edit_transitions,      .transition_count = 7, .is_realtime = false },
     { .state = HMI_MENU_IMPLUVIUM_MANUAL_WATER, .item_count = 3, .transitions = impluvium_manual_water_transitions,   .transition_count = 3, .is_realtime = false },
     { .state = HMI_MENU_IMPLUVIUM_INTERVALS,    .item_count = 5, .transitions = impluvium_intervals_transitions,      .transition_count = 5, .is_realtime = false },
@@ -398,9 +414,117 @@ const nav_transition_t* hmi_nav_find_transition(const nav_menu_metadata_t *meta,
     return NULL;
 }
 
+// ########################## Scrolling Helper Functions ##########################
+
+/**
+ * @brief Update scroll window to ensure selected item is visible
+ * @param total_items Total number of items in current menu
+ */
+static void hmi_update_scroll_window(uint8_t total_items)
+{
+    if (total_items <= HMI_MAX_VISIBLE_ITEMS) {
+        // No scrolling needed
+        hmi_status.scroll_offset = 0;
+        return;
+    }
+
+    // Ensure selected_item is within visible window
+    uint8_t first_visible = hmi_status.scroll_offset;
+    uint8_t last_visible = first_visible + HMI_MAX_VISIBLE_ITEMS - 1;
+
+    if (hmi_status.selected_item < first_visible) {
+        // Scrolled above window - adjust offset up
+        hmi_status.scroll_offset = hmi_status.selected_item;
+    } else if (hmi_status.selected_item > last_visible) {
+        // Scrolled below window - adjust offset down
+        hmi_status.scroll_offset = hmi_status.selected_item - HMI_MAX_VISIBLE_ITEMS + 1;
+    }
+
+    // Clamp offset to valid range
+    uint8_t max_offset = total_items - HMI_MAX_VISIBLE_ITEMS;
+    if (hmi_status.scroll_offset > max_offset) {
+        hmi_status.scroll_offset = max_offset;
+    }
+}
+
+/**
+ * @brief Save current scroll position and selected item to per-menu memory
+ */
+static void hmi_save_scroll_position(void)
+{
+    if (hmi_status.current_menu < 47) {  // Safety check (array bounds)
+        hmi_status.menu_scroll_memory[hmi_status.current_menu] = hmi_status.scroll_offset;
+        hmi_status.menu_selected_item_memory[hmi_status.current_menu] = hmi_status.selected_item;
+    }
+}
+
+/**
+ * @brief Restore scroll position and selected item from per-menu memory
+ * @param menu Menu state to restore position for
+ */
+static void hmi_restore_scroll_position(hmi_menu_state_t menu)
+{
+    if (menu < 47) {  // Safety check (array bounds)
+        hmi_status.scroll_offset = hmi_status.menu_scroll_memory[menu];
+        hmi_status.selected_item = hmi_status.menu_selected_item_memory[menu];
+    }
+}
+
+/**
+ * @brief Get parent menu for a given detail page (for pagination back navigation)
+ * @param current Current menu state
+ * @return Parent menu state, or HMI_MENU_MAIN if no parent found
+ */
+static hmi_menu_state_t hmi_get_parent_menu(hmi_menu_state_t current)
+{
+    // Map detail pages to their parent menus
+    if (current >= HMI_MENU_FLUCTUS && current <= HMI_MENU_FLUCTUS_INTERVALS) {
+        return HMI_MENU_FLUCTUS;
+    }
+    if (current >= HMI_MENU_TEMPESTA && current <= HMI_MENU_TEMPESTA_INTERVALS) {
+        return HMI_MENU_TEMPESTA;
+    }
+    if (current >= HMI_MENU_IMPLUVIUM && current <= HMI_MENU_IMPLUVIUM_INTERVALS) {
+        return HMI_MENU_IMPLUVIUM;
+    }
+    if (current >= HMI_MENU_STELLARIA && current <= HMI_MENU_STELLARIA_AUTO) {
+        return HMI_MENU_STELLARIA;
+    }
+    if (current >= HMI_MENU_SYSTEM && current <= HMI_MENU_SYSTEM_INTERVALS) {
+        return HMI_MENU_SYSTEM;
+    }
+
+    // Default fallback
+    return HMI_MENU_MAIN;
+}
+
+// ########################## Navigation Functions ##########################
+
 void hmi_handle_button_press(void)
 {
     hmi_update_activity();
+
+    // Check if we're on a paginated detail page
+    if (hmi_status.total_pages > 1) {
+        // Special handling for FLUCTUS Tracking/Debug page 4 (interactive controls)
+        if (hmi_status.current_menu == HMI_MENU_FLUCTUS_SOLAR && hmi_status.current_page == 3) {
+            // Page 4 has interactive controls - use normal menu navigation
+            // Fall through to the menu navigation logic below
+        } else {
+            // Button press on pagination = go back to parent menu
+            hmi_menu_state_t parent = hmi_get_parent_menu(hmi_status.current_menu);
+
+            // Reset pagination state
+            hmi_status.current_page = 0;
+            hmi_status.total_pages = 0;
+
+            // Navigate to parent and restore scroll position + selected item
+            hmi_status.current_menu = parent;
+            hmi_restore_scroll_position(parent);
+            return;
+        }
+    }
+
     const nav_menu_metadata_t *meta = hmi_nav_get_menu_metadata(hmi_status.current_menu);
     if (!meta) {
         ESP_LOGE(TAG, "Failed to get metadata for menu %d", hmi_status.current_menu);
@@ -416,9 +540,16 @@ void hmi_handle_button_press(void)
     // Execute action based on type
     switch (trans->action) {
         case NAV_ACTION_NAVIGATE:
-            // Simple navigation
+            // Save scroll position before leaving current menu
+            hmi_save_scroll_position();
+
+            // Reset pagination state when leaving detail pages
+            hmi_status.current_page = 0;
+            hmi_status.total_pages = 0;
+
+            // Navigate to new menu and restore scroll + selection
             hmi_status.current_menu = trans->next_menu;
-            hmi_status.selected_item = 0;
+            hmi_restore_scroll_position(trans->next_menu);
             break;
 
         case NAV_ACTION_TOGGLE:
@@ -469,6 +600,25 @@ void hmi_handle_button_press(void)
 void hmi_handle_encoder_change(int delta)
 {
     hmi_update_activity();
+
+    // Check if we're on a paginated detail page
+    if (hmi_status.total_pages > 1) {
+        // Handle page navigation
+        if (delta > 0) {
+            hmi_status.current_page++;
+            if (hmi_status.current_page >= hmi_status.total_pages) {
+                hmi_status.current_page = 0; // Wrap to first page
+            }
+        } else {
+            if (hmi_status.current_page == 0) {
+                hmi_status.current_page = hmi_status.total_pages - 1; // Wrap to last page
+            } else {
+                hmi_status.current_page--;
+            }
+        }
+        return; // Don't process as menu navigation
+    }
+
     const nav_menu_metadata_t *meta = hmi_nav_get_menu_metadata(hmi_status.current_menu);
     if (!meta) return;
 
@@ -524,6 +674,54 @@ void hmi_handle_encoder_change(int delta)
         return;
     }
 
+    // Servo control mode (direct servo position adjustment)
+    if (servo_debug_active) {
+        const int32_t SERVO_STEP = 50;  // 50 duty units per encoder step
+
+        if (hmi_status.current_menu == HMI_MENU_FLUCTUS_SERVO_CONTROL_YAW) {
+            // Control yaw servo using locally tracked position
+            int32_t new_duty = (int32_t)servo_debug_current_duty + (delta * SERVO_STEP);
+
+            // Clamp to servo limits (safety, though API also clamps)
+            if (new_duty < FLUCTUS_SERVO_MIN_DUTY) new_duty = FLUCTUS_SERVO_MIN_DUTY;
+            if (new_duty > FLUCTUS_SERVO_MAX_DUTY) new_duty = FLUCTUS_SERVO_MAX_DUTY;
+
+            // Set servo position using public API (updates both hardware and system state)
+            esp_err_t ret = fluctus_servo_debug_set_position(FLUCTUS_SERVO_YAW_CHANNEL, (uint32_t)new_duty);
+            if (ret == ESP_OK) {
+                // Update local tracking variable
+                servo_debug_current_duty = (uint32_t)new_duty;
+                ESP_LOGD(TAG, "Yaw servo: %ld (delta %d)", new_duty, delta);
+            } else {
+                ESP_LOGW(TAG, "Failed to set yaw servo position: %s", esp_err_to_name(ret));
+            }
+
+            // Update activity timestamp (reset timeout on user activity)
+            servo_debug_start_time = time(NULL);
+
+        } else if (hmi_status.current_menu == HMI_MENU_FLUCTUS_SERVO_CONTROL_PITCH) {
+            // Control pitch servo using locally tracked position
+            int32_t new_duty = (int32_t)servo_debug_current_duty + (delta * SERVO_STEP);
+
+            // Clamp to servo limits (safety, though API also clamps)
+            if (new_duty < FLUCTUS_SERVO_MIN_DUTY) new_duty = FLUCTUS_SERVO_MIN_DUTY;
+            if (new_duty > FLUCTUS_SERVO_MAX_DUTY) new_duty = FLUCTUS_SERVO_MAX_DUTY;
+
+            // Set servo position using public API (updates both hardware and system state)
+            esp_err_t ret = fluctus_servo_debug_set_position(FLUCTUS_SERVO_PITCH_CHANNEL, (uint32_t)new_duty);
+            if (ret == ESP_OK) {
+                // Update local tracking variable
+                servo_debug_current_duty = (uint32_t)new_duty;
+            } else {
+                ESP_LOGW(TAG, "Failed to set pitch servo position: %s", esp_err_to_name(ret));
+            }
+
+            // Update activity timestamp (reset timeout on user activity)
+            servo_debug_start_time = time(NULL);
+        }
+        return;
+    }
+
     // Normal menu navigation
     if (delta > 0) {
         hmi_status.selected_item++;
@@ -537,6 +735,9 @@ void hmi_handle_encoder_change(int delta)
             hmi_status.selected_item--;
         }
     }
+
+    // Update scroll window to keep selected item visible
+    hmi_update_scroll_window(meta->item_count);
 }
 
 uint8_t hmi_get_menu_item_count(hmi_menu_state_t menu)
@@ -593,6 +794,9 @@ static void hmi_action_toggle_solar_tracking(void)
         fluctus_disable_solar_tracking();
         ESP_LOGI(TAG, "Solar tracking disabled");
     }
+
+    // Force telemetry cache update so HMI sees new values immediately
+    telemetry_fetch_snapshot(TELEMETRY_SRC_FLUCTUS);
 }
 
 static void hmi_action_manual_safety_reset(void)
@@ -649,6 +853,114 @@ static void hmi_action_edit_fluctus_solar_correction(void)
     }
 }
 
+static void hmi_action_toggle_solar_debug_mode(void)
+{
+    bool debug_active = fluctus_is_solar_debug_mode_active();
+    if (debug_active) {
+        fluctus_disable_solar_debug_mode();
+        ESP_LOGI(TAG, "Solar debug mode disabled");
+    } else {
+        esp_err_t ret = fluctus_enable_solar_debug_mode();
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, "Solar debug mode enabled (90s timeout)");
+        } else {
+            ESP_LOGW(TAG, "Failed to enable debug mode - solar tracking may be disabled");
+        }
+    }
+
+    // Force telemetry cache update so HMI sees new values immediately
+    telemetry_fetch_snapshot(TELEMETRY_SRC_FLUCTUS);
+}
+
+/**
+ * @brief Enter servo control mode for Yaw servo
+ * Requests 6.6V bus power and initializes timeout tracking
+ */
+static void hmi_action_enter_servo_control_yaw(void)
+{
+    ESP_LOGI(TAG, "Entering Yaw servo control mode");
+
+    // Read current yaw position from telemetry (one-time snapshot)
+    fluctus_snapshot_t data;
+    telemetry_get_fluctus_data(&data);
+    servo_debug_current_duty = data.current_yaw_duty;
+    ESP_LOGI(TAG, "Initial yaw position: %lu (duty cycle)", (unsigned long)servo_debug_current_duty);
+
+    // Request 6.6V bus power for servos
+    esp_err_t ret = fluctus_request_bus_power(POWER_BUS_6V6, "HMI_SERVO_DEBUG");
+    if (ret == ESP_OK) {
+        servo_debug_bus_requested = true;
+        servo_debug_active = true;
+        servo_debug_start_time = time(NULL);
+        ESP_LOGI(TAG, "6.6V bus powered, servo control active");
+    } else {
+        ESP_LOGW(TAG, "Failed to power 6.6V bus: %s", esp_err_to_name(ret));
+        // Still allow control mode (maybe bus already powered by tracking system)
+        servo_debug_active = true;
+        servo_debug_start_time = time(NULL);
+    }
+
+    // Navigate to control page
+    hmi_status.current_menu = HMI_MENU_FLUCTUS_SERVO_CONTROL_YAW;
+    hmi_status.selected_item = 0;
+}
+
+/**
+ * @brief Enter servo control mode for Pitch servo
+ * Requests 6.6V bus power and initializes timeout tracking
+ */
+static void hmi_action_enter_servo_control_pitch(void)
+{
+    ESP_LOGI(TAG, "Entering Pitch servo control mode");
+
+    // Read current pitch position from telemetry (one-time snapshot)
+    fluctus_snapshot_t data;
+    telemetry_get_fluctus_data(&data);
+    servo_debug_current_duty = data.current_pitch_duty;
+    ESP_LOGI(TAG, "Initial pitch position: %lu (duty cycle)", (unsigned long)servo_debug_current_duty);
+
+    // Request 6.6V bus power for servos
+    esp_err_t ret = fluctus_request_bus_power(POWER_BUS_6V6, "HMI_SERVO_DEBUG");
+    if (ret == ESP_OK) {
+        servo_debug_bus_requested = true;
+        servo_debug_active = true;
+        servo_debug_start_time = time(NULL);
+        ESP_LOGI(TAG, "6.6V bus powered, servo control active");
+    } else {
+        ESP_LOGW(TAG, "Failed to power 6.6V bus: %s", esp_err_to_name(ret));
+        // Still allow control mode (maybe bus already powered by tracking system)
+        servo_debug_active = true;
+        servo_debug_start_time = time(NULL);
+    }
+
+    // Navigate to control page
+    hmi_status.current_menu = HMI_MENU_FLUCTUS_SERVO_CONTROL_PITCH;
+    hmi_status.selected_item = 0;
+}
+
+/**
+ * @brief Exit servo control mode
+ * Releases 6.6V bus power and clears state
+ */
+static void hmi_action_exit_servo_control(void)
+{
+    ESP_LOGI(TAG, "Exiting servo control mode");
+
+    // Release 6.6V bus power if we requested it
+    if (servo_debug_bus_requested) {
+        fluctus_release_bus_power(POWER_BUS_6V6, "HMI_SERVO_DEBUG");
+        servo_debug_bus_requested = false;
+    }
+
+    servo_debug_active = false;
+    servo_debug_start_time = 0;
+    servo_debug_current_duty = 0;
+
+    // Navigate back to servo debug menu
+    hmi_status.current_menu = HMI_MENU_FLUCTUS_SERVO_DEBUG;
+    hmi_status.selected_item = 0;
+}
+
 // TEMPESTA Actions
 static void hmi_action_toggle_tempesta(void)
 {
@@ -660,6 +972,9 @@ static void hmi_action_toggle_tempesta(void)
         tempesta_set_system_enabled(false);
         ESP_LOGI(TAG, "TEMPESTA disabled");
     }
+
+    // Force telemetry cache update so HMI sees new values immediately
+    telemetry_fetch_snapshot(TELEMETRY_SRC_TEMPESTA);
 }
 
 static void hmi_action_force_tempesta_collection(void)
@@ -742,6 +1057,9 @@ static void hmi_action_toggle_impluvium(void)
         impluvium_set_system_enabled(false);
         ESP_LOGI(TAG, "IMPLUVIUM disabled");
     }
+
+    // Force telemetry cache update so HMI sees new values immediately
+    telemetry_fetch_snapshot(TELEMETRY_SRC_IMPLUVIUM);
 }
 
 static void hmi_action_force_moisture_check(void)
@@ -779,11 +1097,51 @@ static void hmi_action_enter_zone_edit(void)
         editing_zone_enabled = snapshot.zones[editing_zone_id].watering_enabled;
         editing_zone_target = snapshot.zones[editing_zone_id].target_moisture_percent;
         editing_zone_deadband = snapshot.zones[editing_zone_id].moisture_deadband_percent;
+
+        // Use defaults if config is uninitialized (both target and deadband are 0.0)
+        if (editing_zone_target == 0.0f && editing_zone_deadband == 0.0f) {
+            editing_zone_target = 40.0f;      // Default 40% target
+            editing_zone_deadband = 5.0f;     // Default 5% deadband
+            ESP_LOGW(TAG, "Zone %d config uninitialized, using defaults: target=%.1f%%, deadband=%.1f%%",
+                     editing_zone_id, editing_zone_target, editing_zone_deadband);
+        }
     }
 
     zone_editing = false;  // Not in edit mode yet
     hmi_status.current_menu = HMI_MENU_IMPLUVIUM_ZONE_EDIT;
     hmi_status.selected_item = 0;
+}
+
+static void hmi_action_toggle_all_zones(void)
+{
+    // Get current zone configurations from telemetry snapshot
+    impluvium_snapshot_t snapshot;
+    if (telemetry_get_impluvium_data(&snapshot) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to get impluvium data for toggle all zones");
+        return;
+    }
+
+    // Count enabled zones to determine action (if all enabled -> disable all, else -> enable all)
+    uint8_t enabled_count = 0;
+    for (int i = 0; i < IRRIGATION_ZONE_COUNT; i++) {
+        if (snapshot.zones[i].watering_enabled) {
+            enabled_count++;
+        }
+    }
+    bool enable_all = (enabled_count < IRRIGATION_ZONE_COUNT);
+
+    // Apply to all zones
+    for (int i = 0; i < IRRIGATION_ZONE_COUNT; i++) {
+        impluvium_update_zone_config(i,
+                                      snapshot.zones[i].target_moisture_percent,
+                                      snapshot.zones[i].moisture_deadband_percent,
+                                      enable_all);
+    }
+
+    ESP_LOGI(TAG, "All zones %s", enable_all ? "enabled" : "disabled");
+
+    // Force telemetry cache update so HMI sees new values immediately
+    telemetry_fetch_snapshot(TELEMETRY_SRC_IMPLUVIUM);
 }
 
 static void hmi_action_zone_edit_cancel(void)
@@ -832,6 +1190,9 @@ static void hmi_action_zone_edit_save(void)
 
     ESP_LOGI(TAG, "Zone %d config saved: enabled=%d, target=%.1f%%, deadband=%.1f%%",
              editing_zone_id, editing_zone_enabled, editing_zone_target, editing_zone_deadband);
+
+    // Force telemetry cache update so HMI sees new values immediately
+    telemetry_fetch_snapshot(TELEMETRY_SRC_IMPLUVIUM);
 
     zone_editing = false;
     hmi_status.current_menu = HMI_MENU_IMPLUVIUM_ZONE_CONFIG;
@@ -931,6 +1292,9 @@ static void hmi_action_toggle_stellaria(void)
         stellaria_disable();
         ESP_LOGI(TAG, "STELLARIA disabled");
     }
+
+    // Force telemetry cache update so HMI sees new values immediately
+    telemetry_fetch_snapshot(TELEMETRY_SRC_STELLARIA);
 }
 
 static void hmi_action_toggle_stellaria_intensity(void)
@@ -941,6 +1305,9 @@ static void hmi_action_toggle_stellaria_intensity(void)
         stellaria_set_intensity(pwm_value);
         stellaria_intensity_editing = false;
         ESP_LOGI(TAG, "STELLARIA intensity set to %d%%", stellaria_intensity_percent);
+
+        // Force telemetry cache update so HMI sees new values immediately
+        telemetry_fetch_snapshot(TELEMETRY_SRC_STELLARIA);
     } else {
         // Enter edit mode - load current intensity from telemetry snapshot
         stellaria_snapshot_t snapshot;
@@ -961,6 +1328,9 @@ static void hmi_action_toggle_auto_mode(void)
     }
     stellaria_set_auto_mode(!auto_mode);
     ESP_LOGI(TAG, "STELLARIA auto mode %s", auto_mode ? "disabled" : "enabled");
+
+    // Force telemetry cache update so HMI sees new values immediately
+    telemetry_fetch_snapshot(TELEMETRY_SRC_STELLARIA);
 }
 
 // SYSTEM Actions

@@ -47,14 +47,14 @@ esp_err_t impluvium_read_moisture_sensor(uint8_t zone_id, float *moisture_percen
         // Success - convert voltage to percentage
         // Clamp voltage to calibrated range
         float clamped_voltage = voltage;
-        if (clamped_voltage < MOISTURE_SENSOR_DRY_V)
+        if (clamped_voltage > MOISTURE_SENSOR_DRY_V)
             clamped_voltage = MOISTURE_SENSOR_DRY_V;
-        if (clamped_voltage > MOISTURE_SENSOR_WET_V)
+        if (clamped_voltage < MOISTURE_SENSOR_WET_V)
             clamped_voltage = MOISTURE_SENSOR_WET_V;
 
         // Linear mapping to percentage
         *moisture_percent =
-            ((clamped_voltage - MOISTURE_SENSOR_DRY_V) / (MOISTURE_SENSOR_WET_V - MOISTURE_SENSOR_DRY_V)) * 100.0f;
+            ((MOISTURE_SENSOR_DRY_V - clamped_voltage) / (MOISTURE_SENSOR_DRY_V - MOISTURE_SENSOR_WET_V)) * 100.0f;
 
         ESP_LOGD(TAG, "Zone %d moisture sensor read: %.1f%% (%.3fV)", zone_id, *moisture_percent, voltage);
     }

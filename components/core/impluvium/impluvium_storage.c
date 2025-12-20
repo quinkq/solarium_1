@@ -9,6 +9,7 @@
 #include "impluvium.h"
 #include "impluvium_private.h"
 #include "esp_vfs.h"
+#include <sys/stat.h>
 
 static const char *TAG = "IMPLUVIUM_STORAGE";
 
@@ -71,8 +72,18 @@ esp_err_t impluvium_save_zone_config(void)
     // Calculate CRC on zones data
     config_file.crc16 = impluvium_crc16((uint8_t *)&config_file.zones, sizeof(config_file.zones));
 
+    // Ensure directory exists (stat is read-only, mkdir only runs once)
+    struct stat st = {0};
+    if (stat("/data/irrigation", &st) == -1) {
+        if (mkdir("/data/irrigation", 0755) != 0) {
+            ESP_LOGE(TAG, "Failed to create /data/irrigation directory");
+            return ESP_FAIL;
+        }
+        ESP_LOGI(TAG, "Created /data/irrigation directory");
+    }
+
     // Write to LittleFS
-    FILE *f = fopen("/littlefs/irrigation/config.dat", "wb");
+    FILE *f = fopen("/data/irrigation/config.dat", "wb");
     if (f == NULL) {
         ESP_LOGE(TAG, "Failed to open config.dat for writing");
         return ESP_FAIL;
@@ -105,7 +116,7 @@ esp_err_t impluvium_load_zone_config(void)
     irrigation_config_file_t config_file = {0};
 
     // Try to open config file
-    FILE *f = fopen("/littlefs/irrigation/config.dat", "rb");
+    FILE *f = fopen("/data/irrigation/config.dat", "rb");
     if (f == NULL) {
         ESP_LOGW(TAG, "Config file not found - using defaults");
         return ESP_ERR_NOT_FOUND;
@@ -178,12 +189,6 @@ esp_err_t impluvium_save_learning_data_all_zones(void)
     learning_file.version = 1;
     learning_file.last_saved = time(NULL);
 
-    // Copy learning data from RAM
-    if (xSemaphoreTake(xIrrigationMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
-        ESP_LOGE(TAG, "Failed to acquire mutex for learning data save");
-        return ESP_FAIL;
-    }
-
     for (uint8_t zone_id = 0; zone_id < IRRIGATION_ZONE_COUNT; zone_id++) {
         zone_learning_t *learning = &irrigation_zones[zone_id].learning;
 
@@ -215,13 +220,12 @@ esp_err_t impluvium_save_learning_data_all_zones(void)
         learning_file.zones[zone_id].history_write_index = 0;  // Reset to start on load
     }
 
-    xSemaphoreGive(xIrrigationMutex);
 
     // Calculate CRC on zones data
     learning_file.crc16 = impluvium_crc16((uint8_t *)&learning_file.zones, sizeof(learning_file.zones));
 
     // Write to LittleFS
-    FILE *f = fopen("/littlefs/irrigation/learning.dat", "wb");
+    FILE *f = fopen("/data/irrigation/learning.dat", "wb");
     if (f == NULL) {
         ESP_LOGE(TAG, "Failed to open learning.dat for writing");
         return ESP_FAIL;
@@ -254,7 +258,7 @@ esp_err_t impluvium_load_learning_data_all_zones(void)
     irrigation_learning_file_t learning_file = {0};
 
     // Try to open learning file
-    FILE *f = fopen("/littlefs/irrigation/learning.dat", "rb");
+    FILE *f = fopen("/data/irrigation/learning.dat", "rb");
     if (f == NULL) {
         ESP_LOGW(TAG, "Learning data file not found - using defaults");
         return ESP_ERR_NOT_FOUND;

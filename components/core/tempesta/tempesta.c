@@ -36,17 +36,17 @@ tempesta_snapshot_t weather_data = {0};
 weather_calculation_data_t calculation_data = {0};
 
 // State machine
-tempesta_state_t tempesta_state = TEMPESTA_STATE_DISABLED;  // Current operational state
-tempesta_state_t tempesta_previous_state = TEMPESTA_STATE_DISABLED;  // Previous state (for SHUTDOWN recovery)
+tempesta_state_t tempesta_state = TEMPESTA_STATE_DISABLED;          // Current operational state
+tempesta_state_t tempesta_previous_state = TEMPESTA_STATE_DISABLED; // Previous state (for SHUTDOWN recovery)
 
 // Power and hardware configuration
-bool power_save_mode = false;                 // Power save mode flag (60min vs 15min cycle)
-bool previous_power_save_mode = false;        // Previous power save mode (for SHUTDOWN recovery)
-bool weather_pms5003_enabled = true;          // PMS5003 air quality sensor hardware enabled
+bool power_save_mode = false;          // Power save mode flag (60min vs 15min cycle)
+bool previous_power_save_mode = false; // Previous power save mode (for SHUTDOWN recovery)
+bool weather_pms5003_enabled = true;   // PMS5003 air quality sensor hardware enabled
 
 // Interval configuration (loaded from interval_config at init)
-uint32_t tempesta_normal_interval_ms;         // Normal mode collection interval (from config)
-uint32_t tempesta_power_save_interval_ms;     // Power save mode collection interval (from config)
+uint32_t tempesta_normal_interval_ms;     // Normal mode collection interval (from config)
+uint32_t tempesta_power_save_interval_ms; // Power save mode collection interval (from config)
 
 // Task and timer handles
 TaskHandle_t xTempestaMainTaskHandle = NULL;
@@ -56,11 +56,7 @@ TimerHandle_t xTempestaCollectionTimer = NULL;
 // Sensor device handles
 sht4x_t sht4x_dev = {0};
 bmp280_t bmp280_dev = {0};
-as5600_dev_t as5600_dev = {0};
-
-// Hardware handles
-pcnt_unit_handle_t rain_pcnt_unit_handle = NULL;
-pcnt_unit_handle_t tank_intake_pcnt_unit_handle = NULL;
+as5600_t as5600_dev = {0};
 
 // ########################## Private Function Declarations ##########################
 
@@ -72,8 +68,8 @@ static void tempesta_release_power_buses(bool had_5v);
 // Utility functions
 static void tempesta_update_timer_period(void);
 static void tempesta_timer_callback(TimerHandle_t xTimer);
-//static void tempesta_log_summary(void);
-// Task functions
+// static void tempesta_log_summary(void);
+//  Task functions
 static void tempesta_main_task(void *pvParameters);
 
 // ########################## Initialization ##########################
@@ -102,7 +98,8 @@ esp_err_t tempesta_station_init(void)
         weather_data.wind_speed_rpm = WEATHER_INVALID_VALUE;
         weather_data.wind_speed_ms = WEATHER_INVALID_VALUE;
         weather_data.wind_direction_deg = WEATHER_INVALID_VALUE;
-        weather_data.wind_direction_cardinal = "---";
+        strncpy(weather_data.wind_direction_cardinal, "---", sizeof(weather_data.wind_direction_cardinal) - 1);
+        weather_data.wind_direction_cardinal[sizeof(weather_data.wind_direction_cardinal) - 1] = '\0';
         weather_data.rainfall_last_hour_mm = 0.0f;
         weather_data.rainfall_current_hour_mm = 0.0f;
         weather_data.rainfall_daily_mm = 0.0f;
@@ -173,7 +170,7 @@ esp_err_t tempesta_station_init(void)
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Failed to request 3.3V bus power: %s - continuing without I2C sensors", esp_err_to_name(ret));
     } else {
-        vTaskDelay(pdMS_TO_TICKS(100));  // Allow bus to stabilize
+        vTaskDelay(pdMS_TO_TICKS(100)); // Allow bus to stabilize
 
         ret = tempesta_i2c_sensors_init();
         if (ret != ESP_OK) {
@@ -196,15 +193,17 @@ esp_err_t tempesta_station_init(void)
     // Load interval configuration from global config
     tempesta_normal_interval_ms = g_interval_config.tempesta_normal_min * 60 * 1000;
     tempesta_power_save_interval_ms = g_interval_config.tempesta_power_save_min * 60 * 1000;
-    ESP_LOGI(TAG, "Collection intervals: %lums (normal), %lums (power save)",
-             tempesta_normal_interval_ms, tempesta_power_save_interval_ms);
+    ESP_LOGI(TAG,
+             "Collection intervals: %lums (normal), %lums (power save)",
+             tempesta_normal_interval_ms,
+             tempesta_power_save_interval_ms);
 
     // Create collection timer - auto-reload repeating timer
     xTempestaCollectionTimer = xTimerCreate("WeatherTimer",
-                                           pdMS_TO_TICKS(tempesta_normal_interval_ms),
-                                           pdTRUE, // Auto-reload
-                                           (void *) 0,
-                                           tempesta_timer_callback);
+                                            pdMS_TO_TICKS(tempesta_normal_interval_ms),
+                                            pdTRUE, // Auto-reload
+                                            (void *) 0,
+                                            tempesta_timer_callback);
     if (xTempestaCollectionTimer == NULL) {
         ESP_LOGE(TAG, "Failed to create collection timer");
         goto cleanup_mutex;
@@ -212,8 +211,8 @@ esp_err_t tempesta_station_init(void)
 
     // Create main weather task
     BaseType_t xResult = xTaskCreate(tempesta_main_task,
-                                     "WeatherMain",
-                                     2048, // Reduced stack - mostly I2C operations
+                                     "TEMPESTA_MainTask",
+                                     4096, // Increased from 2048 - prevents stack overflow with nested logging/mutexes
                                      NULL,
                                      5,
                                      &xTempestaMainTaskHandle);
@@ -224,8 +223,8 @@ esp_err_t tempesta_station_init(void)
 
     // Create AS5600 sampling task
     xResult = xTaskCreate(tempesta_as5600_sampling_task,
-                          "WeatherAS5600",
-                          2048, // Reduced stack - simple calculations
+                          "TEMPESTA_AS5600Task",
+                          4096, // Reduced stack - simple calculations
                           NULL,
                           6, // Higher priority for time-sensitive wind measurements
                           &xTempestaAS5600TaskHandle);
@@ -276,7 +275,7 @@ cleanup_mutex:
 static void tempesta_change_state(tempesta_state_t new_state)
 {
     if (tempesta_state == new_state) {
-        return;  // No change needed
+        return; // No change needed
     }
 
     // Log state transition
@@ -284,19 +283,39 @@ static void tempesta_change_state(tempesta_state_t new_state)
     const char *new_state_str = "UNKNOWN";
 
     switch (tempesta_state) {
-        case TEMPESTA_STATE_DISABLED:   old_state_str = "DISABLED"; break;
-        case TEMPESTA_STATE_IDLE:       old_state_str = "IDLE"; break;
-        case TEMPESTA_STATE_READING:    old_state_str = "READING"; break;
-        case TEMPESTA_STATE_SHUTDOWN:   old_state_str = "SHUTDOWN"; break;
-        case TEMPESTA_STATE_ERROR:      old_state_str = "ERROR"; break;
+        case TEMPESTA_STATE_DISABLED:
+            old_state_str = "DISABLED";
+            break;
+        case TEMPESTA_STATE_IDLE:
+            old_state_str = "IDLE";
+            break;
+        case TEMPESTA_STATE_READING:
+            old_state_str = "READING";
+            break;
+        case TEMPESTA_STATE_SHUTDOWN:
+            old_state_str = "SHUTDOWN";
+            break;
+        case TEMPESTA_STATE_ERROR:
+            old_state_str = "ERROR";
+            break;
     }
 
     switch (new_state) {
-        case TEMPESTA_STATE_DISABLED:   new_state_str = "DISABLED"; break;
-        case TEMPESTA_STATE_IDLE:       new_state_str = "IDLE"; break;
-        case TEMPESTA_STATE_READING:    new_state_str = "READING"; break;
-        case TEMPESTA_STATE_SHUTDOWN:   new_state_str = "SHUTDOWN"; break;
-        case TEMPESTA_STATE_ERROR:      new_state_str = "ERROR"; break;
+        case TEMPESTA_STATE_DISABLED:
+            new_state_str = "DISABLED";
+            break;
+        case TEMPESTA_STATE_IDLE:
+            new_state_str = "IDLE";
+            break;
+        case TEMPESTA_STATE_READING:
+            new_state_str = "READING";
+            break;
+        case TEMPESTA_STATE_SHUTDOWN:
+            new_state_str = "SHUTDOWN";
+            break;
+        case TEMPESTA_STATE_ERROR:
+            new_state_str = "ERROR";
+            break;
     }
 
     ESP_LOGI(TAG, "State transition: %s -> %s", old_state_str, new_state_str);
@@ -393,9 +412,8 @@ static void tempesta_release_power_buses(bool had_5v)
 static void tempesta_update_timer_period(void)
 {
     if (xTempestaCollectionTimer != NULL) {
-        TickType_t new_period = power_save_mode ?
-            pdMS_TO_TICKS(tempesta_power_save_interval_ms) :
-            pdMS_TO_TICKS(tempesta_normal_interval_ms);
+        TickType_t new_period = power_save_mode ? pdMS_TO_TICKS(tempesta_power_save_interval_ms)
+                                                : pdMS_TO_TICKS(tempesta_normal_interval_ms);
 
         xTimerChangePeriod(xTempestaCollectionTimer, new_period, portMAX_DELAY);
     }
@@ -473,7 +491,7 @@ static void tempesta_timer_callback(TimerHandle_t xTimer)
  */
 static void tempesta_main_task(void *pvParameters)
 {
-    const char *task_tag = "WeatherMain";
+    const char *task_tag = "TEMPESTA_MainTask";
     ESP_LOGI(task_tag, "Weather station main task started");
     uint32_t notification_value = 0;
 
@@ -485,9 +503,12 @@ static void tempesta_main_task(void *pvParameters)
         notification_value = 0;
         xTaskNotifyWait(0x00, ULONG_MAX, &notification_value, portMAX_DELAY);
 
+        // Monitor stack usage (debug - watermark shows minimum free stack ever reached)
+        UBaseType_t stack_high_water = uxTaskGetStackHighWaterMark(NULL);
+        ESP_LOGI(task_tag, "[STACK] High water mark: %u bytes free (min ever)", stack_high_water * sizeof(StackType_t));
+
         // Check if collection should proceed based on state
-        if (tempesta_state == TEMPESTA_STATE_DISABLED ||
-            tempesta_state == TEMPESTA_STATE_SHUTDOWN ||
+        if (tempesta_state == TEMPESTA_STATE_DISABLED || tempesta_state == TEMPESTA_STATE_SHUTDOWN ||
             tempesta_state == TEMPESTA_STATE_ERROR) {
             ESP_LOGD(task_tag, "System not operational (state %d) - skipping weather collection", tempesta_state);
             continue;
@@ -512,11 +533,12 @@ static void tempesta_main_task(void *pvParameters)
         esp_err_t ret = tempesta_request_power_buses(should_read_pms5003);
         if (ret != ESP_OK) {
             ESP_LOGE(task_tag, "Failed to request power buses");
-            tempesta_change_state(return_state);  // Restore previous state on error
+            tempesta_change_state(return_state); // Restore previous state on error
             continue;
         }
 
-        ESP_LOGI(task_tag, "Sensor buses powered (%s), starting measurements",
+        ESP_LOGI(task_tag,
+                 "Sensor buses powered (%s), starting measurements",
                  should_read_pms5003 ? "3V3+5V" : "3V3 only");
 
         // Record start time for PMS5003 warmup tracking and send wake command
@@ -526,9 +548,9 @@ static void tempesta_main_task(void *pvParameters)
             ESP_LOGI(task_tag, "PMS5003 wake command sent, warmup starting");
         }
 
-        // Allow I2C sensors brief stabilization and trigger wind sampling
+        // Allow I2C sensors stabilization after power-up (SHT40/BME280/AS5600 on Bus B)
+        // SHT40 needs ~1s, add margin to avoid retry on first read
         vTaskDelay(pdMS_TO_TICKS(1000));
-        xTaskNotify(xTempestaAS5600TaskHandle, 1, eSetBits);
 
         // Read and process essential I2C sensors
         consolidated_sensor_data_t sensor_data;
@@ -541,12 +563,17 @@ static void tempesta_main_task(void *pvParameters)
         tempesta_read_and_process_rainfall();
         tempesta_read_and_process_tank_intake();
 
+        // Read wind speed from as5600
+        xTaskNotify(xTempestaAS5600TaskHandle, 1, eSetBits);
+        ESP_LOGD(task_tag, "AS5600 trigger notification sent");
+
+        ESP_LOGI(task_tag, "After wind speed(as5600), before direction"); // Debug
         // Read wind direction from Hall sensor array (ADS1115)
         tempesta_read_and_process_wind_direction();
-
+        ESP_LOGI(task_tag, "Wind direction read done, calling PMS handle"); // Debug
         // Handle PMS5003 air quality sensor (with warmup management)
         tempesta_handle_pms5003_reading(warmup_start_time, should_read_pms5003);
-
+        ESP_LOGI(task_tag, "PMS handle returned"); // Debug
         // Update timestamp and power down
         if (xSemaphoreTake(xTempestaDataMutex, pdMS_TO_TICKS(WEATHER_MUTEX_TIMEOUT_UPDATE_MS)) == pdTRUE) {
             weather_data.snapshot_timestamp = time(NULL);
@@ -562,7 +589,7 @@ static void tempesta_main_task(void *pvParameters)
         tempesta_change_state(return_state);
 
         ESP_LOGI(task_tag, "Weather data collection cycle completed");
-        //tempesta_log_summary();
+        // tempesta_log_summary();
     }
 }
 
@@ -671,7 +698,8 @@ esp_err_t tempesta_set_power_save_mode(bool enable)
             xSemaphoreGive(xTempestaDataMutex);
         }
 
-        ESP_LOGI(TAG, "Power save mode %s (polling interval: %s)",
+        ESP_LOGI(TAG,
+                 "Power save mode %s (polling interval: %s)",
                  enable ? "enabled" : "disabled",
                  enable ? "60min" : "15min");
     }
@@ -694,7 +722,7 @@ esp_err_t tempesta_set_collection_intervals(uint32_t normal_min, uint32_t power_
     // Validate using interval_config API (enforces ranges)
     esp_err_t ret = interval_config_set_tempesta(normal_min, power_save_min);
     if (ret != ESP_OK) {
-        return ret;  // Invalid ranges, error already logged
+        return ret; // Invalid ranges, error already logged
     }
 
     // Update runtime variables
@@ -706,8 +734,7 @@ esp_err_t tempesta_set_collection_intervals(uint32_t normal_min, uint32_t power_
         tempesta_update_timer_period();
     }
 
-    ESP_LOGI(TAG, "Collection intervals updated: %lum (normal), %lum (power save)",
-             normal_min, power_save_min);
+    ESP_LOGI(TAG, "Collection intervals updated: %lum (normal), %lum (power save)", normal_min, power_save_min);
 
     return ESP_OK;
 }
@@ -742,7 +769,7 @@ esp_err_t tempesta_set_shutdown(bool shutdown)
         if (tempesta_state == TEMPESTA_STATE_SHUTDOWN) {
             tempesta_state_t target_state = tempesta_previous_state;
             if (target_state == TEMPESTA_STATE_DISABLED || target_state == TEMPESTA_STATE_SHUTDOWN) {
-                target_state = TEMPESTA_STATE_IDLE;  // Default to IDLE if previous state was invalid
+                target_state = TEMPESTA_STATE_IDLE; // Default to IDLE if previous state was invalid
             }
 
             // Restore power save mode
@@ -759,8 +786,7 @@ esp_err_t tempesta_set_shutdown(bool shutdown)
                 xTimerStart(xTempestaCollectionTimer, portMAX_DELAY);
             }
 
-            ESP_LOGI(TAG, "TEMPESTA restored from shutdown (state: %d, power_save: %d)",
-                     target_state, power_save_mode);
+            ESP_LOGI(TAG, "TEMPESTA restored from shutdown (state: %d, power_save: %d)", target_state, power_save_mode);
         }
     }
 

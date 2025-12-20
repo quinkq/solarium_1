@@ -74,6 +74,11 @@ parking_reason_t current_parking_reason = PARKING_REASON_SUNSET;
 uint8_t consecutive_tracking_errors = 0;
 #define FLUCTUS_MAX_CONSECUTIVE_ERRORS 5  // Disable tracking after 5 consecutive failures
 
+// Debug mode state (for continuous testing without daytime checks)
+static bool solar_debug_mode_active = false;
+static int64_t debug_mode_start_time = 0;
+#define FLUCTUS_DEBUG_MODE_TIMEOUT_MS 90000  // 90 seconds auto-timeout
+
 // ########################## Servo PWM Initialization ##########################
 
 
@@ -173,10 +178,10 @@ esp_err_t fluctus_read_photoresistors(fluctus_solar_snapshot_t *data)
     bool all_valid = true;
 
     for (int channel = 0; channel < 4; channel++) {
-        esp_err_t ret = ads1115_helper_read_channel(2, (ads111x_mux_t)channel, &raw_value, &voltage);
+        esp_err_t ret = ads1115_helper_read_channel(2, ADS111X_MUX_0_GND + channel, &raw_value, &voltage);
         if (ret == ESP_OK) {
             data->photoresistor_readings[channel] = voltage;
-            ESP_LOGD(TAG, "Photoresistor ch%d: %.3fV", channel, voltage);
+            ESP_LOGD(TAG, "Photoresistor CH:%d %.3fV", channel, voltage);
         } else {
             ESP_LOGW(TAG, "Failed to read photoresistor ch%d: %s", channel, esp_err_to_name(ret));
             data->photoresistor_readings[channel] = 0.0f;
@@ -225,6 +230,49 @@ esp_err_t fluctus_servo_set_position(ledc_channel_t channel, uint32_t duty_cycle
     }
     
     return ledc_update_duty(FLUCTUS_SERVO_PWM_SPEED_MODE, channel);
+}
+
+/**
+ * @brief Set servo position directly for debug/testing (PUBLIC API)
+ *
+ * This function is called by HMI servo debug mode to directly control servos.
+ * It updates both the hardware PWM and the internal system_status so that
+ * telemetry and display show the correct position.
+ *
+ * Thread-safe with xSolarMutex.
+ */
+esp_err_t fluctus_servo_debug_set_position(ledc_channel_t channel, uint32_t duty_cycle)
+{
+    // Take mutex for thread safety
+    if (xSemaphoreTake(xSolarMutex, pdMS_TO_TICKS(FLUCTUS_MUTEX_TIMEOUT_QUICK_MS)) != pdTRUE) {
+        ESP_LOGW(TAG, "Failed to take xSolarMutex for servo debug");
+        return ESP_FAIL;
+    }
+
+    // Clamp duty cycle to safe range
+    if (duty_cycle < FLUCTUS_SERVO_MIN_DUTY) {
+        duty_cycle = FLUCTUS_SERVO_MIN_DUTY;
+    } else if (duty_cycle > FLUCTUS_SERVO_MAX_DUTY) {
+        duty_cycle = FLUCTUS_SERVO_MAX_DUTY;
+    }
+
+    // Set hardware PWM
+    esp_err_t ret = fluctus_servo_set_position(channel, duty_cycle);
+
+    if (ret == ESP_OK) {
+        // Update internal state so telemetry reflects the new position
+        if (xSemaphoreTake(xPowerBusMutex, pdMS_TO_TICKS(FLUCTUS_MUTEX_TIMEOUT_QUICK_MS)) == pdTRUE) {
+            if (channel == FLUCTUS_SERVO_YAW_CHANNEL) {
+                system_status.current_yaw_duty = duty_cycle;
+            } else if (channel == FLUCTUS_SERVO_PITCH_CHANNEL) {
+                system_status.current_pitch_duty = duty_cycle;
+            }
+            xSemaphoreGive(xPowerBusMutex);
+        }
+    }
+
+    xSemaphoreGive(xSolarMutex);
+    return ret;
 }
 
 /**
@@ -476,7 +524,7 @@ bool fluctus_is_daytime_with_sufficient_light(void)
     stellaria_update_light_intensity(avg_light);
 
     // Combined decision: astronomical daytime AND sufficient light detected
-    return (avg_light >= FLUCTUS_PV_LIGHT_THRESHOLD);
+    return (avg_light >= FLUCTUS_SOLAR_LIGHT_THRESHOLD);
 }
 
 /**
@@ -502,36 +550,46 @@ void fluctus_set_tracking_state(solar_tracking_state_t new_state, const char *lo
  *
  * Checks every 15 minutes whether to start a correction cycle.
  * Transitions to PARKING if true sunset detected, or CORRECTING if daytime with sufficient light.
+ * In debug mode, bypasses daytime checks for continuous testing.
  *
  * @param current_time_ms Current time in milliseconds (for correction interval timing)
  */
 void fluctus_solar_state_standby(int64_t current_time_ms)
 {
-    // Check for sunset parking condition using centralized environmental check
-    if (!fluctus_is_daytime_with_sufficient_light()) {
-        // Insufficient light detected - determine if it's true sunset or just cloudy
-        if (solar_calc_is_daytime_buffered()) {
-            // Astronomically daytime but cloudy - stay in STANDBY, retry in 15 minutes
-            ESP_LOGW(TAG, "Insufficient light but still daytime - will retry in 15 minutes");
-            return;
-        } else {
-            // True sunset (astronomically nighttime)
-            current_parking_reason = PARKING_REASON_SUNSET;
-            fluctus_set_tracking_state(SOLAR_TRACKING_PARKING, "Sunset - insufficient light for tracking");
-            return;
+    // In debug mode, skip daytime checks and force continuous operation
+    if (!solar_debug_mode_active) {
+        // Normal mode: Check for sunset parking condition using centralized environmental check
+        if (!fluctus_is_daytime_with_sufficient_light()) {
+            // Insufficient light detected - determine if it's true sunset or just cloudy
+            if (solar_calc_is_daytime_buffered()) {
+                // Astronomically daytime but cloudy - stay in STANDBY, retry in 15 minutes
+                ESP_LOGW(TAG, "Insufficient light but still daytime - will retry in 15 minutes");
+                return;
+            } else {
+                // True sunset (astronomically nighttime)
+                current_parking_reason = PARKING_REASON_SUNSET;
+                fluctus_set_tracking_state(SOLAR_TRACKING_PARKING, "Sunset - insufficient light for tracking");
+                return;
+            }
         }
+    } else {
+        // Debug mode: Always proceed with correction (bypass daytime checks)
+        ESP_LOGD(TAG, "Debug mode active - bypassing daytime checks");
     }
 
-    // Check if we should start correction cycle (from config)
+    // Check if we should start correction cycle (from config, or immediate in debug mode)
     if (last_correction_time == 0 ||
-        (current_time_ms - last_correction_time) >= fluctus_solar_correction_interval_ms) {
+        (current_time_ms - last_correction_time) >= fluctus_solar_correction_interval_ms ||
+        solar_debug_mode_active) {
 
         // Request 6.6V servo bus power for correction cycle
         if (fluctus_request_bus_power(POWER_BUS_6V6, "FLUCTUS_SOLAR") == ESP_OK) {
             vTaskDelay(pdMS_TO_TICKS(FLUCTUS_SERVO_POWERUP_DELAY_MS));
             correction_start_time = current_time_ms;
             last_correction_time = current_time_ms;
-            fluctus_set_tracking_state(SOLAR_TRACKING_CORRECTING, "Starting correction cycle (6.6V bus powered on)");
+            fluctus_set_tracking_state(SOLAR_TRACKING_CORRECTING,
+                solar_debug_mode_active ? "Starting DEBUG correction cycle (6.6V bus powered on)" :
+                                         "Starting correction cycle (6.6V bus powered on)");
         } else {
             ESP_LOGE(TAG, "Failed to power 6.6V bus for solar tracking");
         }
@@ -543,6 +601,7 @@ void fluctus_solar_state_standby(int64_t current_time_ms)
  *
  * Runs every 5 seconds during active tracking to adjust servo positions.
  * Checks for sunset, convergence, and timeout conditions.
+ * In debug mode, bypasses daytime checks for continuous testing.
  *
  * OPTIMIZATION: Uses cached photoresistor data from fluctus_is_daytime_with_sufficient_light()
  * to avoid redundant ADC reads (reduces correction cycle time by ~1s).
@@ -551,21 +610,29 @@ void fluctus_solar_state_standby(int64_t current_time_ms)
  */
 void fluctus_solar_state_correcting(int64_t current_time_ms)
 {
-    // Check if sunset occurred - abort correction and park
-    // NOTE: This call updates cached_solar_data with fresh photoresistor readings
-    if (!fluctus_is_daytime_with_sufficient_light()) {
-        fluctus_release_bus_power(POWER_BUS_6V6, "FLUCTUS_SOLAR");
+    // In debug mode, skip sunset checks and continue correcting
+    if (!solar_debug_mode_active) {
+        // Normal mode: Check if sunset occurred - abort correction and park
+        // NOTE: This call updates cached_solar_data with fresh photoresistor readings
+        if (!fluctus_is_daytime_with_sufficient_light()) {
+            fluctus_release_bus_power(POWER_BUS_6V6, "FLUCTUS_SOLAR");
 
-        // Insufficient light detected - determine if it's true sunset or just cloudy
-        if (solar_calc_is_daytime_buffered()) {
-            // Cloudy during correction - abort but stay in STANDBY
-            fluctus_set_tracking_state(SOLAR_TRACKING_STANDBY, "Insufficient light during correction - aborting cycle");
-        } else {
-            // True sunset during correction
-            current_parking_reason = PARKING_REASON_SUNSET;
-            fluctus_set_tracking_state(SOLAR_TRACKING_PARKING, "Sunset during correction - aborting");
+            // Insufficient light detected - determine if it's true sunset or just cloudy
+            if (solar_calc_is_daytime_buffered()) {
+                // Cloudy during correction - abort but stay in STANDBY
+                fluctus_set_tracking_state(SOLAR_TRACKING_STANDBY, "Insufficient light during correction - aborting cycle");
+            } else {
+                // True sunset during correction
+                current_parking_reason = PARKING_REASON_SUNSET;
+                fluctus_set_tracking_state(SOLAR_TRACKING_PARKING, "Sunset during correction - aborting");
+            }
+            return;
         }
-        return;
+    } else {
+        // Debug mode: Skip daytime checks, but still read photoresistors for debugging
+        ESP_LOGD(TAG, "Debug mode active in CORRECTING - bypassing sunset checks");
+        // Still need to read photoresistors for servo correction
+        fluctus_read_photoresistors(&cached_solar_data);
     }
 
     // Use cached photoresistor data (just updated by daytime check above)
@@ -585,7 +652,7 @@ void fluctus_solar_state_correcting(int64_t current_time_ms)
 
     // NOTE: No need to explicitly update TELEMETRY here - the main cache is updated
     // via cached_solar_data which is populated by fluctus_is_daytime_with_sufficient_light()
-    // The regular telemetry_update_fluctus() at line 1518 will pick up the latest cached data
+    // The REALTIME telemetry_fetch_snapshot() at fluctus_monitoring_task will pick up the latest cached data
 
     // Check if errors are acceptable (correction complete)
     if (fluctus_tracking_error_margin_check(tracking_data.yaw_error, tracking_data.pitch_error)) {
@@ -597,7 +664,7 @@ void fluctus_solar_state_correcting(int64_t current_time_ms)
 
     // Check for timeout
     int64_t correction_duration = current_time_ms - correction_start_time;
-    if (correction_duration >= FLUCTUS_TRACKING_CORRECTION_TIMEOUT_MS) {
+    if (correction_duration >= FLUCTUS_TRACKING_ADJUSTMENT_CYCLE_TIMEOUT_MS) {
         ESP_LOGW(TAG, "Correction timeout after %lld ms - entering error state", correction_duration);
         fluctus_set_tracking_state(SOLAR_TRACKING_ERROR, NULL);
         return;
@@ -725,6 +792,7 @@ void fluctus_solar_tracking_task(void *parameters)
 
     while (true) {
         // Read current state and perform safety checks
+        bool debug_mode_active_snapshot = false;  // Thread-safe local copy
         if (xSemaphoreTake(xSolarMutex, pdMS_TO_TICKS(FLUCTUS_MUTEX_TIMEOUT_QUICK_MS)) == pdTRUE) {
             current_state = system_status.solar_tracking_state;
 
@@ -736,7 +804,26 @@ void fluctus_solar_tracking_task(void *parameters)
                     current_state = SOLAR_TRACKING_DISABLED;
                     ESP_LOGW(TAG, "Solar tracking disabled due to safety or power state");
                 }
+                // Also disable debug mode if shutdown or critical power active
+                if (solar_debug_mode_active) {
+                    solar_debug_mode_active = false;
+                    debug_mode_start_time = 0;
+                    ESP_LOGI(TAG, "Debug mode disabled due to safety/power state");
+                }
             }
+
+            // Check debug mode timeout (90 seconds)
+            if (solar_debug_mode_active && debug_mode_start_time > 0) {
+                int64_t current_time_ms = esp_timer_get_time() / 1000;
+                if ((current_time_ms - debug_mode_start_time) >= FLUCTUS_DEBUG_MODE_TIMEOUT_MS) {
+                    solar_debug_mode_active = false;
+                    debug_mode_start_time = 0;
+                    ESP_LOGI(TAG, "Debug mode TIMED OUT after 90 seconds");
+                }
+            }
+
+            // Take thread-safe snapshot of debug mode flag for timeout calculation
+            debug_mode_active_snapshot = solar_debug_mode_active;
 
             xSemaphoreGive(xSolarMutex);
         } else {
@@ -751,10 +838,15 @@ void fluctus_solar_tracking_task(void *parameters)
                 timeout = portMAX_DELAY;  // Wait indefinitely for notification
                 break;
             case SOLAR_TRACKING_STANDBY:
-                timeout = pdMS_TO_TICKS(fluctus_solar_correction_interval_ms);  // From config
+                // In debug mode, run immediately to start correction cycles
+                if (debug_mode_active_snapshot) {
+                    timeout = 0;  // Immediate execution for debug
+                } else {
+                    timeout = pdMS_TO_TICKS(fluctus_solar_correction_interval_ms);  // From config/set by intervals
+                }
                 break;
             case SOLAR_TRACKING_CORRECTING:
-                timeout = pdMS_TO_TICKS(FLUCTUS_TRACKING_CORRECTION_DURATION_MS);  // 5 seconds
+                timeout = pdMS_TO_TICKS(FLUCTUS_TRACKING_ADJUSTMENT_DURATION_MS);  // 3 seconds for single correction cycle
                 break;
             case SOLAR_TRACKING_PARKING:
             case SOLAR_TRACKING_ERROR:
@@ -928,4 +1020,86 @@ solar_tracking_state_t fluctus_get_solar_tracking_state(void)
     }
 
     return state;
+}
+
+/**
+ * @brief Enable solar tracking debug mode (continuous operation for 90 seconds)
+ *
+ * Forces solar tracking to run continuously regardless of daytime conditions.
+ * Automatically times out after 90 seconds to prevent excessive servo wear.
+ *
+ * @return ESP_OK on success
+ * @return ESP_ERR_INVALID_STATE if solar tracking is disabled
+ */
+esp_err_t fluctus_enable_solar_debug_mode(void)
+{
+    if (!fluctus_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    // Check if solar tracking is enabled (not disabled)
+    solar_tracking_state_t current_state = fluctus_get_solar_tracking_state();
+    if (current_state == SOLAR_TRACKING_DISABLED) {
+        ESP_LOGW(TAG, "Cannot enable debug mode - solar tracking is disabled");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (xSemaphoreTake(xSolarMutex, pdMS_TO_TICKS(FLUCTUS_MUTEX_TIMEOUT_QUICK_MS)) == pdTRUE) {
+        solar_debug_mode_active = true;
+        debug_mode_start_time = esp_timer_get_time() / 1000;  // Convert to milliseconds
+        xSemaphoreGive(xSolarMutex);
+
+        ESP_LOGI(TAG, "Solar debug mode ENABLED (90s timeout)");
+
+        // Force immediate correction cycle by notifying the task
+        if (xFluctusSolarTrackingTaskHandle != NULL) {
+            xTaskNotify(xFluctusSolarTrackingTaskHandle, FLUCTUS_NOTIFY_SOLAR_ENABLE, eSetBits);
+        }
+
+        return ESP_OK;
+    }
+
+    return ESP_FAIL;
+}
+
+/**
+ * @brief Disable solar tracking debug mode (return to normal operation)
+ * @return ESP_OK on success
+ */
+esp_err_t fluctus_disable_solar_debug_mode(void)
+{
+    if (!fluctus_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (xSemaphoreTake(xSolarMutex, pdMS_TO_TICKS(FLUCTUS_MUTEX_TIMEOUT_QUICK_MS)) == pdTRUE) {
+        if (solar_debug_mode_active) {
+            solar_debug_mode_active = false;
+            debug_mode_start_time = 0;
+            ESP_LOGI(TAG, "Solar debug mode DISABLED");
+        }
+        xSemaphoreGive(xSolarMutex);
+        return ESP_OK;
+    }
+
+    return ESP_FAIL;
+}
+
+/**
+ * @brief Check if solar debug mode is currently active
+ * @return true if debug mode active, false otherwise
+ */
+bool fluctus_is_solar_debug_mode_active(void)
+{
+    if (!fluctus_initialized) {
+        return false;
+    }
+
+    bool active = false;
+    if (xSemaphoreTake(xSolarMutex, pdMS_TO_TICKS(FLUCTUS_MUTEX_TIMEOUT_QUICK_MS)) == pdTRUE) {
+        active = solar_debug_mode_active;
+        xSemaphoreGive(xSolarMutex);
+    }
+
+    return active;
 }

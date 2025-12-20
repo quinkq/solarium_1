@@ -51,6 +51,11 @@ bool littlefs_mounted = false;
 
 // ################ Component Data Hub (Central Storage) ################
 
+// Realtime mode and publishing control flags
+bool realtime_mode_enabled = true;          // Current active state
+bool realtime_mode_user_preference = false;  // Last user/server preference
+bool telemetry_publishing_enabled = true;    // Normal mode publishing control
+
 // Static storage for component data caches
 stellaria_snapshot_t cached_stellaria_data = {0};
 fluctus_snapshot_t cached_fluctus_data = {0};  // Unified: shared by both FLUCTUS and FLUCTUS_RT
@@ -74,11 +79,6 @@ volatile int in_flight_msg_id = -1;         // MQTT msg_id awaiting PUBACK
 volatile uint32_t in_flight_seq = 0;        // Sequence number (for logging)
 volatile uint16_t in_flight_tail_index = 0; // Buffer tail index (for retry_count tracking)
 #endif  // CONFIG_TELEMETRY_MQTT_ENABLE
-
-// Realtime mode and publishing control flags
-bool realtime_mode_enabled = false;          // Current active state
-bool realtime_mode_user_preference = false;  // Last user/server preference
-bool telemetry_publishing_enabled = true;    // Normal mode publishing control
 
 buffer_slot_t *psram_buffer = NULL;
 uint16_t buffer_head = 0;
@@ -364,4 +364,36 @@ esp_err_t telemetry_manual_flush_to_flash(uint16_t *flushed_count)
     }
 
     return (flushed > 0) ? ESP_OK : ESP_FAIL;
+}
+
+/**
+ * @brief Fetch snapshot from component and trigger MQTT publishing
+ * Calls component's writer function, then notifies MQTT task for encoding/publishing
+ * This is the entry point for all component telemetry injections
+ *
+ * When MQTT is disabled, this function still performs cache writes but skips notification.
+ */
+esp_err_t telemetry_fetch_snapshot(telemetry_source_t src)
+{
+    if (!telemetry_initialized || src >= TELEMETRY_SRC_COUNT) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    void *cache = NULL;
+    esp_err_t ret = telemetry_lock_cache(src, &cache);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to lock cache for source %d", src);
+        return ret;
+    }
+
+    ret = streams[src].writer_function(cache);
+    telemetry_unlock_cache(src);
+
+#ifdef CONFIG_TELEMETRY_MQTT_ENABLE
+    if (ret == ESP_OK && mqtt_task_handle) {
+        xTaskNotify(mqtt_task_handle, (1 << src), eSetBits);
+    }
+#endif
+
+    return ret;
 }

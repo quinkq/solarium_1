@@ -67,8 +67,14 @@ void fluctus_handle_power_state_change(fluctus_power_state_t new_state)
         ESP_LOGI(TAG, "Power state change: %s -> %s", 
                 fluctus_power_state_to_string(old_state),
                 fluctus_power_state_to_string(new_state));
-        
+
         fluctus_log_power_event(FLUCTUS_EVENT_POWER_STATE_CHANGE, POWER_BUS_COUNT, NULL);
+
+        xSemaphoreGive(xPowerBusMutex);
+    } else {
+        ESP_LOGE(TAG, "Failed to take xPowerBusMutex - fluctus_handle_power_state_change");
+        return;
+    }
         
         // Implement load shedding logic based on power state transitions
         switch (new_state) {
@@ -82,7 +88,7 @@ void fluctus_handle_power_state_change(fluctus_power_state_t new_state)
                 tempesta_set_power_save_mode(false);   // Normal 15min weather collection
                 tempesta_set_shutdown(false);          // Restore weather monitoring
                 tempesta_set_pms5003_enabled(true);    // Enable air quality sensor
-                wifi_helper_set_power_save_mode(false);              // WiFi normal mode (~100mA)
+                wifi_helper_set_power_save_mode(true);              // WiFi normal mode (~100mA) - (temporily in PS all the time)
                 wifi_helper_set_shutdown(false);                     // Ensure WiFi enabled
                 telemetry_enable_telemetry_publishing(true);         // Enable normal MQTT publishing
                 telemetry_force_realtime_monitoring_disable(false);  // Restore realtime mode user preference
@@ -98,7 +104,7 @@ void fluctus_handle_power_state_change(fluctus_power_state_t new_state)
                 tempesta_set_power_save_mode(false);   // Keep normal weather collection
                 tempesta_set_shutdown(false);          // Keep weather monitoring
                 tempesta_set_pms5003_enabled(true);    // Keep air quality sensor enabled
-                wifi_helper_set_power_save_mode(false);              // Keep WiFi normal mode
+                wifi_helper_set_power_save_mode(true);              // Keep WiFi normal mode - (temporily in PS all the time)
                 wifi_helper_set_shutdown(false);                     // Keep WiFi enabled
                 telemetry_enable_telemetry_publishing(true);         // Keep normal MQTT publishing enabled
                 telemetry_force_realtime_monitoring_disable(false);  // Keep realtime mode at user preference
@@ -127,8 +133,8 @@ void fluctus_handle_power_state_change(fluctus_power_state_t new_state)
                 tempesta_set_power_save_mode(true);    // 60min weather collection interval
                 tempesta_set_shutdown(false);          // Keep weather monitoring
                 tempesta_set_pms5003_enabled(false);   // Skip air quality sensor to save power
-                wifi_helper_set_power_save_mode(true);               // WiFi modem power save (~20mA avg)
-                wifi_helper_set_shutdown(false);                     // Keep WiFi for MQTT buffering
+                wifi_helper_set_power_save_mode(true);              // WiFi modem power save (~20mA avg)
+                wifi_helper_set_shutdown(false);                    // Keep WiFi for MQTT buffering
                 telemetry_enable_telemetry_publishing(false);       // Buffering only (SOC <15%)
                 telemetry_force_realtime_monitoring_disable(true);  // Force disable realtime mode
                 break;
@@ -139,7 +145,7 @@ void fluctus_handle_power_state_change(fluctus_power_state_t new_state)
                 stellaria_set_shutdown(true);          // Shutdown STELLARIA
                 impluvium_set_shutdown(true);          // Shutdown all irrigation operations
                 tempesta_set_shutdown(true);           // Shutdown weather monitoring
-                wifi_helper_set_shutdown(true);                      // Shutdown WiFi (save ~20mA)
+                wifi_helper_set_shutdown(true);                     // Shutdown WiFi (save ~20mA)
                 telemetry_enable_telemetry_publishing(false);       // Buffering only (critical power)
                 telemetry_force_realtime_monitoring_disable(true);  // Force disable realtime mode
                 if (system_status.solar_tracking_state != SOLAR_TRACKING_DISABLED) {
@@ -159,10 +165,6 @@ void fluctus_handle_power_state_change(fluctus_power_state_t new_state)
             default:
                 break;
         } 
-        xSemaphoreGive(xPowerBusMutex);
-    } else {
-        ESP_LOGE(TAG, "Failed to take xPowerBusMutex - fluctus_handle_power_state_change");
-    }
 }
 
 // ########################## Core Orchestration Task ##########################
@@ -289,13 +291,6 @@ esp_err_t fluctus_init(void)
         goto cleanup;
     }
 
-    // Initialize DS18B20 temperature sensor (non-critical - warn but continue on failure)
-    ret = fluctus_ds18b20_init();
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "DS18B20 initialization failed - temperature monitoring disabled");
-        // Don't goto cleanup - continue without temperature monitoring
-    }
-
     // Initialize system status
     memset(&system_status, 0, sizeof(fluctus_power_status_t));
     system_status.power_state = FLUCTUS_POWER_STATE_NORMAL;
@@ -363,7 +358,7 @@ esp_err_t fluctus_init(void)
     task_ret = xTaskCreate(
         fluctus_core_orchestration_task,
         "fluctus_core_orq",
-        2048,
+        3072,
         NULL,
         3,
         &xFluctusCoreOrchestrationTaskHandle
@@ -376,6 +371,15 @@ esp_err_t fluctus_init(void)
     }
 
     fluctus_initialized = true;
+
+    // Initialize DS18B20 temperature sensor (non-critical - warn but continue on failure)
+    // Must be done AFTER fluctus_initialized=true so it can request power bus
+    ret = fluctus_ds18b20_init();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "DS18B20 initialization failed - temperature monitoring disabled");
+        // Don't fail - continue without temperature monitoring
+    }
+
     ESP_LOGI(TAG, "FLUCTUS initialization complete");
     return ESP_OK;
     
@@ -576,14 +580,14 @@ esp_err_t fluctus_write_to_telemetry_cache(fluctus_snapshot_t *cache)
 
     // Energy statistics - hourly totals and peaks
     cache->current_hour_start = rtc_fluctus_accumulator.current_hour_start;
-    cache->pv_energy_wh_hour = rtc_fluctus_accumulator.pv_energy_wh_accumulator;
-    cache->battery_energy_wh_hour = rtc_fluctus_accumulator.battery_energy_wh_accumulator;
+    cache->pv_produced_wh_hour = rtc_fluctus_accumulator.pv_energy_wh_accumulator;
+    cache->battery_consumed_wh_hour = rtc_fluctus_accumulator.battery_energy_wh_accumulator;
     cache->pv_peak_w_hour = rtc_fluctus_accumulator.pv_peak_w_hour;
     cache->battery_peak_w_hour = rtc_fluctus_accumulator.battery_peak_w_hour;
 
     // Energy statistics - daily totals and peaks
     cache->current_day_start = rtc_fluctus_accumulator.current_day_start;
-    cache->pv_energy_wh_day = rtc_fluctus_accumulator.pv_energy_wh_day;
+    cache->pv_produced_wh_day = rtc_fluctus_accumulator.pv_produced_wh_day;
     cache->battery_consumed_wh_day = rtc_fluctus_accumulator.battery_consumed_wh_day;
     cache->pv_peak_w_day = rtc_fluctus_accumulator.pv_peak_w_day;
     cache->battery_peak_w_day = rtc_fluctus_accumulator.battery_peak_w_day;

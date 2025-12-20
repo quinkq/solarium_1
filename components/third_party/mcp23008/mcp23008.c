@@ -39,7 +39,7 @@
 #include <esp_idf_lib_helpers.h>
 #include "mcp23008.h"
 
-#define I2C_FREQ_HZ 1000000 // Max 1MHz for esp-idf, but device supports up to 1.7Mhz
+#define I2C_FREQ_HZ 400000 // Max 1MHz for esp-idf, but device supports up to 1.7Mhz
 
 #define REG_IODIR   0x00
 #define REG_IPOL    0x01
@@ -299,4 +299,14 @@ esp_err_t mcp23008_set_interrupt(i2c_dev_t *dev, uint8_t pin, mcp23008_gpio_intr
     CHECK_ARG(pin < 8);
 
     return mcp23008_port_set_interrupt(dev, BV(pin), intr);
+}
+
+esp_err_t mcp23008_port_get_interrupt_flags(i2c_dev_t *dev, uint8_t *val)
+{
+    return read_reg(dev, REG_INTF, val);
+}
+
+esp_err_t mcp23008_port_get_interrupt_capture(i2c_dev_t *dev, uint8_t *val)
+{
+    return read_reg(dev, REG_INTCAP, val);
 }

@@ -188,6 +188,11 @@ esp_err_t impluvium_set_pump_speed(uint32_t pwm_duty);
 esp_err_t impluvium_pump_ramp_up(uint8_t zone_id);
 void impluvium_pump_adaptive_control(float current_gain_rate, float target_gain_rate);
 
+// Valve control with logging and validation
+esp_err_t impluvium_open_valve(uint8_t zone_id);
+esp_err_t impluvium_close_valve(uint8_t zone_id);
+esp_err_t impluvium_close_all_valves(void);
+
 // --- Power Management Functions (impluvium.c) ---
 // Note: These are called from multiple modules
 typedef enum {

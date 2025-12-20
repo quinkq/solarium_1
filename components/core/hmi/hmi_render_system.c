@@ -13,6 +13,7 @@
 
 #include <stdio.h>
 #include <time.h>
+#include "esp_timer.h"
 
 // ########################## Main Menu ##########################
 
@@ -81,8 +82,8 @@ static void hmi_render_stellaria_menu(void)
 
     // Show quick status at bottom
     char buf[32];
-    snprintf(buf, sizeof(buf), "%s Int:%d%%",
-             data.driver_enabled ? "ON " : "OFF",
+    snprintf(buf, sizeof(buf), "Output %s Int:%d%%",
+             data.driver_output_enabled ? "ON " : "OFF",
              (data.current_intensity * 100) / 1023);
     hmi_fb_draw_string(2, 56, buf, false);
 }
@@ -158,21 +159,31 @@ static void hmi_render_stellaria_control_page(void)
 
     items[0] = "< Back";
 
-    // Enable/Disable item (shows current state)
+    // Enable/Disable item (shows user's setting and operational state)
     const char *state_str = "OFF";
-    if (data.auto_mode_active && data.state == STELLARIA_STATE_ENABLED) {
-        state_str = "AUTO";
+    if (data.state == STELLARIA_STATE_SHUTDOWN) {
+        state_str = "SHUTDOWN";  // Load shedding override
     } else if (data.state == STELLARIA_STATE_ENABLED) {
-        state_str = "ON";
-    } else if (data.state == STELLARIA_STATE_SHUTDOWN) {
-        state_str = "SHUTDOWN";
+        // System is enabled - check mode
+        if (data.auto_mode_active) {
+            state_str = "AUTO";  // Auto mode enabled
+        } else {
+            state_str = "ON";  // Manually enabled
+        }
+    } else {
+        // System is disabled (STELLARIA_STATE_DISABLED)
+        if (data.auto_mode_active) {
+            state_str = "AUTO (OFF)";  // Auto mode configured but disabled
+        } else {
+            state_str = "OFF";  // Manually disabled
+        }
     }
     snprintf(enable_text, sizeof(enable_text), "Enable: %s", state_str);
     items[1] = enable_text;
 
     // Intensity item (shows current or editing value)
     if (stellaria_intensity_editing) {
-        snprintf(intensity_text, sizeof(intensity_text), "Intensity: %d%% *", stellaria_intensity_percent);
+        snprintf(intensity_text, sizeof(intensity_text), "Intensity: %d%%", stellaria_intensity_percent);
     } else {
         uint8_t current_percent = (uint8_t)((data.target_intensity * 100) / 1023);
         snprintf(intensity_text, sizeof(intensity_text), "Intensity: %d%%", current_percent);
@@ -183,14 +194,24 @@ static void hmi_render_stellaria_control_page(void)
     int y = 14;
     for (int i = 0; i < 3; i++) {
         bool selected = (i == hmi_status.selected_item);
+        bool is_editable = (i == 2);  // Only Intensity is editable
 
-        // Selection indicator
-        if (selected) {
+        // Cursor logic: blink on editable field when selected
+        if (selected && is_editable) {
+            if (hmi_status.blink_state) {
+                hmi_fb_draw_string(2, y, ">", false);
+            }
+        } else if (selected) {
             hmi_fb_draw_string(2, y, ">", false);
         }
 
         // Item text
         hmi_fb_draw_string(8, y, items[i], selected);
+
+        // Draw blinking "*" separately (not inverted)
+        if (stellaria_intensity_editing && selected && is_editable && hmi_status.blink_state) {
+            hmi_fb_draw_string(104, y, "*", false);
+        }
 
         y += 14;  // Larger spacing for better visibility
     }
@@ -210,6 +231,9 @@ static void hmi_render_stellaria_auto_page(void)
 {
     stellaria_snapshot_t data;
     telemetry_get_stellaria_data(&data);
+
+    // Navigation symbols
+    hmi_draw_back_symbol();
 
     hmi_fb_draw_string(26, 2, "Auto Mode", false);
     hmi_fb_draw_hline(0, 10, 128);
@@ -241,11 +265,11 @@ static void hmi_render_stellaria_auto_page(void)
         // Item text
         hmi_fb_draw_string(8, y, items[i], selected);
 
-        y += 14;
+        y += 12;
     }
 
     // Status information (below menu)
-    y += 4;  // Extra spacing
+    y += 2;  // Extra spacing
     char buf[32];
 
     snprintf(buf, sizeof(buf), "Light: %.2fV", data.last_light_reading);
@@ -255,8 +279,6 @@ static void hmi_render_stellaria_auto_page(void)
     hmi_fb_draw_string(2, y, "Uses FLUCTUS", false);
     y += 8;
     hmi_fb_draw_string(2, y, "avg light", false);
-
-    hmi_fb_draw_string(2, 56, "Press to toggle", false);
 }
 
 // ########################## SYSTEM Pages ##########################
@@ -275,7 +297,7 @@ static void hmi_render_system_menu(void)
         "< Back",
         "System Info",
         "Controls",
-        "Intervals"
+        "Global Intervals"
     };
 
     int y = 14;
@@ -303,6 +325,9 @@ static void hmi_render_system_info_page(void)
     wifi_snapshot_t wifi_data;
     telemetry_get_wifi_data(&wifi_data);
 
+    // Navigation symbols
+    hmi_draw_back_symbol();
+
     // Title
     hmi_fb_draw_string(24, 2, "System Info", false);
     hmi_fb_draw_hline(0, 10, 128);
@@ -318,7 +343,7 @@ static void hmi_render_system_info_page(void)
     snprintf(buf, sizeof(buf), "WiFi: %s",
              wifi_state_str[wifi_data.state < 6 ? wifi_data.state : 0]);
     hmi_fb_draw_string(2, y, buf, false);
-    y += 10;
+    y += 9;
 
     // RSSI (only if connected)
     if (wifi_data.state == WIFI_STATE_CONNECTED && wifi_data.has_ip) {
@@ -327,28 +352,26 @@ static void hmi_render_system_info_page(void)
     } else {
         hmi_fb_draw_string(2, y, "RSSI: N/A", false);
     }
-    y += 10;
+    y += 9;
 
     // Reconnection count
     snprintf(buf, sizeof(buf), "Reconnects: %u", wifi_data.reconnect_count);
     hmi_fb_draw_string(2, y, buf, false);
-    y += 10;
+    y += 9;
 
     // Power save mode
     snprintf(buf, sizeof(buf), "Power Save: %s",
              wifi_data.power_save_mode ? "ON" : "OFF");
     hmi_fb_draw_string(2, y, buf, false);
-    y += 14;
+    y += 11;
 
-    // Uptime
-    uint32_t uptime_sec = (uint32_t)time(NULL);
+    // Uptime (use esp_timer for time since boot, not Unix timestamp)
+    uint64_t uptime_us = esp_timer_get_time();  // Microseconds since boot
+    uint32_t uptime_sec = (uint32_t)(uptime_us / 1000000ULL);
     uint32_t hours = uptime_sec / 3600;
     uint32_t minutes = (uptime_sec % 3600) / 60;
     snprintf(buf, sizeof(buf), "Uptime: %luh %lum", hours, minutes);
     hmi_fb_draw_string(2, y, buf, false);
-
-    // Navigation hint
-    hmi_fb_draw_string(2, 56, "Press to go back", false);
 }
 
 /**
@@ -363,7 +386,7 @@ static void hmi_render_system_controls_page(void)
     // Menu items
     const char *items[] = {
         "< Back",
-        "Flush & Reset",
+        "Flush buffer & Reset",
         "WiFi Reconnect"
     };
 
@@ -391,6 +414,9 @@ static void hmi_render_system_controls_page(void)
  */
 static void hmi_render_system_intervals_page(void)
 {
+    // Navigation symbols
+    hmi_draw_back_symbol();
+
     // Title
     hmi_fb_draw_string(22, 2, "Intervals", false);
     hmi_fb_draw_hline(0, 10, 128);
@@ -431,9 +457,6 @@ static void hmi_render_system_intervals_page(void)
 
         y += 10;  // Tighter spacing for 5 items
     }
-
-    // Help text at bottom
-    hmi_fb_draw_string(2, 56, "Press to apply", false);
 }
 
 // ########################## Shared Pages ##########################
@@ -481,7 +504,7 @@ static void hmi_render_confirm_page(void)
             message = "Safety override!";
             break;
         case CONFIRM_SYSTEM_FLUSH_RESET:
-            title = "Flush & Reset?";
+            title = "Flush->Flash & Reset?";
             message = "Save & restart MCU";
             break;
         default:

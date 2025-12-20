@@ -51,7 +51,7 @@ typedef struct {
     stellaria_state_t state;         // Current system state
     uint16_t current_intensity;      // Current PWM intensity (0-1023)
     uint16_t target_intensity;       // Target intensity requested
-    bool driver_enabled;             // Driver enable state
+    bool driver_output_enabled;             // Driver enable state
     bool initialized;                // Component initialization status
     bool auto_mode_active;           // Auto light sensing mode active
     bool power_save_mode;            // Power saving mode active (intensity limited)

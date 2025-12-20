@@ -14,7 +14,7 @@
 #include <math.h>
 #include <string.h>
 
-static const char *TAG = "IMPLUVIUM_LEARN";
+static const char *TAG = "IMPLUVIUM_LEARNING";
 
 /**
  * @brief Calculate dynamic moisture check interval based on temperature and power state
@@ -38,7 +38,7 @@ uint32_t impluvium_calc_moisture_check_interval(float current_temperature)
         interval = impluvium_power_save_interval_ms;
     }
     else if (current_temperature == WEATHER_INVALID_VALUE) {
-        ESP_LOGW(TAG, "Invalid temperature - using optimal interval as fallback");
+        ESP_LOGW(TAG, "Invalid temperature - using ""optimal interval"" as fallback");
         interval = impluvium_optimal_interval_ms;
     }
     else if (current_temperature < MIN_TEMPERATURE_WATERING) {

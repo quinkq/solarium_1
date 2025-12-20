@@ -33,7 +33,7 @@ esp_err_t impluvium_pre_check(void)
     float current_temperature = tempesta_get_temperature();
 
     if (current_temperature == WEATHER_INVALID_VALUE) {
-        ESP_LOGE(TAG, "Pre-check failed: Temperature sensors unavailable");
+        ESP_LOGW(TAG, "Pre-check skipped: Temperature sensors not ready (TEMPESTA disabled or initializing)");
         return ESP_FAIL;
     }
 
@@ -441,12 +441,19 @@ esp_err_t emergency_diagnostics_test_zone(uint8_t zone_id)
 {
     FLUCTUS_REQUEST_BUS_OR_FAIL(POWER_BUS_12V, "IMPLUVIUM_DIAG", return ESP_FAIL);
 
-    if (zone_id >= IRRIGATION_ZONE_COUNT) {
-        ESP_LOGE(TAG, "Invalid zone for diagnostics: %d", zone_id);
-        return ESP_ERR_INVALID_ARG;
+    // Request level shifter enable for valve/pump control signals
+    if (fluctus_request_level_shifter("IMPLUVIUM_DIAG") != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to enable level shifter for diagnostic test");
+        fluctus_release_bus_power(POWER_BUS_12V, "IMPLUVIUM_DIAG");
+        return ESP_FAIL;
     }
 
-    irrigation_zone_t *zone = &irrigation_zones[zone_id];
+    if (zone_id >= IRRIGATION_ZONE_COUNT) {
+        ESP_LOGE(TAG, "Invalid zone for diagnostics: %d", zone_id);
+        fluctus_release_level_shifter("IMPLUVIUM_DIAG");
+        fluctus_release_bus_power(POWER_BUS_12V, "IMPLUVIUM_DIAG");
+        return ESP_ERR_INVALID_ARG;
+    }
 
     ESP_LOGI(TAG,
              "Testing zone %d (diagnostic cycle %d)...",
@@ -454,14 +461,16 @@ esp_err_t emergency_diagnostics_test_zone(uint8_t zone_id)
              irrigation_system.emergency.test_cycle_count + 1);
 
     // Open valve for this zone
-    gpio_set_level(zone->valve_gpio, 1);
+    impluvium_open_valve(zone_id);
     vTaskDelay(pdMS_TO_TICKS(VALVE_OPEN_DELAY_MS)); // Wait for valve to open
 
     // Start pump at reduced speed for safety
     esp_err_t ret = impluvium_set_pump_speed(PUMP_MIN_DUTY);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to start pump for zone %d test", zone_id);
-        gpio_set_level(zone->valve_gpio, 0);
+        impluvium_close_valve(zone_id);
+        fluctus_release_level_shifter("IMPLUVIUM_DIAG");
+        fluctus_release_bus_power(POWER_BUS_12V, "IMPLUVIUM_DIAG");
         irrigation_system.emergency.failed_zones_mask |= (1U << zone_id);
         irrigation_system.emergency.test_flow_rates[zone_id] = 0.0f;
         irrigation_system.emergency.test_pressures[zone_id] = 0.0f;
@@ -497,7 +506,8 @@ esp_err_t emergency_diagnostics_test_zone(uint8_t zone_id)
     // Stop pump and close valve
     impluvium_set_pump_speed(0);
     vTaskDelay(pdMS_TO_TICKS(PRESSURE_EQUALIZE_DELAY_MS)); // Wait for outlet pressure to drop
-    gpio_set_level(zone->valve_gpio, 0);
+    impluvium_close_valve(zone_id);
+    fluctus_release_level_shifter("IMPLUVIUM_DIAG");
     fluctus_release_bus_power(POWER_BUS_12V, "IMPLUVIUM_DIAG");
 
     // Store test results
@@ -711,7 +721,11 @@ void impluvium_monitoring_task(void *pvParameters)
                         ULONG_MAX,
                         &notification_value,
                         continuous_monitoring ? pdMS_TO_TICKS(MONITORING_INTERVAL_MS) : portMAX_DELAY);
-
+                        
+        // Monitor stack usage (debug - watermark shows minimum free stack ever reached)
+        UBaseType_t stack_high_water = uxTaskGetStackHighWaterMark(NULL);
+        ESP_LOGI(TAG, "[STACK] High water mark: %u bytes free (min ever)", stack_high_water * sizeof(StackType_t));
+        
         // Handle specific notifications
         if (notification_value & MONITORING_TASK_NOTIFY_START_MONITORING) {
             ESP_LOGI(task_tag, "Starting continuous monitoring for watering");
@@ -730,6 +744,14 @@ void impluvium_monitoring_task(void *pvParameters)
         if (continuous_monitoring) {
             // Take mutex before accessing any shared data
             if (xSemaphoreTake(xIrrigationMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                // Check for load shedding shutdown request (highest priority - abort immediately)
+                if (irrigation_system.load_shed_shutdown) {
+                    ESP_LOGW(task_tag, "Load shedding shutdown detected - stopping monitoring immediately");
+                    xSemaphoreGive(xIrrigationMutex);
+                    continuous_monitoring = false;
+                    continue;
+                }
+
                 // Double-check state inside mutex to handle race conditions
                 if (irrigation_system.state != IMPLUVIUM_WATERING) {
                     xSemaphoreGive(xIrrigationMutex);

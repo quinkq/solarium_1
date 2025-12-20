@@ -6,6 +6,9 @@ managed_components/
 main/wifi_credentials.h
 CLAUDE.md
 .claude
+monitor_rolling_native.ps1
+logs/*.log
+logs/*.txt
 
 components/helpers/abp/abp_example.c
 components/helpers/abp/README.md
@@ -18,8 +21,4 @@ components/core/hmi/HMI_SPLIT_TODO.md
 
 components/helpers/interval_config/MQTT_INTERVAL_COMMANDS.md
 components/helpers/interval_config/INTERVAL_ADJUSTMENT_TODO.md
-components/core/tempesta/TEMPESTA_SPLIT_TODO.md
 components/core/telemetry/TELEMETRY_SPLIT_TODO.md
-components/core/impluvium/IMPLUVIUM_SPLIT_TODO.md
-components/core/fluctus/FLUCTUS_SPLIT_TODO.md
-components/third_party/mcp23008/MCP23008_MIGRATION_PLAN.md

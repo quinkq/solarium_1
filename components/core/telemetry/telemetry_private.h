@@ -2,7 +2,9 @@
 #define TELEMETRY_PRIVATE_H
 
 #include "telemetry.h"
+#ifdef CONFIG_TELEMETRY_MQTT_ENABLE
 #include "mqtt_client.h"
+#endif
 
 #include "esp_log.h"
 #include <stdio.h>
@@ -28,6 +30,7 @@ extern SemaphoreHandle_t xTelemetryMutexes[TELEMETRY_SRC_COUNT];
 extern SemaphoreHandle_t xBufferMutex;
 extern SemaphoreHandle_t xFlashMutex;
 
+#ifdef CONFIG_TELEMETRY_MQTT_ENABLE
 // MQTT infrastructure
 extern esp_mqtt_client_handle_t mqtt_client;
 extern bool mqtt_connected;
@@ -37,6 +40,7 @@ extern TaskHandle_t mqtt_task_handle;
 extern volatile int in_flight_msg_id;
 extern volatile uint32_t in_flight_seq;
 extern volatile uint16_t in_flight_tail_index;
+#endif
 
 // Control flags
 extern bool realtime_mode_enabled;
@@ -140,13 +144,16 @@ esp_err_t telemetry_msgpack_encode_wifi(const wifi_snapshot_t *data,
                              uint8_t *output, uint16_t *output_len,
                              uint16_t max_len);
 
+// Public API for component data injection (telemetry.c)
+// Always available - performs cache writes, optionally notifies MQTT task when enabled
+esp_err_t telemetry_fetch_snapshot(telemetry_source_t src);
+
+#ifdef CONFIG_TELEMETRY_MQTT_ENABLE
 // MQTT Client (telemetry_mqtt_client.c)
 esp_err_t telemetry_mqtt_client_init(void);
 void telemetry_mqtt_event_handler(void *handler_args, esp_event_base_t base,
                        int32_t event_id, void *event_data);
 void telemetry_mqtt_publish_task(void *parameters);
-
-// Public API, but internal to orchestrator
-esp_err_t telemetry_fetch_snapshot(telemetry_source_t src);  
+#endif
 
 #endif // TELEMETRY_PRIVATE_H

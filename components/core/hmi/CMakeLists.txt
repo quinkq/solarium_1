@@ -12,4 +12,5 @@ idf_component_register(
         stellaria
         interval_config
         wifi_helper
+        mcp23008_helper
 )

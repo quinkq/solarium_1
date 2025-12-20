@@ -34,13 +34,15 @@ static const char *TAG = "TEMPESTA_WIND";
  */
 void tempesta_as5600_sampling_task(void *pvParameters)
 {
-    ESP_LOGI(TAG, "AS5600 wind speed sampling task started");
+    ESP_LOGI(TAG, "AS5600 wind speed task started, waiting for a trigger");
 
     while (1) {
         // Wait for sampling trigger
         uint32_t notification_value = 0;
         xTaskNotifyWait(0x00, ULONG_MAX, &notification_value, portMAX_DELAY);
-
+        // Monitor stack usage (debug - watermark shows minimum free stack ever reached)
+        UBaseType_t stack_high_water = uxTaskGetStackHighWaterMark(NULL);
+        ESP_LOGI(TAG, "[STACK] High water mark: %u bytes free (min ever)", stack_high_water * sizeof(StackType_t));
         ESP_LOGI(TAG, "Starting AS5600 sampling for wind speed");
 
         // Wake AS5600 to normal mode for active sampling

@@ -95,9 +95,17 @@ esp_err_t impluvium_state_measuring(void)
 
     // Perform pre-start safety checks directly
     if (impluvium_pre_check() != ESP_OK) {
-        ESP_LOGE(TAG, "Pre-start safety check failed.");
         impluvium_release_power_buses(POWER_ONLY_SENSORS, "IMPLUVIUM");
-        impluvium_change_state(IMPLUVIUM_MAINTENANCE);
+
+        // If emergency_stop was triggered, go to MAINTENANCE for diagnostics
+        // Otherwise, it's just "not ready" (sensors unavailable) - return to STANDBY
+        if (irrigation_system.emergency_stop) {
+            ESP_LOGW(TAG, "Pre-check failed with safety violation - entering maintenance");
+            impluvium_change_state(IMPLUVIUM_MAINTENANCE);
+        } else {
+            ESP_LOGW(TAG, "Pre-check failed - system not ready, returning to standby");
+            impluvium_change_state(IMPLUVIUM_STANDBY);
+        }
         return ESP_FAIL;
     }
 
@@ -227,23 +235,39 @@ esp_err_t impluvium_state_watering(void)
 
     // Request 12V power for valve & pump operation (sensors already powered from measuring state)
     FLUCTUS_REQUEST_BUS_OR_FAIL(POWER_BUS_12V, "IMPLUVIUM", {
-        gpio_set_level(zone->valve_gpio, 0);
+        impluvium_close_valve(zone_id);
         impluvium_release_power_buses(POWER_ONLY_SENSORS, "IMPLUVIUM");
         impluvium_change_state(IMPLUVIUM_MAINTENANCE);
         return ESP_FAIL;
     });
 
-    // Request STELLARIA to dim lights for power management during irrigation
-    stellaria_request_irrigation_dim(true);
+    // Request level shifter enable for valve/pump control signals (SN74AHCT125)
+    if (fluctus_request_level_shifter("IMPLUVIUM") != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to enable level shifter for zone %d", zone_id);
+        impluvium_close_valve(zone_id);
+        impluvium_release_power_buses(POWER_ALL_DEVICES, "IMPLUVIUM");
+        impluvium_change_state(IMPLUVIUM_MAINTENANCE);
+        return ESP_FAIL;
+    }
 
-    // Open valve
-    gpio_set_level(zone->valve_gpio, 1);
-    vTaskDelay(pdMS_TO_TICKS(VALVE_OPEN_DELAY_MS)); // Wait for valve to open
+    // Request STELLARIA to dim lights for power management during irrigation
+    esp_err_t ret = stellaria_request_irrigation_dim(true);
+    if(ret != ESP_OK) {
+        ESP_LOGI(TAG, "Skiping STELLARIA dimming...");
+    } else {
+        ESP_LOGI(TAG, "STELLARIA dimming active - delaying for 1s.");
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+
+    // Open valve and wait for actuation
+    impluvium_open_valve(zone_id);
+    vTaskDelay(pdMS_TO_TICKS(VALVE_OPEN_DELAY_MS));
 
     // Ramp up pump speed
     if (impluvium_pump_ramp_up(zone_id) != ESP_OK) {
         ESP_LOGE(TAG, "Pump ramp-up failed for zone %d, turning off power buses", zone_id);
-        gpio_set_level(zone->valve_gpio, 0);
+        impluvium_close_valve(zone_id);
+        fluctus_release_level_shifter("IMPLUVIUM");
         impluvium_release_power_buses(POWER_ALL_DEVICES, "IMPLUVIUM");
         impluvium_change_state(IMPLUVIUM_MAINTENANCE);
         return ESP_FAIL;
@@ -289,11 +313,14 @@ esp_err_t impluvium_state_stopping(void)
 
     // Close current zone valve
     if (active_zone < IRRIGATION_ZONE_COUNT) {
-        gpio_set_level(irrigation_zones[active_zone].valve_gpio, 0);
+        impluvium_close_valve(active_zone);
         irrigation_zones[active_zone].watering_in_progress = false;
     } else {
         ESP_LOGE(TAG, "Invalid active zone in STOPPING state: %d", active_zone);
     }
+
+    // Release level shifter after valves closed and pump stopped
+    fluctus_release_level_shifter("IMPLUVIUM");
 
     // Calculate volume used and update learning algorithm
     if (active_zone < IRRIGATION_ZONE_COUNT && irrigation_system.queue_index < irrigation_system.watering_queue_size) {

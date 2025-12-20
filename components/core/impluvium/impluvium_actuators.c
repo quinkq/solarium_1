@@ -8,6 +8,7 @@
 
 #include "impluvium.h"
 #include "impluvium_private.h"
+#include "fluctus.h"
 #include "driver/ledc.h"
 #include "driver/gpio.h"
 #include "driver/pulse_cnt.h"
@@ -144,7 +145,7 @@ esp_err_t impluvium_flow_sensor_init(void)
         return ret;
     }
 
-    ESP_LOGI(TAG, "Flow sensor initialized - GPIO19, pulse counting");
+    ESP_LOGI(TAG, "Flow sensor initialized - GPIO%d, pulse counting", FLOW_SENSOR_GPIO);
     return ESP_OK;
 }
 
@@ -239,5 +240,78 @@ void impluvium_pump_adaptive_control(float current_gain_rate, float target_gain_
         ESP_LOGD(TAG, "Decreasing pump speed: %.2f > %.2f %%/sec", current_gain_rate, target_gain_rate);
     }
 
+    // Verify 12V bus is still powered before adjusting pump speed
+    // (FLUCTUS may revoke bus power during load shedding)
+    if (!fluctus_is_bus_powered(POWER_BUS_12V)) {
+        ESP_LOGE(TAG, "12V bus power lost - cannot adjust pump speed! Aborting.");
+        // Emergency stop will be triggered by load shedding callback
+        return;
+    }
+
     impluvium_set_pump_speed(new_duty);
+}
+
+/**
+ * @brief Open valve for specified zone with logging
+ *
+ * Provides centralized valve control with validation and logging.
+ * Ensures consistent actuation behavior across all watering operations.
+ *
+ * @param zone_id Zone identifier (0-4)
+ * @return ESP_OK on success, ESP_ERR_INVALID_ARG if zone_id invalid
+ */
+esp_err_t impluvium_open_valve(uint8_t zone_id)
+{
+    if (zone_id >= IRRIGATION_ZONE_COUNT) {
+        ESP_LOGE(TAG, "Invalid zone_id for valve open: %d", zone_id);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    gpio_set_level(irrigation_zones[zone_id].valve_gpio, 1);
+    ESP_LOGI(TAG, "Valve OPENED for zone %d (GPIO%d)", zone_id, irrigation_zones[zone_id].valve_gpio);
+
+    return ESP_OK;
+}
+
+/**
+ * @brief Close valve for specified zone with logging
+ *
+ * Provides centralized valve control with validation and logging.
+ * Safe to call multiple times (idempotent).
+ *
+ * @param zone_id Zone identifier (0-4)
+ * @return ESP_OK on success, ESP_ERR_INVALID_ARG if zone_id invalid
+ */
+esp_err_t impluvium_close_valve(uint8_t zone_id)
+{
+    if (zone_id >= IRRIGATION_ZONE_COUNT) {
+        ESP_LOGE(TAG, "Invalid zone_id for valve close: %d", zone_id);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    gpio_set_level(irrigation_zones[zone_id].valve_gpio, 0);
+    ESP_LOGI(TAG, "Valve CLOSED for zone %d (GPIO%d)", zone_id, irrigation_zones[zone_id].valve_gpio);
+
+    return ESP_OK;
+}
+
+/**
+ * @brief Emergency close all valves (safety function)
+ *
+ * Closes all zone valves regardless of current state.
+ * Used during emergency shutdown and system initialization.
+ *
+ * @return ESP_OK on success
+ */
+esp_err_t impluvium_close_all_valves(void)
+{
+    ESP_LOGW(TAG, "Closing ALL valves (emergency/safety procedure)");
+
+    for (uint8_t i = 0; i < IRRIGATION_ZONE_COUNT; i++) {
+        gpio_set_level(irrigation_zones[i].valve_gpio, 0);
+        ESP_LOGD(TAG, "  Zone %d valve closed (GPIO%d)", i, irrigation_zones[i].valve_gpio);
+    }
+
+    ESP_LOGI(TAG, "All %d valves confirmed closed", IRRIGATION_ZONE_COUNT);
+    return ESP_OK;
 }

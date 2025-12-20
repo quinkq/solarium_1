@@ -22,6 +22,7 @@
 
 #include "ads1115_helper.h"
 #include "fluctus.h"
+#include "main.h"
 #include "esp_log.h"
 #include "freertos/task.h"
 #include <string.h>
@@ -34,8 +35,8 @@ static const char *TAG = "ADS1115_HELPER";
 static const uint8_t ads1115_addresses[ADS1115_DEVICE_COUNT] = {
     ADS111X_ADDR_GND, // 0x48 - Moisture sensors Zone 0 - 4 (Dev#0)
     ADS111X_ADDR_VCC, // 0x49 - Zone5 moisture + pressure + 3v3 Bus voltage (Dev#1)
-    ADS111X_ADDR_SDA, // 0x4A - Photoresistor array (Dev#2)
-    ADS111X_ADDR_SCL  // 0x4B - Hall sensor array (Dev#3)
+    ADS111X_ADDR_SCL, // 0x4A - Photoresistor array (Dev#2)
+    ADS111X_ADDR_SDA  // 0x4B - Hall sensor array (Dev#3)
 };
 
 // ########################## Private Variables ##########################
@@ -84,7 +85,7 @@ ads1115_device_t ads1115_devices[ADS1115_DEVICE_COUNT] = {
     }
 };
 
-// Latest voltage readings for display and sharing
+// Latest voltage readings for debug display and sharing
 static float latest_voltages[ADS1115_DEVICE_COUNT][4] = {
     {-999.9, -999.9, -999.9, -999.9}, // Dev#0: Moisture sensors
     {-999.9, -999.9, -999.9, -999.9}, // Dev#1: Mixed
@@ -123,25 +124,25 @@ static esp_err_t ads1115_helper_init_device(uint8_t device_id)
     }
 
     // Request 3.3V bus power for I2C communication (reference counting handles overlaps)
-    esp_err_t power_ret = fluctus_request_bus_power(POWER_BUS_3V3, "ADS1115_INIT_DEV");
+    esp_err_t power_ret = fluctus_request_bus_power(POWER_BUS_3V3, "ADS1115_INI_DEV");
     if (power_ret != ESP_OK) {
         ESP_LOGD(TAG, "[Dev %d] 3.3V bus unavailable: %s", device_id, esp_err_to_name(power_ret));
         return ESP_ERR_INVALID_STATE;
     }
-    vTaskDelay(pdMS_TO_TICKS(10));  // Brief stabilization delay
+    vTaskDelay(pdMS_TO_TICKS(50));  // Power-up stabilization delay (increased from 10ms)
 
     i2c_dev_t *dev = &ads1115_devices[device_id].device;
     esp_err_t ret;
 
-    // 1. Initialize descriptor
+    // 1. Initialize descriptor (Bus B - toggled power)
     ret = ads111x_init_desc(dev,
                             ads1115_addresses[device_id],
-                            ADS1115_I2C_PORT,
-                            CONFIG_I2CDEV_DEFAULT_SDA_PIN,
-                            CONFIG_I2CDEV_DEFAULT_SCL_PIN);
+                            I2C_BUS_B_PORT,
+                            I2C_BUS_B_SDA_PIN,
+                            I2C_BUS_B_SCL_PIN);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "[Dev %d] Failed ads111x_init_desc: %s", device_id, esp_err_to_name(ret));
-        fluctus_release_bus_power(POWER_BUS_3V3, "ADS1115_INIT_DEV");
+        fluctus_release_bus_power(POWER_BUS_3V3, "ADS1115_INI_DEV");
         return ret;
     }
 
@@ -150,35 +151,43 @@ static esp_err_t ads1115_helper_init_device(uint8_t device_id)
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "[Dev %d] Failed ads111x_set_mode: %s", device_id, esp_err_to_name(ret));
         ads111x_free_desc(dev); // Cleanup on failure
-        fluctus_release_bus_power(POWER_BUS_3V3, "ADS1115_INIT_DEV");
+        fluctus_release_bus_power(POWER_BUS_3V3, "ADS1115_INI_DEV");
         return ret;
     }
+    vTaskDelay(pdMS_TO_TICKS(10));  // Allow any inadvertent conversion to clear
 
     // 3. Set data rate (use device-specific configuration)
     ret = ads111x_set_data_rate(dev, ads1115_devices[device_id].data_rate);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "[Dev %d] Failed ads111x_set_data_rate: %s", device_id, esp_err_to_name(ret));
         ads111x_free_desc(dev); // Cleanup on failure
-        fluctus_release_bus_power(POWER_BUS_3V3, "ADS1115_INIT_DEV");
+        fluctus_release_bus_power(POWER_BUS_3V3, "ADS1115_INI_DEV");
         return ret;
     }
+    vTaskDelay(pdMS_TO_TICKS(10));  // Allow any inadvertent conversion to clear
 
     // 4. Set gain (use device-specific configuration)
     ret = ads111x_set_gain(dev, ads1115_devices[device_id].gain);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "[Dev %d] Failed ads111x_set_gain: %s", device_id, esp_err_to_name(ret));
         ads111x_free_desc(dev); // Cleanup on failure
-        fluctus_release_bus_power(POWER_BUS_3V3, "ADS1115_INIT_DEV");
+        fluctus_release_bus_power(POWER_BUS_3V3, "ADS1115_INI_DEV");
         return ret;
     }
+    vTaskDelay(pdMS_TO_TICKS(10));  // Allow any inadvertent conversion to clear
 
     // 5. Test read to verify device is responsive
+    // For 16 SPS devices: 62.5ms conversion time + margin
+    // For 128 SPS devices: 7.8ms conversion time + margin
+    uint32_t conversion_delay_ms = (ads1115_devices[device_id].data_rate == ADS111X_DATA_RATE_16) ? 80 : 20;
+
     int16_t test_raw;
     ret = ads111x_set_input_mux(dev, ADS111X_MUX_0_GND);
     if (ret == ESP_OK) {
+        vTaskDelay(pdMS_TO_TICKS(10));  // Allow mux change to settle
         ret = ads111x_start_conversion(dev);
         if (ret == ESP_OK) {
-            vTaskDelay(pdMS_TO_TICKS(50)); // Wait for conversion
+            vTaskDelay(pdMS_TO_TICKS(conversion_delay_ms));  // Wait for conversion based on data rate
             ret = ads111x_get_value(dev, &test_raw);
         }
     }
@@ -186,14 +195,14 @@ static esp_err_t ads1115_helper_init_device(uint8_t device_id)
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "[Dev %d] Failed test read: %s", device_id, esp_err_to_name(ret));
         ads111x_free_desc(dev); // Cleanup on failure
-        fluctus_release_bus_power(POWER_BUS_3V3, "ADS1115_INIT_DEV");
+        fluctus_release_bus_power(POWER_BUS_3V3, "ADS1115_INI_DEV");
         return ret;
     }
 
     ESP_LOGD(TAG, "[Dev %d] Test read successful (raw: %d)", device_id, test_raw);
 
     // Release power - init complete
-    fluctus_release_bus_power(POWER_BUS_3V3, "ADS1115_INIT_DEV");
+    fluctus_release_bus_power(POWER_BUS_3V3, "ADS1115_INI_DEV");
     return ESP_OK;
 }
 
@@ -205,12 +214,12 @@ static esp_err_t ads1115_helper_init_device(uint8_t device_id)
 static bool retry_all_failed_devices(void)
 {
     // Check if 3.3V bus is available before attempting (power-aware)
-    esp_err_t power_check = fluctus_request_bus_power(POWER_BUS_3V3, "ADS1115_RETRY_CHECK");
+    esp_err_t power_check = fluctus_request_bus_power(POWER_BUS_3V3, "ADS1115_RETRY");
     if (power_check != ESP_OK) {
         ESP_LOGD(TAG, "3.3V bus unavailable for device retry, deferring");
         return true;  // Still have failed devices, but can't retry now
     }
-    fluctus_release_bus_power(POWER_BUS_3V3, "ADS1115_RETRY_CHECK");  // Release immediately, init_device will request again
+    fluctus_release_bus_power(POWER_BUS_3V3, "ADS1115_RETRY");  // Release immediately, init_device will request again
 
     bool any_failed = false;
     uint8_t working_count = 0;
@@ -436,6 +445,11 @@ esp_err_t ads1115_helper_init(void)
 
 esp_err_t ads1115_helper_read_channel(uint8_t device_id, ads111x_mux_t channel, int16_t *raw, float *voltage)
 {
+    if (!ads1115_helper_initialized) {
+    ESP_LOGD(TAG, "[Dev %d] System init in progress, skipping read", device_id);
+    return ESP_ERR_INVALID_STATE;  // Same return as "device not initialized"
+    }
+
     if (!raw) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -452,9 +466,9 @@ esp_err_t ads1115_helper_read_channel(uint8_t device_id, ads111x_mux_t channel, 
     }
 
     // Request 3.3V bus power for I2C communication (reference counting handles overlaps)
-    esp_err_t power_ret = fluctus_request_bus_power(POWER_BUS_3V3, "ADS1115_READ");
+    esp_err_t power_ret = fluctus_request_bus_power(POWER_BUS_3V3, "ADS1115_CH_READ");
     if (power_ret != ESP_OK) {
-        ESP_LOGD(TAG, "[Dev %d] 3.3V bus unavailable: %s", device_id, esp_err_to_name(power_ret));
+        ESP_LOGW(TAG, "[Dev %d] 3.3V bus unavailable: %s", device_id, esp_err_to_name(power_ret));
         return ESP_ERR_INVALID_STATE;
     }
     vTaskDelay(pdMS_TO_TICKS(10));  // Brief stabilization delay
@@ -471,7 +485,23 @@ esp_err_t ads1115_helper_read_channel(uint8_t device_id, ads111x_mux_t channel, 
             goto retry_delay;
         }
 
-        // 1. Set MUX (channel selection)
+        // 1. Reconfigure device settings (required after power cycle of 3.3V bus)
+        // ADS1115 resets to defaults (±2.048V gain, 128 SPS) when power is lost
+        ret = ads111x_set_gain(dev, ads1115_devices[device_id].gain);
+        if (ret != ESP_OK) {
+            ESP_LOGD(TAG, "[Dev %d] Attempt %d: Failed to set gain: %s", device_id, attempt + 1, esp_err_to_name(ret));
+            xSemaphoreGive(xADS1115Mutex);
+            goto retry_delay;
+        }
+
+        ret = ads111x_set_data_rate(dev, ads1115_devices[device_id].data_rate);
+        if (ret != ESP_OK) {
+            ESP_LOGD(TAG, "[Dev %d] Attempt %d: Failed to set data rate: %s", device_id, attempt + 1, esp_err_to_name(ret));
+            xSemaphoreGive(xADS1115Mutex);
+            goto retry_delay;
+        }
+
+        // 2. Set MUX (channel selection)
         ret = ads111x_set_input_mux(dev, channel);
         if (ret != ESP_OK) {
             ESP_LOGD(TAG, "[Dev %d] Attempt %d: Failed to set MUX: %s", device_id, attempt + 1, esp_err_to_name(ret));
@@ -479,7 +509,11 @@ esp_err_t ads1115_helper_read_channel(uint8_t device_id, ads111x_mux_t channel, 
             goto retry_delay;
         }
 
-        // 2. Start Conversion
+        // MUX settling time: Allow input capacitor to charge after channel switch
+        // 10ms is sufficient for RC settling (1kΩ * pF input cap = sub-ms time constant)
+        vTaskDelay(pdMS_TO_TICKS(10));
+
+        // 3. Start Conversion
         ret = ads111x_start_conversion(dev);
         if (ret != ESP_OK) {
             ESP_LOGD(TAG, "[Dev %d] Attempt %d: Failed to start conversion: %s", device_id, attempt + 1, esp_err_to_name(ret));
@@ -487,43 +521,16 @@ esp_err_t ads1115_helper_read_channel(uint8_t device_id, ads111x_mux_t channel, 
             goto retry_delay;
         }
 
-        // MUX settling time: Allow input capacitor to charge after channel switch
-        // Worst-case RC settling: 1MΩ (dark photoresistor) × 1nF (input cap) = 1ms
-        vTaskDelay(pdMS_TO_TICKS(1));
+        // 4. Wait for conversion to complete using fixed delay
+        // Note: OS bit polling doesn't work reliably on some ADS1115 modules, so we use
+        // fixed delays based on the data rate. This is more deterministic and avoids
+        // I2C bus contention from repeated config register polling.
+        // Conversion times: 16 SPS = 62.5ms, 128 SPS = 7.8ms
+        // Add ~12% margin for oscillator tolerance
+        uint32_t conversion_delay_ms = (ads1115_devices[device_id].data_rate == ADS111X_DATA_RATE_16) ? 70 : 15;
+        vTaskDelay(pdMS_TO_TICKS(conversion_delay_ms));
 
-        // 3. Wait for conversion to complete (with timeout)
-        bool conversion_failed = false;
-        int conversion_timeout_ms = 100;
-        int delay_ms = 5;
-        int elapsed_ms = 0;
-        bool busy = true;
-
-        while (busy) {
-            ret = ads111x_is_busy(dev, &busy);
-            if (ret != ESP_OK) {
-                ESP_LOGD(TAG, "[Dev %d] Attempt %d: Failed to check busy status: %s", device_id, attempt + 1, esp_err_to_name(ret));
-                conversion_failed = true;
-                break;
-            }
-
-            if (busy) {
-                vTaskDelay(pdMS_TO_TICKS(delay_ms));
-                elapsed_ms += delay_ms;
-                if (elapsed_ms > conversion_timeout_ms) {
-                    ESP_LOGD(TAG, "[Dev %d] Attempt %d: Conversion timeout after %d ms", device_id, attempt + 1, conversion_timeout_ms);
-                    ret = ESP_ERR_TIMEOUT;
-                    conversion_failed = true;
-                    break;
-                }
-            }
-        }
-
-        if (conversion_failed) {
-            xSemaphoreGive(xADS1115Mutex);
-            goto retry_delay;
-        }
-
-        // 4. Read Value
+        // 5. Read Value
         ret = ads111x_get_value(dev, raw);
         if (ret != ESP_OK) {
             ESP_LOGD(TAG, "[Dev %d] Attempt %d: Failed to get value: %s", device_id, attempt + 1, esp_err_to_name(ret));
@@ -531,10 +538,13 @@ esp_err_t ads1115_helper_read_channel(uint8_t device_id, ads111x_mux_t channel, 
             goto retry_delay;
         }
 
-        // 5. Calculate Voltage (if requested)
+        // 6. Calculate Voltage (if requested)
         float calculated_voltage = 0.0;
         if (voltage || (device_id < ADS1115_DEVICE_COUNT && channel < 4)) {
-            calculated_voltage = (*raw / (float) ADS111X_MAX_VALUE) * ADS1115_GAIN;
+            // Use per-device gain setting for voltage calculation
+            // ads111x_gain_values[] converts enum (0-7) to actual voltage (6.144V - 0.256V)
+            float gain_voltage = ads111x_gain_values[ads1115_devices[device_id].gain];
+            calculated_voltage = (*raw / (float) ADS111X_MAX_VALUE) * gain_voltage;
             if (voltage) {
                 *voltage = calculated_voltage;
             }
@@ -548,7 +558,7 @@ esp_err_t ads1115_helper_read_channel(uint8_t device_id, ads111x_mux_t channel, 
 
         // Success!
         xSemaphoreGive(xADS1115Mutex);
-        fluctus_release_bus_power(POWER_BUS_3V3, "ADS1115_READ");
+        fluctus_release_bus_power(POWER_BUS_3V3, "ADS1115_CH_READ");
 
         if (attempt > 0) {
             ESP_LOGD(TAG, "[Dev %d] Read succeeded on attempt %d", device_id, attempt + 1);
@@ -567,7 +577,7 @@ retry_delay:
     ads1115_devices[device_id].initialized = false;
     xTaskNotify(xADS1115RetryTaskHandle, 1, eSetBits);
 
-    fluctus_release_bus_power(POWER_BUS_3V3, "ADS1115_READ");
+    fluctus_release_bus_power(POWER_BUS_3V3, "ADS1115_CH_READ");
     return ret;
 }
 

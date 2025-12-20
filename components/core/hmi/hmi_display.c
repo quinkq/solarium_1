@@ -16,6 +16,7 @@
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_vendor.h"
 #include "esp_lcd_panel_ops.h"
+#include "mcp23008_helper.h"
 
 
 
@@ -156,6 +157,13 @@ static esp_lcd_panel_handle_t panel_handle = NULL;
 esp_err_t hmi_display_init(void)
 {
     ESP_LOGI(TAG, "Initializing SH1106 OLED display (SPI)...");
+    // Perform hardware reset via MCP23008 GP6
+    ESP_LOGI(TAG, "Performing hardware reset via MCP23008 GP6...");
+    esp_err_t ret = mcp23008_helper_oled_reset_pulse();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to reset display: %s", esp_err_to_name(ret));        
+        return ret;
+    }
 
     // Configure SPI panel IO (shares SPI2_HOST with ABP sensor - bus initialized in main.c)
     esp_lcd_panel_io_spi_config_t io_config = {
@@ -168,7 +176,7 @@ esp_err_t hmi_display_init(void)
         .trans_queue_depth = 10,
     };
 
-    esp_err_t ret = esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)HMI_DISPLAY_SPI_HOST,
+    ret = esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)HMI_DISPLAY_SPI_HOST,
                                               &io_config,
                                               &io_handle);
     if (ret != ESP_OK) {
@@ -178,8 +186,9 @@ esp_err_t hmi_display_init(void)
 
     // Configure SH1106 panel
     // Note: SH1106 is similar to SSD1306 but uses different column addressing
+    // Hardware reset performed via MCP23008 GP6 above
     esp_lcd_panel_dev_config_t panel_config = {
-        .reset_gpio_num = -1,  // No hardware reset pin
+        .reset_gpio_num = -1,  // Reset handled by MCP23008 GP6
         .color_space = ESP_LCD_COLOR_SPACE_MONOCHROME,
         .bits_per_pixel = 1,
     };
@@ -204,9 +213,16 @@ esp_err_t hmi_display_init(void)
         return ret;
     }
 
-    // Configure display orientation
+    // Configure display settings
+    // Note: Rotation handled in hmi_fb_flush() for SH1106 compatibility
+    // esp_lcd orientation functions don't work with custom page-by-page writes
     esp_lcd_panel_invert_color(panel_handle, false);
-    esp_lcd_panel_mirror(panel_handle, false, false);
+
+    // Verify rotation setting at compile time
+    #if HMI_DISPLAY_ROTATION != 0 && HMI_DISPLAY_ROTATION != 90 && \
+        HMI_DISPLAY_ROTATION != 180 && HMI_DISPLAY_ROTATION != 270
+        #error "HMI_DISPLAY_ROTATION must be 0, 90, 180, or 270"
+    #endif
 
     // Start with display off (will be powered on by button press)
     esp_lcd_panel_disp_on_off(panel_handle, false);
@@ -228,11 +244,19 @@ esp_err_t hmi_display_power_on(void)
         return ESP_OK;  // Already on
     }
 
+    // Drive RES high BEFORE powering on bus (ensures RES is valid when display gets power)
+    esp_err_t ret = mcp23008_helper_set_oled_reset(true);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to drive RES high: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
     // Request 3.3V bus from FLUCTUS (toggled for display)
+    // 50ms bus delay ensures RES is stable before display controller starts
     FLUCTUS_REQUEST_BUS_OR_FAIL(POWER_BUS_3V3, "HMI", return ESP_FAIL);
 
     // Turn on display
-    esp_err_t ret = esp_lcd_panel_disp_on_off(panel_handle, true);
+    ret = esp_lcd_panel_disp_on_off(panel_handle, true);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to turn on display: %s", esp_err_to_name(ret));
         fluctus_release_bus_power(POWER_BUS_3V3, "HMI");
@@ -241,8 +265,7 @@ esp_err_t hmi_display_power_on(void)
 
     if (xSemaphoreTake(xHmiMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         hmi_status.display_active = true;
-        // Note: hmi_update_activity() would be called here but it's in hmi.c
-        // For now, just update the display_active flag
+        hmi_update_activity();  // Reset timeout timer
         xSemaphoreGive(xHmiMutex);
     }
 
@@ -263,12 +286,15 @@ esp_err_t hmi_display_power_off(void)
     // Turn off display
     esp_lcd_panel_disp_on_off(panel_handle, false);
 
+    // Release GP6 to high-Z (power saving)
+    mcp23008_helper_oled_reset_release();
+
     // Release 3.3V bus
     fluctus_release_bus_power(POWER_BUS_3V3, "HMI");
 
     hmi_status.display_active = false;
 
-    ESP_LOGI(TAG, "Display powered OFF (3.3V bus released)");
+    ESP_LOGI(TAG, "Display powered OFF (3.3V bus released, GP6 high-Z)");
     return ESP_OK;
 }
 
@@ -368,14 +394,116 @@ void hmi_fb_draw_hline(int x, int y, int width)
         hmi_fb_set_pixel(x + i, y, true);
     }
 }
-
+#if HMI_DISPLAY_ROTATION != 0
+/**
+ * @brief Bit reversal lookup table for vertical flip
+ * Used for 180° and 270° rotations to flip bits within each byte
+ */
+static const uint8_t bit_reverse_table[256] = {
+    0x00, 0x80, 0x40, 0xC0, 0x20, 0xA0, 0x60, 0xE0, 0x10, 0x90, 0x50, 0xD0, 0x30, 0xB0, 0x70, 0xF0,
+    0x08, 0x88, 0x48, 0xC8, 0x28, 0xA8, 0x68, 0xE8, 0x18, 0x98, 0x58, 0xD8, 0x38, 0xB8, 0x78, 0xF8,
+    0x04, 0x84, 0x44, 0xC4, 0x24, 0xA4, 0x64, 0xE4, 0x14, 0x94, 0x54, 0xD4, 0x34, 0xB4, 0x74, 0xF4,
+    0x0C, 0x8C, 0x4C, 0xCC, 0x2C, 0xAC, 0x6C, 0xEC, 0x1C, 0x9C, 0x5C, 0xDC, 0x3C, 0xBC, 0x7C, 0xFC,
+    0x02, 0x82, 0x42, 0xC2, 0x22, 0xA2, 0x62, 0xE2, 0x12, 0x92, 0x52, 0xD2, 0x32, 0xB2, 0x72, 0xF2,
+    0x0A, 0x8A, 0x4A, 0xCA, 0x2A, 0xAA, 0x6A, 0xEA, 0x1A, 0x9A, 0x5A, 0xDA, 0x3A, 0xBA, 0x7A, 0xFA,
+    0x06, 0x86, 0x46, 0xC6, 0x26, 0xA6, 0x66, 0xE6, 0x16, 0x96, 0x56, 0xD6, 0x36, 0xB6, 0x76, 0xF6,
+    0x0E, 0x8E, 0x4E, 0xCE, 0x2E, 0xAE, 0x6E, 0xEE, 0x1E, 0x9E, 0x5E, 0xDE, 0x3E, 0xBE, 0x7E, 0xFE,
+    0x01, 0x81, 0x41, 0xC1, 0x21, 0xA1, 0x61, 0xE1, 0x11, 0x91, 0x51, 0xD1, 0x31, 0xB1, 0x71, 0xF1,
+    0x09, 0x89, 0x49, 0xC9, 0x29, 0xA9, 0x69, 0xE9, 0x19, 0x99, 0x59, 0xD9, 0x39, 0xB9, 0x79, 0xF9,
+    0x05, 0x85, 0x45, 0xC5, 0x25, 0xA5, 0x65, 0xE5, 0x15, 0x95, 0x55, 0xD5, 0x35, 0xB5, 0x75, 0xF5,
+    0x0D, 0x8D, 0x4D, 0xCD, 0x2D, 0xAD, 0x6D, 0xED, 0x1D, 0x9D, 0x5D, 0xDD, 0x3D, 0xBD, 0x7D, 0xFD,
+    0x03, 0x83, 0x43, 0xC3, 0x23, 0xA3, 0x63, 0xE3, 0x13, 0x93, 0x53, 0xD3, 0x33, 0xB3, 0x73, 0xF3,
+    0x0B, 0x8B, 0x4B, 0xCB, 0x2B, 0xAB, 0x6B, 0xEB, 0x1B, 0x9B, 0x5B, 0xDB, 0x3B, 0xBB, 0x7B, 0xFB,
+    0x07, 0x87, 0x47, 0xC7, 0x27, 0xA7, 0x67, 0xE7, 0x17, 0x97, 0x57, 0xD7, 0x37, 0xB7, 0x77, 0xF7,
+    0x0F, 0x8F, 0x4F, 0xCF, 0x2F, 0xAF, 0x6F, 0xEF, 0x1F, 0x9F, 0x5F, 0xDF, 0x3F, 0xBF, 0x7F, 0xFF
+};
+#endif
 /**
  * @brief Flush framebuffer to display via SPI
- * Sends the entire 1024-byte framebuffer to the display
+ * Sends the entire 1024-byte framebuffer to the display page-by-page
+ *
+ * SH1106 requires page-by-page writes with column offset commands.
+ * Cannot use esp_lcd_panel_draw_bitmap() as it doesn't support SH1106's
+ * 132-column addressing (displays middle 128 columns with +2 offset).
+ *
+ * Handles rotation at flush time since esp_lcd orientation functions
+ * don't work with custom page-by-page writes.
  */
 void hmi_fb_flush(void)
 {
-    // Send framebuffer to display using esp_lcd
-    // For SSD1306/SH1106, draw the entire framebuffer (128x64 = 1024 bytes)
-    esp_lcd_panel_draw_bitmap(panel_handle, 0, 0, FB_WIDTH, FB_HEIGHT, framebuffer);
+    static uint8_t line_buffer[FB_WIDTH];  // Temporary buffer for rotation
+
+#if HMI_DISPLAY_ROTATION == 0
+    // 0° - Normal orientation, direct write
+    for (uint8_t page = 0; page < 8; page++) {
+        esp_lcd_panel_io_tx_param(io_handle, 0xB0 + page, NULL, 0);
+        esp_lcd_panel_io_tx_param(io_handle, 0x02, NULL, 0);
+        esp_lcd_panel_io_tx_param(io_handle, 0x10, NULL, 0);
+        esp_lcd_panel_io_tx_color(io_handle, -1, &framebuffer[page * FB_WIDTH], FB_WIDTH);
+    }
+
+#elif HMI_DISPLAY_ROTATION == 180
+    // 180° - Upside down: reverse pages, reverse columns, flip bits
+    for (int8_t page = 7; page >= 0; page--) {
+        esp_lcd_panel_io_tx_param(io_handle, 0xB0 + (7 - page), NULL, 0);
+        esp_lcd_panel_io_tx_param(io_handle, 0x02, NULL, 0);
+        esp_lcd_panel_io_tx_param(io_handle, 0x10, NULL, 0);
+
+        // Reverse columns and flip bits
+        for (int16_t x = 0; x < FB_WIDTH; x++) {
+            line_buffer[x] = bit_reverse_table[framebuffer[page * FB_WIDTH + (FB_WIDTH - 1 - x)]];
+        }
+        esp_lcd_panel_io_tx_color(io_handle, -1, line_buffer, FB_WIDTH);
+    }
+
+#elif HMI_DISPLAY_ROTATION == 90 || HMI_DISPLAY_ROTATION == 270
+    #error "90° and 270° rotations not yet implemented for SH1106"
+
+#endif
+}
+
+/**
+ * @brief Draw scroll indicators (▲/▼) for menus with >7 items
+ *
+ * Shows visual feedback when there are hidden menu items:
+ * - Up arrow (^) at top-right if scrolled down (offset > 0)
+ * - Down arrow (v) at bottom-right if more items below
+ *
+ * @param total_items Total number of items in current menu
+ */
+void hmi_draw_scroll_indicators(uint8_t total_items)
+{
+    // No indicators needed if all items fit on screen
+    if (total_items <= HMI_MAX_VISIBLE_ITEMS) {
+        return;
+    }
+
+    // Draw up arrow if scrolled down (items above current view)
+    if (hmi_status.scroll_offset > 0) {
+        hmi_fb_draw_char(120, 2, '^', false);  // ASCII 94 (^) as up arrow
+    }
+
+    // Draw down arrow if more items below current view
+    uint8_t last_visible = hmi_status.scroll_offset + HMI_MAX_VISIBLE_ITEMS - 1;
+    if (last_visible < total_items - 1) {
+        hmi_fb_draw_char(120, 56, 'v', false);  // ASCII 118 (v) as down arrow
+    }
+}
+
+/**
+ * @brief Draw navigation symbol in top-left corner (← for back)
+ * Indicates "press button to go back"
+ */
+void hmi_draw_back_symbol(void)
+{
+    hmi_fb_draw_char(2, 2, '<', false);  // '<' represents back/left arrow
+}
+
+/**
+ * @brief Draw navigation symbol in top-right corner (↔ for pagination)
+ * Indicates "rotate to change pages"
+ */
+void hmi_draw_pagination_symbol(void)
+{
+    hmi_fb_draw_string(114, 2, "<>", false);  // '<>' represents bidirectional arrows
 }

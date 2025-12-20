@@ -177,9 +177,9 @@ bool fluctus_should_read_temperature(bool monitoring_active);
 void fluctus_handle_temperature_monitoring(bool monitoring_active);
 
 // ==================== Energy Tracking Functions ====================
-// Module: fluctus_energy.c
+// Module: fluctus_accumulator.c
 
-void fluctus_update_energy_accumulator(float pv_power_w, float battery_power_w);
+void fluctus_update_energy_accumulator(void);
 bool fluctus_check_hourly_rollover(void);
 void fluctus_midnight_callback(void);
 

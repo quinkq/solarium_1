@@ -1,0 +1,2 @@
+# This directory stores ESP-IDF monitor logs
+# Contents are ignored by git (see .gitignore)

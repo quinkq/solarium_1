@@ -43,7 +43,7 @@
 #include <esp_idf_lib_helpers.h>
 #include "ads111x.h"
 
-#define I2C_FREQ_HZ 400000 // Max 1MHz for esp32 // Changed to 400KHz because of personal comm issues when prototyping
+#define I2C_FREQ_HZ 400000 // Max 1MHz for esp32 // (Changed to 400KHz)
 
 #define REG_CONVERSION 0
 #define REG_CONFIG 1

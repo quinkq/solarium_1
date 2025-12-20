@@ -10,7 +10,7 @@
  * - Custom 5x8 bitmap font (475 bytes, no external dependencies)
  * - 50-state hierarchical menu system
  * - SH1106 128x64 OLED with framebuffer rendering
- * - EC11 rotary encoder input (PCNT-based)
+ * - EC11 rotary encoder input (MCP23008 I2C expander)
  * - Variable refresh rates (1Hz static, 4Hz realtime)
  * - Power-aware with auto sleep and wake-on-input
  * - Complete system control and monitoring
@@ -20,11 +20,11 @@
 
 #include "hmi.h"
 #include "hmi_private.h"
+#include "mcp23008_helper.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
-#include "driver/pulse_cnt.h"
 #include "esp_timer.h"
 #include "esp_log.h"
 #include <string.h>
@@ -43,7 +43,12 @@ hmi_status_t hmi_status = {
     .last_activity_time = 0,
     .encoder_count = 0,
     .blink_state = false,
-    .blink_counter = 0
+    .blink_counter = 0,
+    .scroll_offset = 0,
+    .menu_scroll_memory = {0},  // Initialize all 47 elements to 0
+    .menu_selected_item_memory = {0},  // Initialize all 47 elements to 0
+    .current_page = 0,
+    .total_pages = 0
 };
 
 // Mutex for thread-safe operations (shared via hmi_private.h)
@@ -78,14 +83,13 @@ confirm_action_t confirmation_action = CONFIRM_NONE;
 uint8_t confirmation_param = 0;  // For zone ID or other params
 hmi_menu_state_t confirmation_return_menu = HMI_MENU_MAIN;  // Menu to return to after confirmation
 
-// Hardware handles
-static pcnt_unit_handle_t encoder_pcnt_unit = NULL;
+// Servo debug state (for FLUCTUS manual servo control, shared via hmi_private.h)
+bool servo_debug_active = false;           // True when in servo control mode
+time_t servo_debug_start_time = 0;         // Timestamp when control mode started (for timeout)
+bool servo_debug_bus_requested = false;    // True if we have 6.6V bus power
+uint32_t servo_debug_current_duty = 0;     // Current servo duty cycle (tracked locally during control)
 
 // ########################## Private Function Declarations ##########################
-
-// Encoder functions
-static esp_err_t hmi_encoder_init(void);
-static void hmi_encoder_button_isr(void *arg);
 
 // Task functions
 static void hmi_display_task(void *pvParameters);
@@ -93,146 +97,6 @@ static void hmi_display_task(void *pvParameters);
 // Activity tracking
 void hmi_update_activity(void);
 static bool hmi_check_timeout(void);
-
-// ########################## Encoder Functions ##########################
-
-/**
- * @brief Initialize EC11 rotary encoder with PCNT
- */
-static esp_err_t hmi_encoder_init(void)
-{
-    ESP_LOGI(TAG, "Initializing EC11 rotary encoder (PCNT)...");
-
-    // Create PCNT unit for quadrature decoding
-    // Note: One PCNT unit can handle both encoder channels (A and B)
-    pcnt_unit_config_t unit_config = {
-        .high_limit = HMI_PCNT_HIGH_LIMIT,
-        .low_limit = HMI_PCNT_LOW_LIMIT,
-    };
-
-    esp_err_t ret = pcnt_new_unit(&unit_config, &encoder_pcnt_unit);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to create PCNT unit: %s", esp_err_to_name(ret));
-        return ret;
-    }
-
-    // Configure channel A (primary encoder signal)
-    pcnt_chan_config_t chan_a_config = {
-        .edge_gpio_num = HMI_ENCODER_A_GPIO,
-        .level_gpio_num = HMI_ENCODER_B_GPIO,  // Use B as control signal for quadrature
-    };
-
-    pcnt_channel_handle_t pcnt_chan_a = NULL;
-    ret = pcnt_new_channel(encoder_pcnt_unit, &chan_a_config, &pcnt_chan_a);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to create PCNT channel A: %s", esp_err_to_name(ret));
-        return ret;
-    }
-
-    // Configure channel B (secondary encoder signal)
-    pcnt_chan_config_t chan_b_config = {
-        .edge_gpio_num = HMI_ENCODER_B_GPIO,
-        .level_gpio_num = HMI_ENCODER_A_GPIO,  // Use A as control signal for quadrature
-    };
-
-    pcnt_channel_handle_t pcnt_chan_b = NULL;
-    ret = pcnt_new_channel(encoder_pcnt_unit, &chan_b_config, &pcnt_chan_b);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to create PCNT channel B: %s", esp_err_to_name(ret));
-        return ret;
-    }
-
-    // Set edge and level actions for quadrature decoding
-    // Channel A: increment on positive edge when B is low, decrement when B is high
-    pcnt_channel_set_edge_action(pcnt_chan_a,
-                                  PCNT_CHANNEL_EDGE_ACTION_INCREASE,  // Pos edge
-                                  PCNT_CHANNEL_EDGE_ACTION_DECREASE); // Neg edge
-    pcnt_channel_set_level_action(pcnt_chan_a,
-                                   PCNT_CHANNEL_LEVEL_ACTION_KEEP,    // B high
-                                   PCNT_CHANNEL_LEVEL_ACTION_INVERSE); // B low
-
-    // Channel B: increment on positive edge when A is high, decrement when A is low
-    pcnt_channel_set_edge_action(pcnt_chan_b,
-                                  PCNT_CHANNEL_EDGE_ACTION_INCREASE,  // Pos edge
-                                  PCNT_CHANNEL_EDGE_ACTION_DECREASE); // Neg edge
-    pcnt_channel_set_level_action(pcnt_chan_b,
-                                   PCNT_CHANNEL_LEVEL_ACTION_INVERSE, // A high
-                                   PCNT_CHANNEL_LEVEL_ACTION_KEEP);   // A low
-
-    // Enable and start the PCNT unit
-    ret = pcnt_unit_enable(encoder_pcnt_unit);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to enable PCNT unit: %s", esp_err_to_name(ret));
-        return ret;
-    }
-
-    ret = pcnt_unit_clear_count(encoder_pcnt_unit);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to clear PCNT count: %s", esp_err_to_name(ret));
-        return ret;
-    }
-
-    ret = pcnt_unit_start(encoder_pcnt_unit);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to start PCNT unit: %s", esp_err_to_name(ret));
-        return ret;
-    }
-
-    // Configure button GPIO (external pull-up already present)
-    gpio_config_t btn_config = {
-        .pin_bit_mask = (1ULL << HMI_ENCODER_BTN_GPIO),
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,    // External pull-up present
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_ANYEDGE,       // Trigger on both press and release
-    };
-
-    ret = gpio_config(&btn_config);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to configure button GPIO: %s", esp_err_to_name(ret));
-        return ret;
-    }
-
-    // Install GPIO ISR service and attach handler
-    ret = gpio_install_isr_service(0);
-    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-        // ESP_ERR_INVALID_STATE means ISR service already installed (by another component)
-        ESP_LOGE(TAG, "Failed to install GPIO ISR service: %s", esp_err_to_name(ret));
-        return ret;
-    }
-
-    ret = gpio_isr_handler_add(HMI_ENCODER_BTN_GPIO, hmi_encoder_button_isr, NULL);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to add button ISR handler: %s", esp_err_to_name(ret));
-        return ret;
-    }
-
-    ESP_LOGI(TAG, "Encoder initialized - PCNT unit handles both channels (A=%d, B=%d, BTN=%d)",
-             HMI_ENCODER_A_GPIO, HMI_ENCODER_B_GPIO, HMI_ENCODER_BTN_GPIO);
-
-    return ESP_OK;
-}
-
-/**
- * @brief Encoder button ISR handler
- */
-static void IRAM_ATTR hmi_encoder_button_isr(void *arg)
-{
-    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-
-    // Read button state
-    int level = gpio_get_level(HMI_ENCODER_BTN_GPIO);
-
-    if (level == 0) {
-        // Button pressed (active low with external pull-up)
-        // Notify display task to wake and handle button event
-        if (xHmiDisplayTask != NULL) {
-            xTaskNotifyFromISR(xHmiDisplayTask, 1, eSetBits, &xHigherPriorityTaskWoken);
-        }
-    }
-
-    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
-}
 
 // ########################## Activity Tracking ##########################
 
@@ -296,21 +160,21 @@ static void hmi_display_task(void *pvParameters)
             }
         }
 
-        // Read encoder count and check for changes
+        // Read encoder count and check for changes (from MCP23008 helper)
         if (hmi_status.display_active) {
-            int current_count = 0;
-            pcnt_unit_get_count(encoder_pcnt_unit, &current_count);
+            int32_t current_count = mcp23008_helper_get_encoder_count();
 
             int delta = current_count - last_encoder_count;
 
-            // Only process significant changes (debounce noise)
-            if (delta >= 4 || delta <= -4) {
+            // Process any change (encoder helper now outputs detent-based counts)
+            // NOTE: mcp23008_helper now handles detent division internally (4 quadrature states = 1 detent)
+            if (delta != 0) {
                 if (xSemaphoreTake(xHmiMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                    hmi_handle_encoder_change(delta / 4);  // Normalize to +/-1 per detent
+                    hmi_handle_encoder_change(delta);  // Already normalized by encoder helper
                     xSemaphoreGive(xHmiMutex);
                 }
                 last_encoder_count = current_count;
-                ESP_LOGD(TAG, "Encoder delta: %d (count: %d)", delta / 4, current_count);
+                ESP_LOGV(TAG, "Encoder delta: %d (count: %ld)", delta, current_count);
             }
         }
 
@@ -320,16 +184,46 @@ static void hmi_display_task(void *pvParameters)
             hmi_display_power_off();
         }
 
+        // Check servo control timeout (60 seconds)
+        if (servo_debug_active) {
+            time_t now = time(NULL);
+            int64_t elapsed_s = now - servo_debug_start_time;
+            if (elapsed_s >= 60) {
+                ESP_LOGW(TAG, "Servo control timeout (%lld s) - exiting control mode", (long long)elapsed_s);
+
+                // Release 6.6V bus power if we requested it
+                if (servo_debug_bus_requested) {
+                    fluctus_release_bus_power(POWER_BUS_6V6, "HMI_SERVO_DEBUG");
+                    servo_debug_bus_requested = false;
+                }
+
+                servo_debug_active = false;
+                servo_debug_start_time = 0;
+                servo_debug_current_duty = 0;
+
+                // Return to servo debug menu
+                if (xSemaphoreTake(xHmiMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                    hmi_status.current_menu = HMI_MENU_FLUCTUS_SERVO_DEBUG;
+                    hmi_status.selected_item = 0;
+                    xSemaphoreGive(xHmiMutex);
+                }
+            }
+        }
+
         // Update blink indicator and render menu if display is active
         if (hmi_status.display_active) {
             if (xSemaphoreTake(xHmiMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                // Update blink state (toggle every 2 cycles = 500ms with 250ms refresh)
+                // Update blink state (toggle every 2 cycles = 500ms for 4Hz realtime, every cycle for 1Hz static)
                 if (hmi_is_realtime_page()) {
+                    // Realtime pages: blink at 1Hz (every 2 cycles @ 250ms = 500ms)
                     hmi_status.blink_counter++;
                     if (hmi_status.blink_counter >= 2) {
                         hmi_status.blink_state = !hmi_status.blink_state;
                         hmi_status.blink_counter = 0;
                     }
+                } else {
+                    // Static pages: blink at 0.5Hz (every cycle @ 1000ms = 1s)
+                    hmi_status.blink_state = !hmi_status.blink_state;
                 }
 
                 hmi_fb_clear();
@@ -363,16 +257,8 @@ esp_err_t hmi_init(void)
         return ESP_FAIL;
     }
 
-    // Initialize encoder
-    esp_err_t ret = hmi_encoder_init();
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to initialize encoder: %s", esp_err_to_name(ret));
-        vSemaphoreDelete(xHmiMutex);
-        return ret;
-    }
-
     // Initialize display
-    ret = hmi_display_init();
+    esp_err_t ret = hmi_display_init();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to initialize display: %s", esp_err_to_name(ret));
         vSemaphoreDelete(xHmiMutex);
@@ -395,10 +281,20 @@ esp_err_t hmi_init(void)
         return ESP_FAIL;
     }
 
+    // Register button callback with MCP23008 helper
+    // NOTE: Encoder/button hardware managed by MCP23008 helper (initialized earlier in main)
+    ret = mcp23008_helper_register_button_callback(xHmiDisplayTask);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to register button callback: %s", esp_err_to_name(ret));
+        // Continue anyway - non-critical, button just won't work
+    } else {
+        ESP_LOGI(TAG, "Button callback registered with MCP23008 helper");
+    }
+
     // Mark as initialized
     hmi_status.initialized = true;
 
-    ESP_LOGI(TAG, "HMI system initialized successfully");
+    ESP_LOGI(TAG, "HMI system initialized successfully (encoder via MCP23008)");
     return ESP_OK;
 }
 

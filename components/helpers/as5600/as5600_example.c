@@ -74,7 +74,7 @@ void example_1_basic_usage(void)
     ESP_LOGI(TAG, "=== Example 1: Basic Usage ===");
 
     // Step 1: Initialize the device descriptor
-    as5600_dev_t sensor = {0};
+    as5600_t sensor = {0};
     esp_err_t ret;
 
     ret = as5600_init_desc(&sensor,
@@ -130,7 +130,7 @@ void example_2_robot_arm_calibration(void)
 {
     ESP_LOGI(TAG, "=== Example 2: Robot Arm Joint with Calibration ===");
 
-    as5600_dev_t joint_sensor = {0};
+    as5600_t joint_sensor = {0};
 
     // Initialize sensor
     as5600_init_desc(&joint_sensor, I2C_NUM_0, AS5600_DEFAULT_ADDRESS,
@@ -158,9 +158,9 @@ void example_2_robot_arm_calibration(void)
     vTaskDelay(pdMS_TO_TICKS(2000));
 
     // Check position relative to home (after multiple rotations)
-    float relative_accumulated;
+    int32_t relative_accumulated;
     as5600_read_accumulated_counts_relative(&joint_sensor, &relative_accumulated);
-    float rotations_from_home = relative_accumulated / 4096.0f;
+    float rotations_from_home = (float)relative_accumulated / 4096.0f;
     ESP_LOGI(TAG, "Position: %.2f rotations from HOME", rotations_from_home);
 
     // Example: If joint rotated 3.5 turns clockwise from home
@@ -176,7 +176,7 @@ void example_3_wind_speed_anemometer(void)
 {
     ESP_LOGI(TAG, "=== Example 3: Wind Speed Anemometer ===");
 
-    as5600_dev_t anemometer = {0};
+    as5600_t anemometer = {0};
 
     // Initialize
     as5600_init_desc(&anemometer, I2C_NUM_0, AS5600_DEFAULT_ADDRESS,
@@ -247,7 +247,7 @@ void example_4_robot_wheel_odometer(void)
 {
     ESP_LOGI(TAG, "=== Example 4: Robot Wheel Odometer ===");
 
-    as5600_dev_t wheel_encoder = {0};
+    as5600_t wheel_encoder = {0};
 
     // Initialize
     as5600_init_desc(&wheel_encoder, I2C_NUM_0, AS5600_DEFAULT_ADDRESS,
@@ -255,9 +255,9 @@ void example_4_robot_wheel_odometer(void)
     as5600_init(&wheel_encoder);
 
     // Robot starts, wheel has rotated 0 times
-    float lifetime_counts;
+    int32_t lifetime_counts;
     as5600_read_accumulated_counts(&wheel_encoder, &lifetime_counts);
-    ESP_LOGI(TAG, "Initial odometer: %.1f rotations", lifetime_counts / 4096.0f);
+    ESP_LOGI(TAG, "Initial odometer: %.1f rotations", (float)lifetime_counts / 4096.0f);
 
     // Simulate robot driving (wheel rotates)
     ESP_LOGI(TAG, "Robot driving for 10 seconds...");
@@ -265,7 +265,7 @@ void example_4_robot_wheel_odometer(void)
 
     // Check total distance traveled
     as5600_read_accumulated_counts(&wheel_encoder, &lifetime_counts);
-    float total_rotations = lifetime_counts / 4096.0f;
+    float total_rotations = (float)lifetime_counts / 4096.0f;
 
     // Example: Wheel diameter = 100mm, circumference = 314mm
     float wheel_circumference_mm = 314.0f;
@@ -285,13 +285,13 @@ void example_4_robot_wheel_odometer(void)
     // Check LIFETIME total (ignores zero offset)
     as5600_read_accumulated_counts(&wheel_encoder, &lifetime_counts);
     ESP_LOGI(TAG, "Lifetime odometer: %.2f rotations (for maintenance tracking)",
-             lifetime_counts / 4096.0f);
+             (float)lifetime_counts / 4096.0f);
 
     // Check distance from charging station (respects zero offset)
-    float relative_counts;
+    int32_t relative_counts;
     as5600_read_accumulated_counts_relative(&wheel_encoder, &relative_counts);
     ESP_LOGI(TAG, "Distance from charging station: %.2f rotations",
-             relative_counts / 4096.0f);
+             (float)relative_counts / 4096.0f);
 
     // Note: Lifetime accumulator is useful for:
     // - Maintenance scheduling (replace wheels after X million rotations)
@@ -308,7 +308,7 @@ void example_5_valve_actuator(void)
 {
     ESP_LOGI(TAG, "=== Example 5: Multi-Turn Valve Actuator ===");
 
-    as5600_dev_t valve_encoder = {0};
+    as5600_t valve_encoder = {0};
 
     // Initialize
     as5600_init_desc(&valve_encoder, I2C_NUM_0, AS5600_DEFAULT_ADDRESS,
@@ -328,9 +328,9 @@ void example_5_valve_actuator(void)
     vTaskDelay(pdMS_TO_TICKS(5000)); // Simulate motor running
 
     // Step 4: Read absolute position from "fully closed" reference
-    float position_counts;
+    int32_t position_counts;
     as5600_read_accumulated_counts_relative(&valve_encoder, &position_counts);
-    float turns_from_closed = position_counts / 4096.0f;
+    float turns_from_closed = (float)position_counts / 4096.0f;
 
     ESP_LOGI(TAG, "Valve position: %.2f turns from closed", turns_from_closed);
 
@@ -359,7 +359,7 @@ void example_6_magnet_diagnostic(void)
 {
     ESP_LOGI(TAG, "=== Example 6: Magnet Status Diagnostics ===");
 
-    as5600_dev_t sensor = {0};
+    as5600_t sensor = {0};
 
     // Initialize
     as5600_init_desc(&sensor, I2C_NUM_0, AS5600_DEFAULT_ADDRESS,
@@ -406,7 +406,7 @@ void example_7_power_modes(void)
 {
     ESP_LOGI(TAG, "=== Example 7: Power Mode Selection ===");
 
-    as5600_dev_t sensor = {0};
+    as5600_t sensor = {0};
     as5600_init_desc(&sensor, I2C_NUM_0, AS5600_DEFAULT_ADDRESS,
                      GPIO_NUM_21, GPIO_NUM_22);
     as5600_init(&sensor);
@@ -462,7 +462,7 @@ void example_7_power_modes(void)
  ******************************************************************************/
 void monitoring_task(void *pvParameters)
 {
-    as5600_dev_t *sensor = (as5600_dev_t *)pvParameters;
+    as5600_t *sensor = (as5600_t *)pvParameters;
 
     ESP_LOGI(TAG, "=== Continuous Monitoring Started ===");
 
@@ -496,7 +496,7 @@ void example_8_continuous_monitoring(void)
 {
     ESP_LOGI(TAG, "=== Example 8: Continuous Monitoring ===");
 
-    static as5600_dev_t sensor = {0}; // Static for task access
+    static as5600_t sensor = {0}; // Static for task access
 
     as5600_init_desc(&sensor, I2C_NUM_0, AS5600_DEFAULT_ADDRESS,
                      GPIO_NUM_21, GPIO_NUM_22);

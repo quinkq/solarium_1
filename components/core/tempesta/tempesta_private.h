@@ -28,7 +28,6 @@
 
 #include "driver/uart.h"
 #include "driver/gpio.h"
-#include "driver/pulse_cnt.h"
 
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -79,11 +78,7 @@ extern TimerHandle_t xTempestaCollectionTimer;
 // Sensor device handles
 extern sht4x_t sht4x_dev;
 extern bmp280_t bmp280_dev;
-extern as5600_dev_t as5600_dev;
-
-// Hardware handles
-extern pcnt_unit_handle_t rain_pcnt_unit_handle;
-extern pcnt_unit_handle_t tank_intake_pcnt_unit_handle;
+extern as5600_t as5600_dev;
 
 // PMS5003 data structure
 typedef struct {
@@ -96,7 +91,7 @@ typedef struct {
     bool valid;
 } pms5003_data_t;
 
-// Consolidated sensor readings
+// Consolidated sensor SHT40/BME280 readings
 typedef struct {
     struct {
         float temperature;

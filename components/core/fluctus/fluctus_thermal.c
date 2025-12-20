@@ -31,6 +31,7 @@ int64_t last_temp_read_time = 0;
 
 temp_conversion_state_t temp_state = TEMP_STATE_IDLE;
 int64_t temp_conversion_start_time = 0;
+bool ds18b20_power_held = false;  // Track if we're holding 3.3V bus for conversion
 
 /**
  * @brief Initialize DS18B20 temperature sensor
@@ -38,6 +39,15 @@ int64_t temp_conversion_start_time = 0;
 esp_err_t fluctus_ds18b20_init(void)
 {
     ESP_LOGI(TAG, "Initializing DS18B20 temperature sensor...");
+
+    // Request 3.3V bus power for DS18B20 (reference counting handles overlaps)
+    esp_err_t power_ret = fluctus_request_bus_power(POWER_BUS_3V3, "DS18B20_INIT");
+    if (power_ret != ESP_OK) {
+        ESP_LOGW(TAG, "3.3V bus unavailable: %s", esp_err_to_name(power_ret));
+        ds18b20_found = false;
+        return ESP_ERR_INVALID_STATE;
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));  // Power-up stabilization delay
 
     // Search for DS18B20 device on the bus (family code 0x28)
     onewire_search_t search;
@@ -49,6 +59,7 @@ esp_err_t fluctus_ds18b20_init(void)
     if (ds18b20_addr == ONEWIRE_NONE) {
         ESP_LOGW(TAG, "DS18B20 not found on GPIO%d", FLUCTUS_DS18B20_GPIO);
         ds18b20_found = false;
+        fluctus_release_bus_power(POWER_BUS_3V3, "DS18B20_INIT");  // Release power on failure
         return ESP_ERR_NOT_FOUND;
     }
 
@@ -60,11 +71,16 @@ esp_err_t fluctus_ds18b20_init(void)
     if (crc != addr_bytes[7]) {
         ESP_LOGE(TAG, "DS18B20 CRC mismatch - sensor may be faulty");
         ds18b20_found = false;
+        fluctus_release_bus_power(POWER_BUS_3V3, "DS18B20_INIT");  // Release power on failure
         return ESP_FAIL;
     }
 
     ds18b20_found = true;
     ESP_LOGI(TAG, "DS18B20 found at address 0x%llx", ds18b20_addr);
+
+    // Release 3.3V bus power - will be requested again for each reading
+    fluctus_release_bus_power(POWER_BUS_3V3, "DS18B20_INIT");
+    ESP_LOGI(TAG, "DS18B20 initialization complete - power released (toggled on per reading)");
 
     return ESP_OK;
 }
@@ -145,9 +161,17 @@ void fluctus_update_fan_speed(float temperature)
             fan_duty = FLUCTUS_FAN_MIN_DUTY + (uint8_t)((temp_offset / temp_range) * duty_range);
         }
 
-        // Request 12V bus power if not already active
+        // Request level shifter and 12V bus power if not already active
         if (!monitoring_data.fan_active) {
-            esp_err_t ret = fluctus_request_bus_power(POWER_BUS_12V, "FLUCTUS_FAN");
+            // Enable level shifter first (required for MOSFET gate driver)
+            esp_err_t ret = fluctus_request_level_shifter("FAN");
+            if (ret != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to enable level shifter for cooling fan");
+                return;
+            }
+
+            // Then enable 12V bus
+            ret = fluctus_request_bus_power(POWER_BUS_12V, "FLUCTUS_FAN");
             if (ret == ESP_OK) {
                 gpio_set_level(FLUCTUS_12V_FAN_ENABLE_GPIO, 1);
                 monitoring_data.fan_active = true;
@@ -155,6 +179,8 @@ void fluctus_update_fan_speed(float temperature)
                 ESP_LOGI(TAG, "Cooling fan activated at %.1f°C", temperature);
             } else {
                 ESP_LOGE(TAG, "Failed to power 12V bus for cooling fan");
+                // Release level shifter if bus power failed
+                fluctus_release_level_shifter("FAN");
                 return;
             }
         }
@@ -168,7 +194,11 @@ void fluctus_update_fan_speed(float temperature)
         if (monitoring_data.fan_active) {
             fluctus_set_cooling_fan_speed(0);
             gpio_set_level(FLUCTUS_12V_FAN_ENABLE_GPIO, 0);
+
+            // Release 12V bus first, then level shifter
             fluctus_release_bus_power(POWER_BUS_12V, "FLUCTUS_FAN");
+            fluctus_release_level_shifter("FAN");
+
             monitoring_data.fan_active = false;
             ESP_LOGI(TAG, "Cooling fan deactivated at %.1f°C", temperature);
 
@@ -220,34 +250,32 @@ void fluctus_handle_temperature_monitoring(bool monitoring_active)
     }
 
     int64_t current_time_ms = esp_timer_get_time() / 1000;
-
+    
     switch (temp_state) {
         case TEMP_STATE_IDLE:
             // Check if we should start a new temperature conversion
             if (fluctus_should_read_temperature(monitoring_active)) {
-                bool bus_was_off = false;
+                // Request 3.3V bus power for DS18B20 (toggled power saving)
+                if (fluctus_request_bus_power(POWER_BUS_3V3, "DS18B20_READ") == ESP_OK) {
+                    vTaskDelay(pdMS_TO_TICKS(50)); // Power-up stabilization delay
+                    ds18b20_power_held = true;
 
-                // Request 3.3V bus power if needed for thermal monitoring
-                if (monitoring_data.thermal_monitoring_active && !fluctus_is_bus_powered(POWER_BUS_3V3)) {
-                    if (fluctus_request_bus_power(POWER_BUS_3V3, "FLUCTUS_TEMP") == ESP_OK) {
-                        bus_was_off = true;
-                        vTaskDelay(pdMS_TO_TICKS(100)); // Allow bus to stabilize
+                    // Start conversion WITHOUT blocking (wait=false)
+                    // DS18B20 needs power during the 750ms conversion time
+                    if (ds18x20_measure(FLUCTUS_DS18B20_GPIO, ds18b20_addr, false) == ESP_OK) {
+                        temp_state = TEMP_STATE_CONVERTING;
+                        temp_conversion_start_time = current_time_ms;
+                        ESP_LOGV(TAG, "DS18B20 conversion started (non-blocking, ~750ms)");
+                    } else {
+                        ESP_LOGW(TAG, "Failed to start DS18B20 conversion");
+                        monitoring_data.temperature_valid = false;
+                        // Release power on failure
+                        fluctus_release_bus_power(POWER_BUS_3V3, "DS18B20_READ");
+                        ds18b20_power_held = false;
                     }
-                }
-
-                // Start conversion WITHOUT blocking (wait=false)
-                if (ds18x20_measure(FLUCTUS_DS18B20_GPIO, ds18b20_addr, false) == ESP_OK) {
-                    temp_state = TEMP_STATE_CONVERTING;
-                    temp_conversion_start_time = current_time_ms;
-                    ESP_LOGD(TAG, "DS18B20 conversion started (non-blocking, ~750ms)");
                 } else {
-                    ESP_LOGW(TAG, "Failed to start DS18B20 conversion");
+                    ESP_LOGD(TAG, "3.3V bus unavailable for DS18B20 reading");
                     monitoring_data.temperature_valid = false;
-                }
-
-                // Release 3.3V bus if we requested it
-                if (bus_was_off) {
-                    fluctus_release_bus_power(POWER_BUS_3V3, "FLUCTUS_TEMP");
                 }
             }
             break;
@@ -273,10 +301,16 @@ void fluctus_handle_temperature_monitoring(bool monitoring_active)
                     monitoring_data.temperature_valid = false;
                 }
 
+                // Release 3.3V bus power after reading
+                if (ds18b20_power_held) {
+                    fluctus_release_bus_power(POWER_BUS_3V3, "DS18B20_READ");
+                    ds18b20_power_held = false;
+                }
+
                 // Return to idle state
                 temp_state = TEMP_STATE_IDLE;
             }
-            // else: Still converting, check again on next monitoring cycle
+            // else: Still converting (power held), check again on next monitoring cycle
             break;
     }
 }
@@ -289,10 +323,17 @@ esp_err_t fluctus_set_cooling_fan_speed(uint8_t duty_percent)
     if (!fluctus_initialized || duty_percent > 100) {
         return ESP_ERR_INVALID_ARG;
     }
-    
+
+    // Verify 12V bus is powered before controlling fan
+    // (fan may not respond if bus is disabled during load shedding)
+    if (duty_percent > 0 && !fluctus_is_bus_powered(POWER_BUS_12V)) {
+        ESP_LOGW(TAG, "12V bus not powered - cannot control cooling fan");
+        return ESP_ERR_INVALID_STATE;
+    }
+
     // Convert percentage to duty cycle (8-bit resolution = 256 levels)
     uint32_t duty_cycle = (duty_percent * 255) / 100;
-    
+
     esp_err_t ret = ledc_set_duty(FLUCTUS_SERVO_PWM_SPEED_MODE, FLUCTUS_FAN_PWM_CHANNEL, duty_cycle);
     if (ret != ESP_OK) {
         return ret;

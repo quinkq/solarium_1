@@ -15,8 +15,9 @@ extern "C" {
 // ########################## Configuration Constants ##########################
 
 #define ADS1115_DEVICE_COUNT 4
-#define ADS1115_GAIN ADS111X_GAIN_4V096  // ±4.096V
-#define ADS1115_I2C_PORT I2C_NUM_0
+// Note: Gain is configured per-device in ads1115_devices[].gain
+// Use ads111x_gain_values[gain] from ads111x.h for voltage calculation
+// Note: I2C bus configuration (port and pins) now from main.h (I2C_BUS_B_*)
 
 // Retry configuration - read operation (fast retries for transient issues)
 #define ADS1115_READ_RETRY_ATTEMPTS 3

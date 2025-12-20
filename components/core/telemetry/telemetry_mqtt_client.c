@@ -513,33 +513,3 @@ void telemetry_mqtt_publish_task(void *parameters)
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
-
-// ########################## Public API ##########################
-
-/**
- * @brief Fetch snapshot from component and trigger MQTT publishing
- * Calls component's writer function, then notifies MQTT task for encoding/publishing
- * This is the entry point for all component telemetry injections
- */
-esp_err_t telemetry_fetch_snapshot(telemetry_source_t src)
-{
-    if (!telemetry_initialized || src >= TELEMETRY_SRC_COUNT) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    void *cache = NULL;
-    esp_err_t ret = telemetry_lock_cache(src, &cache);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to lock cache for source %d", src);
-        return ret;
-    }
-
-    ret = streams[src].writer_function(cache);
-    telemetry_unlock_cache(src);
-
-    if (ret == ESP_OK && mqtt_task_handle) {
-        xTaskNotify(mqtt_task_handle, (1 << src), eSetBits);
-    }
-
-    return ret;
-}

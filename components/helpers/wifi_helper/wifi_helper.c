@@ -74,9 +74,16 @@ static uint8_t backoff_level = 0;
 static TimerHandle_t reconnect_timer = NULL;
 static bool shutdown_requested = false;
 
+// WiFi restart delay (anti-bounce for rapid power state changes)
+static TimerHandle_t restart_delay_timer = NULL;
+#define WIFI_RESTART_DELAY_MS 30000  // 30 seconds
+
 // RSSI monitoring
 static TaskHandle_t rssi_monitor_task_handle = NULL;
 static int8_t last_reported_rssi = 0;
+
+// SNTP initialization state
+static bool sntp_initialized = false;
 
 // Connection timing
 static time_t connect_time = 0;
@@ -85,6 +92,7 @@ static time_t total_connected_sec = 0;
 // ########################## Forward Declarations ##########################
 
 static void reconnect_timer_callback(TimerHandle_t xTimer);
+static void restart_delay_timer_callback(TimerHandle_t xTimer);
 static void rssi_monitor_task(void *pvParameters);
 static void update_connected_time(void);
 
@@ -279,14 +287,10 @@ static void ip_event_handler(void *arg, esp_event_base_t event_base,
 
         set_wifi_state(WIFI_STATE_CONNECTED);
 
-        // Initialize SNTP
-        initialize_sntp();
-
-        // Get initial RSSI
-        wifi_ap_record_t ap_info;
-        if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
-            update_rssi(ap_info.rssi);
-            last_reported_rssi = ap_info.rssi;
+        // Notify rssi_monitor_task to perform post-connection initialization
+        // (SNTP init + initial RSSI reading) in a safe context with adequate stack
+        if (rssi_monitor_task_handle != NULL) {
+            xTaskNotifyGive(rssi_monitor_task_handle);
         }
     }
 }
@@ -301,16 +305,79 @@ static void reconnect_timer_callback(TimerHandle_t xTimer)
 }
 
 /**
+ * @brief Timer callback for delayed WiFi restart (anti-bounce)
+ * Waits 30s after power state returns to NORMAL before restarting WiFi
+ * Prevents rapid cycling during voltage bounces (e.g., IMPLUVIUM pump tests)
+ */
+static void restart_delay_timer_callback(TimerHandle_t xTimer)
+{
+    ESP_LOGI(TAG, "WiFi restart delay expired, starting WiFi...");
+
+    // Check if shutdown was requested again during delay
+    if (shutdown_requested) {
+        ESP_LOGI(TAG, "Shutdown requested during delay, aborting WiFi restart");
+        return;
+    }
+
+    // Start WiFi
+    esp_wifi_start();
+    retry_count = 0;
+    backoff_level = 0;
+
+    // Re-enable power save mode after restart (it's reset by esp_wifi_start())
+    // Note: This will be applied once WiFi connects, setting it early is safe
+    vTaskDelay(pdMS_TO_TICKS(100));  // Small delay to let WiFi start
+    esp_err_t ps_ret = esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
+    if (ps_ret == ESP_OK) {
+        if (xSemaphoreTake(xWiFiMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            current_snapshot.power_save_mode = true;
+            xSemaphoreGive(xWiFiMutex);
+        }
+        ESP_LOGI(TAG, "WiFi power save mode re-enabled after restart");
+    } else {
+        ESP_LOGW(TAG, "Failed to re-enable power save mode: %s", esp_err_to_name(ps_ret));
+    }
+}
+
+/**
  * @brief RSSI monitoring task (runs when connected)
+ * Handles post-connection initialization (SNTP + initial RSSI) via task notification
+ * Performs periodic RSSI checks every 15 minutes
  */
 static void rssi_monitor_task(void *pvParameters)
 {
     ESP_LOGI(TAG, "RSSI monitor task started");
 
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(WIFI_HELPER_RSSI_CHECK_INTERVAL));
+        // Wait for notification (post-connection init) or timeout (periodic check)
+        uint32_t notification = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(WIFI_HELPER_RSSI_CHECK_INTERVAL));
 
-        // Only check RSSI when connected
+        // Monitor stack usage (debug - watermark shows minimum free stack ever reached)
+        UBaseType_t stack_high_water = uxTaskGetStackHighWaterMark(NULL);
+        ESP_LOGI(TAG, "[STACK] High water mark: %u bytes free (min ever)", stack_high_water * sizeof(StackType_t));
+
+        // Handle post-connection initialization notification
+        if (notification > 0) {
+            ESP_LOGI(TAG, "Post-connection initialization triggered");
+
+            // Initialize SNTP (only once per boot, idempotent on reconnections)
+            if (!sntp_initialized) {
+                initialize_sntp();
+                sntp_initialized = true;
+            }
+
+            // Get initial RSSI after connection
+            if (current_snapshot.state == WIFI_STATE_CONNECTED && current_snapshot.has_ip) {
+                wifi_ap_record_t ap_info;
+                if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+                    update_rssi(ap_info.rssi);
+                    last_reported_rssi = ap_info.rssi;
+                    ESP_LOGI(TAG, "Initial RSSI: %d dBm", ap_info.rssi);
+                }
+            }
+        }
+
+        // Periodic RSSI check (timeout or after notification handling)
         if (current_snapshot.state == WIFI_STATE_CONNECTED && current_snapshot.has_ip) {
             wifi_ap_record_t ap_info;
             if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
@@ -389,11 +456,19 @@ esp_err_t wifi_helper_init(const char *ssid, const char *password)
         return ESP_FAIL;
     }
 
+    // Create restart delay timer (one-shot, anti-bounce)
+    restart_delay_timer = xTimerCreate("wifi_restart_delay", pdMS_TO_TICKS(WIFI_RESTART_DELAY_MS),
+                                        pdFALSE, NULL, restart_delay_timer_callback);
+    if (restart_delay_timer == NULL) {
+        ESP_LOGE(TAG, "Failed to create restart delay timer");
+        return ESP_FAIL;
+    }
+
     // Start RSSI monitoring task
     BaseType_t task_created = xTaskCreate(
         rssi_monitor_task,
         "wifi_rssi",
-        3072,  // Increased from 2048 to handle UART0 printf buffering??
+        4096,  // Increased to handle SNTP init + RSSI operations
         NULL,
         5,
         &rssi_monitor_task_handle
@@ -406,6 +481,16 @@ esp_err_t wifi_helper_init(const char *ssid, const char *password)
 
     // Start WiFi
     ESP_ERROR_CHECK(esp_wifi_start());
+
+    // Enable power save mode by default (WIFI_PS_MAX_MODEM: ~20mA vs WIFI_PS_NONE: ~100mA)
+    // This reduces power consumption while maintaining connectivity and MQTT functionality
+    esp_err_t ps_ret = esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
+    if (ps_ret == ESP_OK) {
+        current_snapshot.power_save_mode = true;
+        ESP_LOGI(TAG, "WiFi power save mode enabled by default (WIFI_PS_MAX_MODEM)");
+    } else {
+        ESP_LOGW(TAG, "Failed to enable default power save mode: %s", esp_err_to_name(ps_ret));
+    }
 
     wifi_initialized = true;
     ESP_LOGI(TAG, "WiFi helper initialized successfully");
@@ -465,6 +550,12 @@ esp_err_t wifi_helper_set_shutdown(bool shutdown)
     if (shutdown) {
         ESP_LOGI(TAG, "Shutting down WiFi...");
 
+        // Cancel any pending restart timer (immediate shutdown takes priority)
+        if (xTimerIsTimerActive(restart_delay_timer)) {
+            xTimerStop(restart_delay_timer, 100);
+            ESP_LOGI(TAG, "Cancelled pending WiFi restart");
+        }
+
         // Update connected time before shutdown
         update_connected_time();
 
@@ -478,10 +569,12 @@ esp_err_t wifi_helper_set_shutdown(bool shutdown)
             xSemaphoreGive(xWiFiMutex);
         }
     } else {
-        ESP_LOGI(TAG, "Re-enabling WiFi...");
-        esp_wifi_start();
-        retry_count = 0;
-        backoff_level = 0;
+        // Delayed restart to prevent rapid cycling during voltage bounces
+        ESP_LOGI(TAG, "WiFi restart requested, delaying %d seconds to prevent rapid cycling...",
+                 WIFI_RESTART_DELAY_MS / 1000);
+
+        // Start delay timer (will call esp_wifi_start() after 30s)
+        xTimerStart(restart_delay_timer, 100);
     }
 
     return ESP_OK;

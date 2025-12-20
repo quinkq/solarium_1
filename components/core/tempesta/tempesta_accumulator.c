@@ -21,10 +21,11 @@
 
 #include "tempesta.h"
 #include "tempesta_private.h"
+#include "mcp23008_helper.h"
 
 #include "solar_calc.h"
 
-static const char *TAG = "TEMPESTA_ACCU";
+static const char *TAG = "TEMPESTA_ACCUMULATOR";
 
 
 /**
@@ -207,14 +208,10 @@ void tempesta_daily_reset_callback(void)
     if (is_weekly_reset) {
         ESP_LOGI(TAG, "%s midnight - HARDWARE COUNTER RESET + daily/weekly reset", day_names[day_of_week]);
 
-        // Clear hardware counters to prevent overflow (max 32,767 pulses)
-        // This ensures tank intake can't overflow during heavy rain weeks
-        if (rain_pcnt_unit_handle != NULL) {
-            pcnt_unit_clear_count(rain_pcnt_unit_handle);
-        }
-        if (tank_intake_pcnt_unit_handle != NULL) {
-            pcnt_unit_clear_count(tank_intake_pcnt_unit_handle);
-        }
+        // Clear MCP23008 helper counters to prevent overflow (max uint32_t)
+        // This ensures counters don't overflow during heavy rain/usage
+        mcp23008_helper_reset_rainfall_pulses();
+        mcp23008_helper_reset_tank_intake_pulses();
 
         // Acquire mutex to protect calculation_data and weather_data access
         if (xSemaphoreTake(xTempestaDataMutex, pdMS_TO_TICKS(WEATHER_MUTEX_TIMEOUT_UPDATE_MS)) != pdTRUE) {
@@ -340,24 +337,16 @@ esp_err_t tempesta_reset_weekly_counters(void)
 }
 
 /**
- * @brief Reset rain gauge accumulation (clears hardware counter)
+ * @brief Reset rain gauge accumulation (clears MCP23008 helper counter)
  * WARNING: This resets hourly/daily/weekly data. Consider using
  * tempesta_reset_daily_counters() or tempesta_reset_weekly_counters() instead.
  */
 esp_err_t tempesta_reset_rain_gauge_total(void)
 {
-    ESP_LOGI(TAG, "Resetting rain gauge (hardware counter clear)");
+    ESP_LOGI(TAG, "Resetting rain gauge (MCP23008 counter clear)");
 
-    if (rain_pcnt_unit_handle == NULL) {
-        return ESP_FAIL;
-    }
-
-    // Clear hardware counter
-    esp_err_t ret = pcnt_unit_clear_count(rain_pcnt_unit_handle);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to clear rain gauge pulse counter: %s", esp_err_to_name(ret));
-        return ret;
-    }
+    // Clear MCP23008 helper counter
+    mcp23008_helper_reset_rainfall_pulses();
 
     // Acquire mutex to protect calculation_data and weather_data access
     if (xSemaphoreTake(xTempestaDataMutex, pdMS_TO_TICKS(WEATHER_MUTEX_TIMEOUT_UPDATE_MS)) != pdTRUE) {
@@ -383,24 +372,16 @@ esp_err_t tempesta_reset_rain_gauge_total(void)
 }
 
 /**
- * @brief Reset tank intake accumulation (clears hardware counter)
+ * @brief Reset tank intake accumulation (clears MCP23008 helper counter)
  * WARNING: This resets hourly/daily/weekly data. Consider using
  * tempesta_reset_daily_counters() or tempesta_reset_weekly_counters() instead.
  */
 esp_err_t tempesta_reset_tank_intake_total(void)
 {
-    ESP_LOGI(TAG, "Resetting tank intake (hardware counter clear)");
+    ESP_LOGI(TAG, "Resetting tank intake (MCP23008 counter clear)");
 
-    if (tank_intake_pcnt_unit_handle == NULL) {
-        return ESP_FAIL;
-    }
-
-    // Clear hardware counter
-    esp_err_t ret = pcnt_unit_clear_count(tank_intake_pcnt_unit_handle);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to clear tank intake pulse counter: %s", esp_err_to_name(ret));
-        return ret;
-    }
+    // Clear MCP23008 helper counter
+    mcp23008_helper_reset_tank_intake_pulses();
 
     // Acquire mutex to protect calculation_data and weather_data access
     if (xSemaphoreTake(xTempestaDataMutex, pdMS_TO_TICKS(WEATHER_MUTEX_TIMEOUT_UPDATE_MS)) != pdTRUE) {

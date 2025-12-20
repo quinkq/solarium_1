@@ -102,10 +102,10 @@ esp_err_t telemetry_msgpack_encode_fluctus(const fluctus_snapshot_t *data,
 
     // Energy statistics - hourly
     msgpack_pack_str(&pk, 6); msgpack_pack_str_body(&pk, "pv_wh_h", 6);
-    msgpack_pack_float(&pk, data->pv_energy_wh_hour);
+    msgpack_pack_float(&pk, data->pv_produced_wh_hour);
 
     msgpack_pack_str(&pk, 7); msgpack_pack_str_body(&pk, "bat_wh_h", 7);
-    msgpack_pack_float(&pk, data->battery_energy_wh_hour);
+    msgpack_pack_float(&pk, data->battery_consumed_wh_hour);
 
     msgpack_pack_str(&pk, 7); msgpack_pack_str_body(&pk, "pv_pk_h", 7);
     msgpack_pack_float(&pk, data->pv_peak_w_hour);
@@ -115,7 +115,7 @@ esp_err_t telemetry_msgpack_encode_fluctus(const fluctus_snapshot_t *data,
 
     // Energy statistics - daily
     msgpack_pack_str(&pk, 6); msgpack_pack_str_body(&pk, "pv_wh_d", 6);
-    msgpack_pack_float(&pk, data->pv_energy_wh_day);
+    msgpack_pack_float(&pk, data->pv_produced_wh_day);
 
     msgpack_pack_str(&pk, 7); msgpack_pack_str_body(&pk, "bat_wh_d", 7);
     msgpack_pack_float(&pk, data->battery_consumed_wh_day);
@@ -288,7 +288,7 @@ esp_err_t telemetry_msgpack_encode_stellaria(const stellaria_snapshot_t *data,
     msgpack_pack_uint16(&pk, data->current_intensity);
 
     msgpack_pack_str(&pk, 2); msgpack_pack_str_body(&pk, "en", 2);
-    msgpack_pack_uint8(&pk, data->driver_enabled ? 1 : 0);
+    msgpack_pack_uint8(&pk, data->driver_output_enabled ? 1 : 0);
 
     msgpack_pack_str(&pk, 4); msgpack_pack_str_body(&pk, "mode", 4);
     msgpack_pack_uint8(&pk, data->auto_mode_active);
@@ -357,12 +357,8 @@ esp_err_t telemetry_msgpack_encode_tempesta(const tempesta_snapshot_t *data,
     msgpack_pack_float(&pk, data->wind_direction_deg);
 
     msgpack_pack_str(&pk, 5); msgpack_pack_str_body(&pk, "wcard", 5);
-    if (data->wind_direction_cardinal) {
-        msgpack_pack_str(&pk, strlen(data->wind_direction_cardinal));
-        msgpack_pack_str_body(&pk, data->wind_direction_cardinal, strlen(data->wind_direction_cardinal));
-    } else {
-        msgpack_pack_nil(&pk);
-    }
+    msgpack_pack_str(&pk, strlen(data->wind_direction_cardinal));
+    msgpack_pack_str_body(&pk, data->wind_direction_cardinal, strlen(data->wind_direction_cardinal));
 
     // Rainfall measurements (3)
     msgpack_pack_str(&pk, 3); msgpack_pack_str_body(&pk, "rhr", 3);
