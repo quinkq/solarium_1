@@ -14,8 +14,7 @@ The system is built around four main subsystems: **FLUCTUS** (power & solar trac
 
 ![solarium Diagram drawio](https://github.com/user-attachments/assets/f8a33487-a0ce-4170-98f9-2d25f3874cc6)
 
-### Original Work (~19,000 lines)
-All core system architecture and components were designed and implemented from scratch:
+### Core system components
 
 - #### FLUCTUS - Power management, solar tracking, load shedding orchestration
 Manages four voltage buses (3.3V/5V/6.6V/12V) with reference counting, dual INA219 power monitors (solar + battery), overcurrent protection, thermal management with PWM fan control, and dual-axis solar tracking with 15-minute correction cycles.
@@ -45,11 +44,16 @@ Custom UI system with SH1106 OLED screen and EC11 encoder. Framebuffer rendering
 ### Custom drivers
 - **abp** - Honeywell ABP ΔP sensor SPI driver library
 - **as5600** - AS5600 Hall magnetic encoder I2C driver library, esp-idf-lib compatible
+
 ### Third-Party Components
 - **Sensor drivers**: esp-idf-lib (SHT4x, BMP280, INA219, DS18B20, OneWire)
 - **Serialization**: msgpack-c (library for MQTT payloads)
 - **Filesystem**: joltwallet/esp_littlefs (wear-leveling flash filesystem for config and backup storage)
 - **Framework**: ESP-IDF v5.4 (Espressif's official development framework)
+
+### Original Work (~19,000 lines)
+
+## General system's hardware layout (due to be updated)
 
 ![solarium_topo-1](https://github.com/user-attachments/assets/5801f9b7-c7d6-40f8-a188-8f4dde045b36)
 
@@ -93,18 +97,15 @@ Hybrid push/pull eliminating polling and minimizing lock contention:
 
 **Push-Based Injection**:
 - Components write directly to TELEMETRY cache buffers (~1KB total cache)
-- Each source has dedicated mutex - no lock contention between components
 - Variable update rates: 500ms (active monitoring) to 60min (idle states)
 - Seven injection points with automatic timestamping
 - HMI memcpy's snapshots for local rendering across multiple screens
-- Variable Refresh rates: 4Hz static screens / 8Hz realtime monitoring
 
 ### Custom HMI System
-Built entirely from scratch without LVGL or U8g2:
 
 - **Custom Font**: 475-byte bitmap 5×7 font, full ASCII support
 - **47 Menu States**: Hierarchical navigation across all subsystems with realtime and configuration screens
-- **Table-Driven Navigation**: Declarative transition tables use, instead of long switch statements
+- **Table-Driven Navigation**: Declarative transition tables use
 - **Variable Refresh Rates**: 4Hz for static screens, 8Hz for realtime data
 - **Framebuffer Rendering**: 1024-byte buffer with efficient SPI flush to SH1106 128×64 OLED
 - **EC11 Encoder**: Software quadrature decoder via MCP23008 I2C expander with button support
@@ -121,26 +122,24 @@ The MCP23008 I2C GPIO expander replaces hardware PCNT with interrupt-driven soft
 
 ## Hardware
 
-**MCU**: ESP32-S3 16MB flash, 8MB PSRAM
-**Storage**: FLASH LittleFS partition for persistent config and backups
-**Display**: SH1106 128×64 OLED (SPI) with EC11 rotary encoder (via MCP23008)
-**Interfaces**: I2C, SPI, UART, GPIO, OneWire, PWM
-**Power**: 4-bus distribution (3.3V/5V/6.6V/12V) with solar input and battery bank
+- **MCU**: ESP32-S3 16MB flash, 8MB PSRAM
+- **Storage**: FLASH LittleFS partition for persistent config and backups
+- **Display**: SH1106 128×64 OLED (SPI) with EC11 rotary encoder (via MCP23008)
+- **Interfaces**: I2C, SPI, UART, GPIO, OneWire, PWM
+- **Power**: 4-bus distribution (3.3V/5V/6.6V/12V) with solar input and battery bank
 
 ![20251013_135107](https://github.com/user-attachments/assets/67a5d10f-e1c2-459f-9a77-ee2e89fb2cb5)
 
 ## Development Status
 
-**Alpha Release**
-- Single-node integrated system with all core features operational:
-- Seven main components fully implemented and tested
+**Alpha version**
+Single-node integrated system with all core features operational:
+- Six main components fully implemented and tested
 - Irrigation learning algorithm with persistent storage and temperature correction
 - Two-tier MQTT buffering (PSRAM + Flash) with boot recovery
-- 47-state HMI with custom rendering and table-driven navigation
+- 47-state custom HMI
 - Day/night aware operations with NOAA solar calculations
 - Five-stage load shedding with coordinated shutdown
-- Adaptive sensor polling (500ms to 60min depending on context)
-- MCP23008 I/O expander integration complete
 
 **In Progress**:
 - MQTT broker integration and topic structure finalization
