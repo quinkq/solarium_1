@@ -99,6 +99,11 @@ extern time_t servo_debug_start_time;     // Timestamp when control mode started
 extern bool servo_debug_bus_requested;    // True if we have 6.6V bus power
 extern uint32_t servo_debug_current_duty; // Current servo duty cycle (tracked locally during control)
 
+// TEMPESTA diagnostic state (for wind sensor debugging)
+extern bool tempesta_diag_active;         // True when in diagnostic mode
+extern time_t tempesta_diag_start_time;   // Timestamp when diagnostic mode started (for 90s timeout)
+extern bool tempesta_diag_bus_requested;  // True if we have 3.3V bus power
+
 // ########################## Display Functions (hmi_display.c) ##########################
 
 /**

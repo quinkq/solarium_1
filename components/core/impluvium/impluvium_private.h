@@ -185,7 +185,14 @@ esp_err_t impluvium_gpio_init(void);
 esp_err_t impluvium_pump_init(void);
 esp_err_t impluvium_flow_sensor_init(void);
 esp_err_t impluvium_set_pump_speed(uint32_t pwm_duty);
-esp_err_t impluvium_pump_ramp_up(uint8_t zone_id);
+
+// Pump ramp direction
+typedef enum {
+    PUMP_RAMP_UP = 0,   // Ramp from min to target duty
+    PUMP_RAMP_DOWN = 1  // Ramp from current to zero
+} pump_ramp_direction_t;
+
+esp_err_t impluvium_pump_ramp(uint8_t zone_id, pump_ramp_direction_t direction);
 void impluvium_pump_adaptive_control(float current_gain_rate, float target_gain_rate);
 
 // Valve control with logging and validation

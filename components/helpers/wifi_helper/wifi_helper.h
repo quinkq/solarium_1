@@ -10,7 +10,7 @@
 
 // ########################## Configuration ##########################
 
-#define WIFI_HELPER_MAX_RETRIES           20    // ~10 minutes total with exponential backoff
+#define WIFI_HELPER_MAX_RETRIES           30    // ~24hrs minutes total with exponential backoff
 #define WIFI_HELPER_RSSI_UPDATE_THRESHOLD 5     // Update TELEMETRY on RSSI change > 5 dBm
 #define WIFI_HELPER_RSSI_CHECK_INTERVAL   (1000 * 60 * 15) // Check RSSI every 15 min (ms)
 

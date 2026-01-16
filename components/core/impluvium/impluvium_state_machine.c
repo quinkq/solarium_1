@@ -135,8 +135,10 @@ esp_err_t impluvium_state_measuring(void)
 
     // Check each zone for watering needs
     for (uint8_t zone_id = 0; zone_id < IRRIGATION_ZONE_COUNT; zone_id++) {
-        if (!irrigation_zones[zone_id].watering_enabled)
+        if (!irrigation_zones[zone_id].watering_enabled) {
+            ESP_LOGI(TAG, "Zone %d: SKIPPED - disabled in configuration", zone_id);
             continue;
+        }
 
         float moisture_percent;
         esp_err_t ret = impluvium_read_moisture_sensor(zone_id, &moisture_percent);
@@ -168,7 +170,25 @@ esp_err_t impluvium_state_measuring(void)
                         irrigation_system.watering_queue[irrigation_system.watering_queue_size].watering_completed = false;
                         irrigation_system.watering_queue_size++;
                     }
+                } else {
+                    // Too soon since last watering
+                    int64_t time_since_watering_s = (current_time_ms - zone->last_watered_time_ms) / 1000;
+                    int64_t time_remaining_s = (MIN_WATERING_INTERVAL_MS - (current_time_ms - zone->last_watered_time_ms)) / 1000;
+                    ESP_LOGI(TAG,
+                             "Zone %d: SKIPPED - watered %lld s ago, need %lld s more (15 min minimum)",
+                             zone_id,
+                             (long long)time_since_watering_s,
+                             (long long)time_remaining_s);
                 }
+            } else {
+                // Moisture within acceptable range
+                ESP_LOGI(TAG,
+                         "Zone %d: SKIPPED - moisture %.1f%% within target %.1f%% ±%.1f%% (deficit %.1f%%)",
+                         zone_id,
+                         moisture_percent,
+                         zone->target_moisture_percent,
+                         zone->moisture_deadband_percent,
+                         moisture_deficit_percent);
             }
         }
     }
@@ -264,7 +284,7 @@ esp_err_t impluvium_state_watering(void)
     vTaskDelay(pdMS_TO_TICKS(VALVE_OPEN_DELAY_MS));
 
     // Ramp up pump speed
-    if (impluvium_pump_ramp_up(zone_id) != ESP_OK) {
+    if (impluvium_pump_ramp(zone_id, PUMP_RAMP_UP) != ESP_OK) {
         ESP_LOGE(TAG, "Pump ramp-up failed for zone %d, turning off power buses", zone_id);
         impluvium_close_valve(zone_id);
         fluctus_release_level_shifter("IMPLUVIUM");
@@ -303,8 +323,11 @@ esp_err_t impluvium_state_stopping(void)
     // Notify monitoring task to stop
     xTaskNotify(xIrrigationMonitoringTaskHandle, MONITORING_TASK_NOTIFY_STOP_MONITORING, eSetBits);
 
-    // Stop pump
-    impluvium_set_pump_speed(0);
+    // Ramp down pump (3 seconds for gentle shutdown)
+    if (impluvium_pump_ramp(active_zone, PUMP_RAMP_DOWN) != ESP_OK) {
+        ESP_LOGW(TAG, "Pump ramp-down failed, forcing immediate stop");
+        impluvium_set_pump_speed(0);
+    }
     ESP_LOGI(TAG, "Pump stopped - delaying %dms for pressure equalization", PRESSURE_EQUALIZE_DELAY_MS);
     vTaskDelay(pdMS_TO_TICKS(PRESSURE_EQUALIZE_DELAY_MS));
 

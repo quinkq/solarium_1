@@ -80,6 +80,11 @@ extern sht4x_t sht4x_dev;
 extern bmp280_t bmp280_dev;
 extern as5600_t as5600_dev;
 
+// Diagnostic mode state
+extern bool diagnostic_mode_active;               // True when in diagnostic mode
+extern tempesta_diag_snapshot_t diagnostic_data;  // Live diagnostic data (updated continuously)
+extern uint16_t diagnostic_last_as5600_angle;     // Last AS5600 angle for rotation counting
+
 // PMS5003 data structure
 typedef struct {
     uint16_t pm1_0_cf1; // PM1.0 concentration (CF=1)
@@ -151,5 +156,8 @@ void tempesta_daily_reset_callback(void);
 // Task functions
 void tempesta_as5600_sampling_task(void *pvParameters);
 
+// Diagnostic mode functions
+esp_err_t tempesta_diag_read_hall_array(void);
+esp_err_t tempesta_diag_read_as5600(void);
 
 #endif // TEMPESTA_PRIVATE_H

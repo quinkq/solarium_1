@@ -89,6 +89,11 @@ time_t servo_debug_start_time = 0;         // Timestamp when control mode starte
 bool servo_debug_bus_requested = false;    // True if we have 6.6V bus power
 uint32_t servo_debug_current_duty = 0;     // Current servo duty cycle (tracked locally during control)
 
+// TEMPESTA diagnostic state (for wind sensor debugging)
+bool tempesta_diag_active = false;         // True when in diagnostic mode
+time_t tempesta_diag_start_time = 0;       // Timestamp when diagnostic mode started (for 90s timeout)
+bool tempesta_diag_bus_requested = false;  // True if we have 3.3V bus power
+
 // ########################## Private Function Declarations ##########################
 
 // Task functions

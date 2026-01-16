@@ -85,14 +85,6 @@ ads1115_device_t ads1115_devices[ADS1115_DEVICE_COUNT] = {
     }
 };
 
-// Latest voltage readings for debug display and sharing
-static float latest_voltages[ADS1115_DEVICE_COUNT][4] = {
-    {-999.9, -999.9, -999.9, -999.9}, // Dev#0: Moisture sensors
-    {-999.9, -999.9, -999.9, -999.9}, // Dev#1: Mixed
-    {-999.9, -999.9, -999.9, -999.9}, // Dev#2: Photoresistors
-    {-999.9, -999.9, -999.9, -999.9}  // Dev#3: Zone5 moisture + pressure + spare
-};
-
 // Mutex for thread-safe access
 static SemaphoreHandle_t xADS1115Mutex = NULL;
 
@@ -550,12 +542,6 @@ esp_err_t ads1115_helper_read_channel(uint8_t device_id, ads111x_mux_t channel, 
             }
         }
 
-        // Update latest voltages array if within bounds
-        if (channel >= ADS111X_MUX_0_GND && channel <= ADS111X_MUX_3_GND) {
-            uint8_t ch_idx = channel - ADS111X_MUX_0_GND;
-            latest_voltages[device_id][ch_idx] = calculated_voltage;
-        }
-
         // Success!
         xSemaphoreGive(xADS1115Mutex);
         fluctus_release_bus_power(POWER_BUS_3V3, "ADS1115_CH_READ");
@@ -588,29 +574,6 @@ bool ads1115_helper_is_device_ready(uint8_t device_id)
     }
     
     return ads1115_devices[device_id].initialized;
-}
-
-// TODO: verify ads1115_helper_get_latest_voltages is still needed - probably intended for initial serial debuging
-esp_err_t ads1115_helper_get_latest_voltages(float voltages[ADS1115_DEVICE_COUNT][4])
-{
-    if (!voltages) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    if (xSemaphoreTake(xADS1115Mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
-        ESP_LOGW(TAG, "Failed to take mutex for voltage read");
-        return ESP_ERR_TIMEOUT;
-    }
-
-    // Copy latest voltages
-    for (int dev = 0; dev < ADS1115_DEVICE_COUNT; dev++) {
-        for (int ch = 0; ch < 4; ch++) {
-            voltages[dev][ch] = latest_voltages[dev][ch];
-        }
-    }
-
-    xSemaphoreGive(xADS1115Mutex);
-    return ESP_OK;
 }
 
 esp_err_t ads1115_helper_get_device_info(uint8_t device_id, ads1115_device_t *device_info)

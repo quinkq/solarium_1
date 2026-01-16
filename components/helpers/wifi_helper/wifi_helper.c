@@ -39,12 +39,14 @@
 
 // Exponential backoff delays (milliseconds)
 static const uint32_t BACKOFF_DELAYS_MS[] = {
-    1000,   // 1 second
-    2000,   // 2 seconds
-    5000,   // 5 seconds
-    10000,  // 10 seconds
-    30000,  // 30 seconds
-    60000   // 60 seconds (max)
+    1000,    // 1 second
+    2000,    // 2 seconds
+    5000,    // 5 seconds
+    10000,   // 10 seconds
+    30000,   // 30 seconds
+    60000,   // 60 seconds
+    600000,  // 10 minutes
+    3600000, // 60 minutes (max)
 };
 #define BACKOFF_LEVELS (sizeof(BACKOFF_DELAYS_MS) / sizeof(BACKOFF_DELAYS_MS[0]))
 

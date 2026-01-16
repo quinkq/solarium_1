@@ -131,7 +131,7 @@
 
 // Overcurrent Protection
 #define FLUCTUS_OVERCURRENT_THRESHOLD_1       3.0f    // Amps, 5-second delay
-#define FLUCTUS_OVERCURRENT_THRESHOLD_2       5.0f    // Amps, immediate shutdown
+#define FLUCTUS_OVERCURRENT_THRESHOLD_2       4.0f    // Amps, immediate shutdown
 #define FLUCTUS_OVERCURRENT_DELAY_MS          5000    // Delay for threshold 1
 
 // Mutex timeout constants

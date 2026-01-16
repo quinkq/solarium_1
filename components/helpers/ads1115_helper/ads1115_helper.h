@@ -42,9 +42,9 @@ typedef struct {
     const char *name;             // Device name for logging
 
     // Configuration parameters (set during initialization)
-    ads111x_mode_t mode;          // Operating mode (single-shot or continuous)
+    ads111x_mode_t mode;           // Operating mode (single-shot or continuous)
     ads111x_data_rate_t data_rate; // Data rate (SPS)
-    ads111x_gain_t gain;          // Programmable gain amplifier setting
+    ads111x_gain_t gain;           // Programmable gain amplifier setting
 } ads1115_device_t;
 
 extern ads1115_device_t ads1115_devices[ADS1115_DEVICE_COUNT];
@@ -87,17 +87,6 @@ esp_err_t ads1115_helper_read_channel(uint8_t device_id, ads111x_mux_t channel, 
  * @return false if device is not initialized or device_id is invalid
  */
 bool ads1115_helper_is_device_ready(uint8_t device_id);
-
-/**
- * @brief Get the latest voltage readings for display purposes
- * 
- * Thread-safe access to the latest ADC readings across all devices.
- * 
- * @param voltages 2D array to store voltages [device][channel]
- * @return ESP_OK on success
- * @return ESP_ERR_INVALID_ARG if voltages is NULL
- */
-esp_err_t ads1115_helper_get_latest_voltages(float voltages[ADS1115_DEVICE_COUNT][4]);
 
 /**
  * @brief Get device status information

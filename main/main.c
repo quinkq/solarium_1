@@ -22,7 +22,7 @@
 #include "fluctus.h"
 #include "stellaria.h"
 #include "telemetry.h"
-#include "solar_calc.h" // For debug printouts only - remvoe it later
+#include "solar_calc.h"
 #include "hmi.h"
 #include "wifi_helper.h"
 #include "interval_config.h"
@@ -42,26 +42,11 @@
 // ########################## Global Variable Definitions ##########################
 #define TAG "SOLARIUM_1"
 
-// Mutex for protecting shared display data
-SemaphoreHandle_t xDisplayDataMutex = NULL;
-
-// ADS1115 voltages are now managed by ads1115_helper component
-
-// INA219 data now retrieved directly from FLUCTUS component
-
-// Debuging display variables
-float latest_sht_temp = -999.9;
-float latest_sht_hum = -999.9;
-float latest_bmp_temp = -999.9;
-float latest_bmp_press = -999.9;
-float latest_bmp_hum = -999.9;
-float latest_as5600_angle = -999.9;
-uint16_t latest_as5600_raw = 0;
-
 // ########################## FUNCTION DECLARATIONS ################################
 
 
 // ################################ FUNCTIONS ######################################
+
 // ------- SPI Bus Initialization -------
 
 /**
@@ -91,151 +76,6 @@ esp_err_t spi_bus_init(void)
     return ESP_OK;
 }
 
-// -----------------#################################-----------------
-// -----------------############# TASKS #############-----------------
-// -----------------#################################-----------------
-/*
-void serial_debug_display_task(void *pvParameters)
-{
-    ESP_LOGI(TAG, "Serial Display Task started.");
-    vTaskDelay(pdMS_TO_TICKS(1000));
-    // ANSI escape codes
-    const char *ANSI_CLEAR_SCREEN = "\033[2J";
-    const char *ANSI_CURSOR_HOME = "\033[H";
-
-    char buffer[100]; // Buffer for formatting lines
-
-    // Declare local variables for sensor readings outside the loop
-    float sht_t, sht_h, bmp_t, bmp_p, bmp_h, as_a;
-    uint16_t as_r;
-    float ads_voltages[ADS1115_DEVICE_COUNT][4];
-    fluctus_snapshot_t fluctus_data;
-
-    while (1) {
-        // --- Read Global Variables Safely ---
-        if (xSemaphoreTake(xDisplayDataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            // SHT4x
-            sht_t = latest_sht_temp;
-            sht_h = latest_sht_hum;
-            // BMP280
-            bmp_t = latest_bmp_temp;
-            bmp_p = latest_bmp_press;
-            bmp_h = latest_bmp_hum;
-            // Get ADS1115 voltages from helper component (no longer from global arrays)
-            // AS5600
-            as_a = latest_as5600_angle;
-            as_r = latest_as5600_raw;
-            // INA219 values will be read from FLUCTUS separately
-
-            xSemaphoreGive(xDisplayDataMutex);
-        } else {
-            ESP_LOGW(TAG, "Serial display task could not get mutex");
-            // Optionally print an error message to serial?
-            printf("%s%s!!! Failed to get mutex !!!\n", ANSI_CLEAR_SCREEN, ANSI_CURSOR_HOME);
-            vTaskDelay(pdMS_TO_TICKS(SERIAL_DISPLAY_INTERVAL_MS));
-            continue;
-        }
-        
-        // Get ADS1115 voltages from helper component
-        esp_err_t ads_ret = ads1115_helper_get_latest_voltages(ads_voltages);
-        if (ads_ret != ESP_OK) {
-            ESP_LOGW(TAG, "Failed to get ADS1115 voltages: %s", esp_err_to_name(ads_ret));
-            // Initialize with error values
-            for (int dev = 0; dev < ADS1115_DEVICE_COUNT; dev++) {
-                for (int ch = 0; ch < 4; ch++) {
-                    ads_voltages[dev][ch] = -999.9;
-                }
-            }
-        }
-        
-        // Get INA219/power monitoring data from TELEMETRY
-        esp_err_t fluctus_ret = telemetry_get_fluctus_data(&fluctus_data);
-        if (fluctus_ret != ESP_OK) {
-            ESP_LOGW(TAG, "Failed to get FLUCTUS data from telemetry: %s", esp_err_to_name(fluctus_ret));
-            // Initialize with error values
-            fluctus_data.solar_voltage = fluctus_data.solar_current = fluctus_data.solar_power_w = -999.9;
-            fluctus_data.battery_voltage = fluctus_data.battery_current = fluctus_data.battery_power_w = -999.9;
-        }
-        // --- End Read ---
-
-        // --- Format and Print to Serial Monitor ---
-        // Clear screen and move cursor to top-left
-
-        // printf("%s%s", ANSI_CLEAR_SCREEN, ANSI_CURSOR_HOME);
-
-        // Print header
-        printf("--- Sensor Readings ---\n");
-
-        // Print sensor data (chat says using snprintf for safety is good practice)
-        snprintf(buffer, sizeof(buffer), "SHT4x: Temp=%.1f C, Hum=%.1f %%\n", sht_t, sht_h);
-        printf("%s", buffer);
-
-        snprintf(buffer,
-                 sizeof(buffer),
-                 "BMP280: Temp=%.1f C, Press=%.0f hPa, Hum=%.1f %%\n",
-                 bmp_t,
-                 bmp_p / 100,
-                 bmp_h); // Assuming BME & Pa -> hPa
-        printf("%s", buffer);
-
-        // Display ADS1115 readings organized by function
-        snprintf(buffer,
-                 sizeof(buffer),
-                 "ADS0 (Photo): LT=%.3f RT=%.3f LB=%.3f RB=%.3f\n",
-                 ads_voltages[0][0],
-                 ads_voltages[0][1],
-                 ads_voltages[0][2],
-                 ads_voltages[0][3]);
-        printf("%s", buffer);
-
-        snprintf(buffer,
-                 sizeof(buffer),
-                 "ADS1 (Moist): Z1=%.3f Z2=%.3f Z3=%.3f Z4=%.3f\n",
-                 ads_voltages[1][0],
-                 ads_voltages[1][1],
-                 ads_voltages[1][2],
-                 ads_voltages[1][3]);
-        printf("%s", buffer);
-
-        snprintf(buffer,
-                 sizeof(buffer),
-                 "ADS2 (Mixed): Z5=%.3f Press=%.3f Ch2=%.3f Ch3=%.3f\n",
-                 ads_voltages[2][0],
-                 ads_voltages[2][1],
-                 ads_voltages[2][2],
-                 ads_voltages[2][3]);
-        printf("%s", buffer);
-
-        snprintf(buffer, sizeof(buffer), "AS5600: Angle=%.1f deg, Raw=%u\n", as_a, as_r);
-        printf("%s", buffer);
-
-        // Add INA219 display
-        snprintf(buffer,
-                 sizeof(buffer),
-                 "INA219_Solar: V=%.2f V, I=%.2f mA, P=%.2f mW\n",
-                 fluctus_data.solar_voltage,
-                 fluctus_data.solar_current * 1000,
-                 fluctus_data.solar_power_w * 1000);
-        printf("%s", buffer);
-
-        snprintf(buffer,
-                 sizeof(buffer),
-                 "INA219_Battery: V=%.2f V, I=%.2f mA, P=%.2f mW\n",
-                 fluctus_data.battery_voltage,
-                 fluctus_data.battery_current * 1000,
-                 fluctus_data.battery_power_w * 1000);
-        printf("%s", buffer);
-
-        printf("-----------------------\n");
-        // Flush stdout buffer to ensure data is sent immediately
-        fflush(stdout);
-
-        // --- End Format and Print ---
-
-        vTaskDelay(pdMS_TO_TICKS(SERIAL_DISPLAY_INTERVAL_MS));
-    }
-}
-*/
 // -----------------##########################################-----------------
 // -----------------################### MAIN #################-----------------
 // -----------------##########################################-----------------
@@ -256,16 +96,6 @@ void app_main(void)
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
-
-
-    /* Display Mutex creation */
-    xDisplayDataMutex = xSemaphoreCreateMutex();
-    if (xDisplayDataMutex == NULL) {
-        ESP_LOGE(TAG, "Failed to create display data mutex!");
-        // Handle error appropriately, maybe halt or return an error code
-    } else {
-        ESP_LOGI(TAG, "Display data mutex created successfully.");
-    }
 
     /* Print chip information */
     esp_chip_info_t chip_info;
@@ -298,23 +128,21 @@ void app_main(void)
     tzset();
     ESP_LOGI(TAG, "Timezone configured: CET-1CEST (Poland)");
 
-    // Initialize Wi-Fi helper (handles WiFi, SNTP, reconnection, power management)
+    // Initialize Wi-Fi helper
     vTaskDelay(pdMS_TO_TICKS(100));
     ESP_LOGI(TAG, "Initializing WiFi helper...");
     ESP_ERROR_CHECK(wifi_helper_init(WIFI_SSID, WIFI_PASSWORD));
 
     // Initialize I2C subsystem
     vTaskDelay(pdMS_TO_TICKS(100));
-    ESP_LOGI(TAG, "Initializing I2C...");
-    ESP_ERROR_CHECK(i2cdev_init());
 
     // Initialize SPI2 bus (shared by ABP sensor and HMI display)
     vTaskDelay(pdMS_TO_TICKS(100));
     ESP_LOGI(TAG, "Initializing SPI2 bus...");
     ESP_ERROR_CHECK(spi_bus_init());
 
-    // Initialize telemetry subsystem (power metering, weather data collection, LittleFS storage)
-    // IMPORTANT: Must run BEFORE interval_config_init (mounts LittleFS at /data)
+    // Initialize telemetry subsystem
+    // Must run BEFORE interval_config_init (mounts LittleFS at /data)
     vTaskDelay(pdMS_TO_TICKS(100));
     ESP_LOGI(TAG, "Initializing telemetry subsystem...");
     esp_err_t telemetry_ret = telemetry_init();
@@ -437,10 +265,6 @@ void app_main(void)
         ESP_LOGI(TAG, "HMI initialized successfully");
     }
 
-/*
-    // Misc tasks / debug tools - ADS1115 retry task now handled by ads1115_helper component
-    xTaskCreate(serial_debug_display_task, "serial_debug_display_task", configMINIMAL_STACK_SIZE * 4, NULL, 5, NULL);
-*/
     ESP_LOGI(TAG, "Tasks created!!!");
 
     // Detailed heap stats after all initialization complete

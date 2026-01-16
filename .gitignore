@@ -1,6 +1,5 @@
 .vscode/
 .devcontainer/
-esp8266_test/
 build/
 managed_components/
 main/wifi_credentials.h
@@ -10,15 +9,8 @@ monitor_rolling_native.ps1
 logs/*.log
 logs/*.txt
 
-components/helpers/abp/abp_example.c
-components/helpers/abp/README.md
-
 components/core/telemetry/TELEMETRY_ARCHITECTURE.md
-components/core/telemetry/mqtt_migration.md
-
 components/core/hmi/HMI_ARCHITECTURE.md
-components/core/hmi/HMI_SPLIT_TODO.md
 
 components/helpers/interval_config/MQTT_INTERVAL_COMMANDS.md
-components/helpers/interval_config/INTERVAL_ADJUSTMENT_TODO.md
-components/core/telemetry/TELEMETRY_SPLIT_TODO.md
+components/third_party/encoder

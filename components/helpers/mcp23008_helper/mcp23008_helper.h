@@ -210,47 +210,6 @@ esp_err_t mcp23008_helper_oled_reset_pulse(void);
  */
 esp_err_t mcp23008_helper_oled_reset_release(void);
 
-/**
- * @brief MCP23008 diagnostics structure
- *
- * Contains error counters and statistics for debugging I2C issues
- * and interrupt handling problems.
- */
-typedef struct {
-    uint32_t total_interrupts;           ///< Total interrupts processed since boot
-    uint32_t total_i2c_errors;           ///< Total I2C communication errors
-    uint32_t total_spurious_interrupts;  ///< Total spurious interrupts (INTF=INTCAP=0)
-    uint32_t consecutive_i2c_errors;     ///< Current consecutive I2C error count
-    uint32_t consecutive_spurious;       ///< Current consecutive spurious interrupt count
-    uint32_t recovery_attempts;          ///< Number of recovery attempts
-    uint32_t recovery_successes;         ///< Number of successful recoveries
-} mcp23008_diagnostics_t;
-
-/**
- * @brief Get MCP23008 diagnostics and error statistics
- *
- * Returns diagnostic information for monitoring I2C health and detecting
- * issues with interrupt handling. Useful for debugging encoder/button failures.
- *
- * @param[out] diag Pointer to structure to fill with diagnostic data
- * @return ESP_OK on success
- * @return ESP_ERR_INVALID_ARG if diag is NULL
- */
-esp_err_t mcp23008_helper_get_diagnostics(mcp23008_diagnostics_t *diag);
-
-/**
- * @brief Print MCP23008 diagnostics to console (serial monitor)
- *
- * Dumps comprehensive diagnostic information to the ESP_LOG output, including:
- * - Interrupt counts and error statistics
- * - Recovery attempt success rate
- * - Current encoder/pulse counter values
- * - Hardware state (INT pin level)
- *
- * Useful for debugging encoder failures, I2C issues, and interrupt storms.
- * Output appears in serial monitor (JTAG/USB console).
- */
-void mcp23008_helper_print_diagnostics(void);
 
 #ifdef __cplusplus
 }

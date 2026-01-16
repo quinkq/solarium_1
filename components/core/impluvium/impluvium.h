@@ -90,8 +90,9 @@
 #define TEMP_CORRECTION_FACTOR 0.01f               // 1% correction per degree C
 
 // Dynamic Pump Control Settings
-#define PUMP_RAMP_UP_TIME_MS 5000      // 5-second ramp-up time
-#define TARGET_MOISTURE_GAIN_RATE 0.5f // Target 0.5% moisture gain per second
+#define PUMP_RAMPUP_TIME_MS 5000        // 5-second ramp-up time
+#define PUMP_RAMPDOWN_TIME_MS 3000      // 3-second ramp-down time (gentler hardware stress)
+#define TARGET_MOISTURE_GAIN_RATE 0.5f   // Target 0.5% moisture gain per second
 #define PUMP_ADJUSTMENT_STEP 20        // Pump duty adjustment step
 #define PUMP_GAIN_RATE_TOLERANCE 0.1f  // Acceptable gain rate deviation
 

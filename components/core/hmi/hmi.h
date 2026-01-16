@@ -25,7 +25,7 @@
 // Display Timing Configuration
 #define HMI_DISPLAY_TIMEOUT_NORMAL_MS   (30 * 1000)  // 30 second timeout for normal menus
 #define HMI_DISPLAY_TIMEOUT_REALTIME_MS (60 * 1000)  // 60 second timeout for realtime pages
-#define HMI_REFRESH_RATE_NORMAL_MS      250          // 2Hz for static menus (responsive interaction)
+#define HMI_REFRESH_RATE_NORMAL_MS      250          // 4Hz for static menus (responsive interaction)
 #define HMI_REFRESH_RATE_REALTIME_MS    125          // 8Hz for realtime pages (smooth updates)
 
 // Menu Configuration
@@ -53,6 +53,7 @@ typedef enum {
     HMI_MENU_FLUCTUS_INTERVALS,  // Interval configuration (power day/night, solar correction) [1Hz]
     HMI_MENU_TEMPESTA,           // TEMPESTA weather station submenu
     HMI_MENU_TEMPESTA_SENSORS,   // Paginated sensors (Environment, Wind, Rain+Tank, Air) [4 pages]
+    HMI_MENU_TEMPESTA_DIAG,      // Paginated diagnostics menu for HALL wind direction, AS5600 wind speed and LDR readings [Realtime]
     HMI_MENU_TEMPESTA_CONTROLS,  // System controls (enable/disable, force collection, resets)
     HMI_MENU_TEMPESTA_INTERVALS, // Interval configuration (normal, power save) [1Hz]
     HMI_MENU_IMPLUVIUM,              // IMPLUVIUM irrigation submenu

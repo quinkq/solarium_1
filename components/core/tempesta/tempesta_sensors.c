@@ -738,3 +738,178 @@ esp_err_t tempesta_get_tank_intake_pulse_count(int *pulse_count)
 
     return ESP_OK;
 }
+
+// ########################## Diagnostic Mode Functions ##########################
+
+/**
+ * @brief Read Hall array sensors in diagnostic mode (continuous power)
+ *
+ * Assumes Hall array is already powered (fluctus_hall_array_enable(true) called).
+ * Updates diagnostic_data global with raw voltages and calculated direction.
+ * No power gating - designed for continuous reading at 125ms intervals.
+ */
+esp_err_t tempesta_diag_read_hall_array(void)
+{
+    // NOTE: Hall array should already be powered by tempesta_enter_diagnostic_mode()
+    // No settling delay needed - sensors are continuously powered
+
+    // Read all 4 Hall sensors (N, E, S, W) from ADS1115 Device 3
+    float voltage_north = 0.0f, voltage_east = 0.0f, voltage_south = 0.0f, voltage_west = 0.0f;
+    int16_t raw_value;
+
+    // North sensor (AIN0)
+    if (ads1115_helper_read_channel(WEATHER_WIND_DIR_ADS1115_DEVICE,
+                                     WEATHER_WIND_DIR_HALL_NORTH_CH,
+                                     &raw_value, NULL) == ESP_OK) {
+        voltage_north = (float) raw_value / 1000.0f;  // Convert mV to V
+    } else {
+        ESP_LOGD(TAG, "Failed to read North hall sensor");
+    }
+
+    // East sensor (AIN1)
+    if (ads1115_helper_read_channel(WEATHER_WIND_DIR_ADS1115_DEVICE,
+                                     WEATHER_WIND_DIR_HALL_EAST_CH,
+                                     &raw_value, NULL) == ESP_OK) {
+        voltage_east = (float) raw_value / 1000.0f;
+    } else {
+        ESP_LOGD(TAG, "Failed to read East hall sensor");
+    }
+
+    // South sensor (AIN2)
+    if (ads1115_helper_read_channel(WEATHER_WIND_DIR_ADS1115_DEVICE,
+                                     WEATHER_WIND_DIR_HALL_SOUTH_CH,
+                                     &raw_value, NULL) == ESP_OK) {
+        voltage_south = (float) raw_value / 1000.0f;
+    } else {
+        ESP_LOGD(TAG, "Failed to read South hall sensor");
+    }
+
+    // West sensor (AIN3)
+    if (ads1115_helper_read_channel(WEATHER_WIND_DIR_ADS1115_DEVICE,
+                                     WEATHER_WIND_DIR_HALL_WEST_CH,
+                                     &raw_value, NULL) == ESP_OK) {
+        voltage_west = (float) raw_value / 1000.0f;
+    } else {
+        ESP_LOGD(TAG, "Failed to read West hall sensor");
+    }
+
+    // Store raw voltages
+    diagnostic_data.hall_voltage_north = voltage_north;
+    diagnostic_data.hall_voltage_east = voltage_east;
+    diagnostic_data.hall_voltage_south = voltage_south;
+    diagnostic_data.hall_voltage_west = voltage_west;
+
+    // Calculate weighted direction using vector addition (same algorithm as normal mode)
+    // Each sensor contributes a unit vector in its direction, weighted by its normalized reading
+    float weight_north = fmaxf(0.0f, (voltage_north - WEATHER_WIND_DIR_THRESHOLD_VOLTAGE) /
+                                         (WEATHER_WIND_DIR_MAX_VOLTAGE - WEATHER_WIND_DIR_THRESHOLD_VOLTAGE));
+    float weight_east = fmaxf(0.0f, (voltage_east - WEATHER_WIND_DIR_THRESHOLD_VOLTAGE) /
+                                        (WEATHER_WIND_DIR_MAX_VOLTAGE - WEATHER_WIND_DIR_THRESHOLD_VOLTAGE));
+    float weight_south = fmaxf(0.0f, (voltage_south - WEATHER_WIND_DIR_THRESHOLD_VOLTAGE) /
+                                         (WEATHER_WIND_DIR_MAX_VOLTAGE - WEATHER_WIND_DIR_THRESHOLD_VOLTAGE));
+    float weight_west = fmaxf(0.0f, (voltage_west - WEATHER_WIND_DIR_THRESHOLD_VOLTAGE) /
+                                        (WEATHER_WIND_DIR_MAX_VOLTAGE - WEATHER_WIND_DIR_THRESHOLD_VOLTAGE));
+
+    // Normalize weights (0-1 range)
+    weight_north = fminf(1.0f, weight_north);
+    weight_east = fminf(1.0f, weight_east);
+    weight_south = fminf(1.0f, weight_south);
+    weight_west = fminf(1.0f, weight_west);
+
+    // Vector addition: N=0°, E=90°, S=180°, W=270°
+    float sum_x = weight_east - weight_west;                // East-West axis (positive = East)
+    float sum_y = weight_north - weight_south;              // North-South axis (positive = North)
+
+    float direction_deg = 0.0f;
+    float magnitude = sqrtf(sum_x * sum_x + sum_y * sum_y); // Signal strength
+
+    if (magnitude > 0.01f) {                                // Threshold to avoid noise
+        direction_deg = atan2f(sum_x, sum_y) * 180.0f / M_PI; // atan2(x, y) for North=0°
+        if (direction_deg < 0.0f) {
+            direction_deg += 360.0f; // Normalize to 0-360°
+        }
+    } else {
+        direction_deg = 0.0f; // No clear direction
+    }
+
+    // Store calculated values
+    diagnostic_data.hall_direction_deg = direction_deg;
+    diagnostic_data.hall_magnitude = fminf(1.0f, magnitude); // Clamp to 0-1
+    strncpy(diagnostic_data.hall_direction_cardinal, tempesta_degrees_to_cardinal(direction_deg),
+            sizeof(diagnostic_data.hall_direction_cardinal) - 1);
+    diagnostic_data.hall_direction_cardinal[sizeof(diagnostic_data.hall_direction_cardinal) - 1] = '\0';
+
+    ESP_LOGD(TAG, "Hall diag: N=%.2fV E=%.2fV S=%.2fV W=%.2fV → %.1f° (%s) mag=%.2f",
+             voltage_north, voltage_east, voltage_south, voltage_west,
+             direction_deg, diagnostic_data.hall_direction_cardinal, magnitude);
+
+    return ESP_OK;
+}
+
+/**
+ * @brief Read AS5600 sensor in diagnostic mode (continuous NORMAL mode)
+ *
+ * Assumes AS5600 is in NORMAL power mode (not LPM3).
+ * Updates diagnostic_data global with angle, rotation count, and magnet status.
+ * Tracks rotations using angle delta (handles wrap-around at 4096 counts).
+ */
+esp_err_t tempesta_diag_read_as5600(void)
+{
+    // Read current raw angle (0-4095)
+    uint16_t current_raw_angle;
+    esp_err_t ret = as5600_read_raw_counts(&as5600_dev, &current_raw_angle);
+
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to read AS5600 angle: %s", esp_err_to_name(ret));
+        diagnostic_data.as5600_raw_angle = 0;
+        diagnostic_data.as5600_angle_deg = 0.0f;
+        return ESP_FAIL;
+    }
+
+    // Store raw angle
+    diagnostic_data.as5600_raw_angle = current_raw_angle;
+
+    // Convert to degrees (0-360°)
+    diagnostic_data.as5600_angle_deg = (float) current_raw_angle * 360.0f / 4096.0f;
+
+    // Update rotation counter (detect wrap-around)
+    if (diagnostic_last_as5600_angle != 0) { // Skip first reading
+        int16_t angle_diff = current_raw_angle - diagnostic_last_as5600_angle;
+
+        // Handle wrap-around at 4096 counts
+        if (angle_diff > 2048) {
+            angle_diff -= 4096; // Wrapped backward
+        } else if (angle_diff < -2048) {
+            angle_diff += 4096; // Wrapped forward
+        }
+
+        // Accumulate rotations (positive = CW, negative = CCW)
+        float rotation_delta = (float) angle_diff / 4096.0f;
+        if (fabsf(rotation_delta) > 0.01f) { // Ignore noise (< 0.01 rotations = ~4 counts)
+            diagnostic_data.as5600_rotation_count += (int32_t)(rotation_delta * 1000.0f); // Store as millirotations for precision
+        }
+    }
+
+    diagnostic_last_as5600_angle = current_raw_angle;
+
+    // Read magnet status
+    as5600_status_t as5600_status;
+    if (as5600_read_status(&as5600_dev, &as5600_status) == ESP_OK) {
+        diagnostic_data.as5600_magnet_detected = as5600_status.magnet_detected;
+        diagnostic_data.as5600_magnet_too_weak = as5600_status.magnet_too_weak;
+        diagnostic_data.as5600_magnet_too_strong = as5600_status.magnet_too_strong;
+    } else {
+        diagnostic_data.as5600_magnet_detected = false;
+        diagnostic_data.as5600_magnet_too_weak = false;
+        diagnostic_data.as5600_magnet_too_strong = false;
+    }
+
+    ESP_LOGD(TAG, "AS5600 diag: angle=%u (%.1f°) rot_count=%ld mag=%d weak=%d strong=%d",
+             current_raw_angle, diagnostic_data.as5600_angle_deg,
+             diagnostic_data.as5600_rotation_count / 1000, // Display as whole rotations
+             diagnostic_data.as5600_magnet_detected,
+             diagnostic_data.as5600_magnet_too_weak,
+             diagnostic_data.as5600_magnet_too_strong);
+
+    return ESP_OK;
+}

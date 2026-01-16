@@ -58,6 +58,11 @@ sht4x_t sht4x_dev = {0};
 bmp280_t bmp280_dev = {0};
 as5600_t as5600_dev = {0};
 
+// Diagnostic mode state (HMI-exclusive)
+bool diagnostic_mode_active = false;
+tempesta_diag_snapshot_t diagnostic_data = {0};
+uint16_t diagnostic_last_as5600_angle = 0;
+
 // ########################## Private Function Declarations ##########################
 
 // State machine functions
@@ -873,4 +878,152 @@ esp_err_t tempesta_force_collection(void)
     }
 
     return ESP_FAIL;
+}
+
+// ########################## Diagnostic Mode API ##########################
+
+/**
+ * @brief Enter diagnostic mode for real-time wind sensor debugging
+ */
+esp_err_t tempesta_enter_diagnostic_mode(void)
+{
+    if (xTempestaDataMutex == NULL) {
+        ESP_LOGE(TAG, "TEMPESTA not initialized");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    // Check if system is in a valid state for diagnostics
+    if (tempesta_state == TEMPESTA_STATE_READING) {
+        ESP_LOGW(TAG, "Cannot enter diagnostic mode - system currently reading sensors");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (xSemaphoreTake(xTempestaDataMutex, pdMS_TO_TICKS(WEATHER_MUTEX_TIMEOUT_UPDATE_MS)) != pdTRUE) {
+        ESP_LOGE(TAG, "Failed to acquire mutex for diagnostic mode entry");
+        return ESP_FAIL;
+    }
+
+    // Pause collection timer to prevent conflicts
+    if (xTempestaCollectionTimer != NULL) {
+        xTimerStop(xTempestaCollectionTimer, portMAX_DELAY);
+        ESP_LOGI(TAG, "Collection timer paused for diagnostic mode");
+    }
+
+    // Initialize diagnostic data structure
+    memset(&diagnostic_data, 0, sizeof(tempesta_diag_snapshot_t));
+    strncpy(diagnostic_data.hall_direction_cardinal, "---", sizeof(diagnostic_data.hall_direction_cardinal) - 1);
+    diagnostic_data.hall_direction_cardinal[sizeof(diagnostic_data.hall_direction_cardinal) - 1] = '\0';
+
+    // Enable Hall array power continuously (no gating)
+    fluctus_hall_array_enable(true);
+    ESP_LOGI(TAG, "Hall array power enabled (continuous)");
+
+    // Wake AS5600 to NORMAL mode
+    if (as5600_set_power_mode(&as5600_dev, AS5600_POWER_MODE_NORMAL) == ESP_OK) {
+        ESP_LOGI(TAG, "AS5600 set to NORMAL mode");
+    } else {
+        ESP_LOGW(TAG, "Failed to set AS5600 to NORMAL mode");
+    }
+
+    // Reset rotation counter
+    diagnostic_last_as5600_angle = 0;
+    diagnostic_data.as5600_rotation_count = 0;
+
+    // Mark diagnostic mode as active
+    diagnostic_mode_active = true;
+
+    xSemaphoreGive(xTempestaDataMutex);
+
+    ESP_LOGI(TAG, "Diagnostic mode ACTIVE (Hall array + AS5600 continuous)");
+    return ESP_OK;
+}
+
+/**
+ * @brief Exit diagnostic mode and restore normal operation
+ */
+void tempesta_exit_diagnostic_mode(void)
+{
+    if (xTempestaDataMutex == NULL) {
+        return;
+    }
+
+    if (xSemaphoreTake(xTempestaDataMutex, pdMS_TO_TICKS(WEATHER_MUTEX_TIMEOUT_UPDATE_MS)) != pdTRUE) {
+        ESP_LOGW(TAG, "Failed to acquire mutex for diagnostic mode exit");
+        return;
+    }
+
+    if (!diagnostic_mode_active) {
+        xSemaphoreGive(xTempestaDataMutex);
+        return;  // Not in diagnostic mode
+    }
+
+    // Disable Hall array power
+    fluctus_hall_array_enable(false);
+    ESP_LOGI(TAG, "Hall array power disabled");
+
+    // Return AS5600 to LPM3 mode
+    if (as5600_set_power_mode(&as5600_dev, AS5600_POWER_MODE_LPM3) == ESP_OK) {
+        ESP_LOGI(TAG, "AS5600 set to LPM3 mode (power saving)");
+    } else {
+        ESP_LOGW(TAG, "Failed to set AS5600 to LPM3 mode");
+    }
+
+    // Clear diagnostic mode flag
+    diagnostic_mode_active = false;
+
+    // Resume collection timer if system is IDLE or READING
+    if ((tempesta_state == TEMPESTA_STATE_IDLE || tempesta_state == TEMPESTA_STATE_READING) &&
+        xTempestaCollectionTimer != NULL) {
+        tempesta_update_timer_period();
+        xTimerStart(xTempestaCollectionTimer, portMAX_DELAY);
+        ESP_LOGI(TAG, "Collection timer resumed");
+    }
+
+    xSemaphoreGive(xTempestaDataMutex);
+
+    ESP_LOGI(TAG, "Diagnostic mode EXITED (normal operation restored)");
+}
+
+/**
+ * @brief Get live diagnostic data snapshot (for HMI rendering)
+ */
+esp_err_t tempesta_get_diagnostic_data(tempesta_diag_snapshot_t *diag_data)
+{
+    if (diag_data == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (!diagnostic_mode_active) {
+        return ESP_ERR_INVALID_STATE;  // Not in diagnostic mode
+    }
+
+    if (xSemaphoreTake(xTempestaDataMutex, pdMS_TO_TICKS(WEATHER_MUTEX_TIMEOUT_QUICK_MS)) == pdTRUE) {
+        // Read fresh sensor data
+        tempesta_diag_read_hall_array();  // Updates diagnostic_data.hall_*
+        tempesta_diag_read_as5600();      // Updates diagnostic_data.as5600_*
+
+        // Copy to output
+        memcpy(diag_data, &diagnostic_data, sizeof(tempesta_diag_snapshot_t));
+        diag_data->snapshot_timestamp = time(NULL);
+
+        xSemaphoreGive(xTempestaDataMutex);
+        return ESP_OK;
+    }
+
+    return ESP_FAIL;  // Mutex timeout
+}
+
+/**
+ * @brief Check if TEMPESTA is in diagnostic mode
+ */
+bool tempesta_is_diagnostic_mode_active(void)
+{
+    bool active = false;
+
+    if (xSemaphoreTake(xTempestaDataMutex, pdMS_TO_TICKS(WEATHER_MUTEX_TIMEOUT_QUICK_MS)) == pdTRUE) {
+        active = diagnostic_mode_active;
+        xSemaphoreGive(xTempestaDataMutex);
+    }
+
+    return active;
 }

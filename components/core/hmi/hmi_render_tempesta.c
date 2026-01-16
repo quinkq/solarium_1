@@ -21,14 +21,15 @@
 
 /**
  * @brief Render TEMPESTA main menu (dispatcher) with scrolling support
- * Simplified menu: 4 items (Back, Sensors, Controls, Intervals)
+ * Menu: 5 items (Back, Sensors, Diagnostics, Controls, Intervals)
  */
 static void hmi_render_tempesta_menu(void)
 {
-    const uint8_t TOTAL_ITEMS = 4;
+    const uint8_t TOTAL_ITEMS = 5;
     const char *items[] = {
         "< Back",
         "Sensors",      // Paginated: Environment, Wind, Rain+Tank, Air
+        "Diagnostics",  // Realtime: Hall array, AS5600
         "Controls",
         "Intervals"
     };
@@ -312,6 +313,130 @@ static void hmi_render_tempesta_intervals_page(void)
     }
 }
 
+/**
+ * @brief Render TEMPESTA Diagnostics paginated page (realtime 8Hz)
+ * Live sensor debugging for hardware validation:
+ * - Page 1/2: Hall Array (Wind Direction) - 4 voltages + calculated direction
+ * - Page 2/2: AS5600 (Wind Speed) - Angle + rotation counter + magnet status
+ *
+ * Includes timeout warning at 60s (30s before auto-exit at 90s)
+ */
+static void hmi_render_tempesta_diag_page(void)
+{
+    // Set pagination state (2 pages total)
+    hmi_status.total_pages = 2;
+
+    // Navigation symbols
+    hmi_draw_back_symbol();
+    hmi_draw_pagination_symbol();
+
+    // Check for timeout and display warning
+    time_t current_time = time(NULL);
+    time_t elapsed = current_time - tempesta_diag_start_time;
+    bool show_timeout_warning = (elapsed >= 60); // Warn at 60s (30s before auto-exit)
+
+    // Get diagnostic data from TEMPESTA (direct API call, not telemetry)
+    tempesta_diag_snapshot_t diag;
+    esp_err_t ret = tempesta_get_diagnostic_data(&diag);
+
+    if (ret != ESP_OK) {
+        // Diagnostic mode not active - show error
+        hmi_fb_draw_string(10, 2, "Diagnostic Error", false);
+        hmi_fb_draw_hline(0, 10, 128);
+        hmi_fb_draw_string(2, 20, "Mode not active", false);
+        hmi_fb_draw_string(2, 30, "Press to exit", false);
+        return;
+    }
+
+    // Page 1/2: Hall Array (Wind Direction)
+    if (hmi_status.current_page == 0) {
+        // Title with page indicator
+        char title[20];
+        snprintf(title, sizeof(title), "Hall %d/2", hmi_status.current_page + 1);
+        hmi_fb_draw_string(40, 2, title, false);
+        hmi_fb_draw_hline(0, 10, 128);
+
+        // Display raw voltages (2 columns)
+        char buf[32];
+        int y = 14;
+
+        snprintf(buf, sizeof(buf), "N:%.2fV  E:%.2fV", diag.hall_voltage_north, diag.hall_voltage_east);
+        hmi_fb_draw_string(2, y, buf, false);
+        y += 10;
+
+        snprintf(buf, sizeof(buf), "S:%.2fV  W:%.2fV", diag.hall_voltage_south, diag.hall_voltage_west);
+        hmi_fb_draw_string(2, y, buf, false);
+        y += 10;
+
+        // Calculated direction
+        snprintf(buf, sizeof(buf), "Dir: %.0f%c (%s)", diag.hall_direction_deg, 176, diag.hall_direction_cardinal); // 176 = degree symbol
+        hmi_fb_draw_string(2, y, buf, false);
+        y += 10;
+
+        // Signal magnitude (strength)
+        snprintf(buf, sizeof(buf), "Mag: %.2f", diag.hall_magnitude);
+        hmi_fb_draw_string(2, y, buf, false);
+        y += 10;
+
+        // Timeout warning if applicable
+        if (show_timeout_warning) {
+            snprintf(buf, sizeof(buf), "Exit in %llu s", 90 - elapsed);
+            hmi_fb_draw_string(2, 56, buf, true); // Inverted text
+        }
+    }
+    // Page 2/2: AS5600 (Wind Speed Sensor)
+    else if (hmi_status.current_page == 1) {
+        // Title with page indicator
+        char title[20];
+        snprintf(title, sizeof(title), "AS5600 %d/2", hmi_status.current_page + 1);
+        hmi_fb_draw_string(34, 2, title, false);
+        hmi_fb_draw_hline(0, 10, 128);
+
+        // Display angle
+        char buf[32];
+        int y = 14;
+
+        snprintf(buf, sizeof(buf), "Angle: %u", diag.as5600_raw_angle);
+        hmi_fb_draw_string(2, y, buf, false);
+        y += 10;
+
+        snprintf(buf, sizeof(buf), "       %.1f%c", diag.as5600_angle_deg, 176); // 176 = degree symbol
+        hmi_fb_draw_string(2, y, buf, false);
+        y += 10;
+
+        // Rotation counter (display whole rotations)
+        int32_t whole_rotations = diag.as5600_rotation_count / 1000;
+        snprintf(buf, sizeof(buf), "Rotations: %ld", whole_rotations);
+        hmi_fb_draw_string(2, y, buf, false);
+        y += 12;
+
+        // Magnet status
+        const char *mag_status = "NONE";
+        if (diag.as5600_magnet_detected) {
+            if (diag.as5600_magnet_too_strong) {
+                mag_status = "TOO STRONG!";
+            } else if (diag.as5600_magnet_too_weak) {
+                mag_status = "TOO WEAK";
+            } else {
+                mag_status = "GOOD";
+            }
+        }
+
+        hmi_fb_draw_string(2, y, "Magnet:", false);
+        hmi_fb_draw_string(48, y, mag_status, diag.as5600_magnet_detected);
+        y += 10;
+
+        // Timeout warning if applicable
+        if (show_timeout_warning) {
+            snprintf(buf, sizeof(buf), "Exit in %llus", 90 - elapsed);
+            hmi_fb_draw_string(2, 56, buf, true); // Inverted text
+        } else {
+            // Instruction text (spin magnet)
+            hmi_fb_draw_string(2, 56, "Spin magnet...", false);
+        }
+    }
+}
+
 // ########################## Public Dispatcher ##########################
 
 /**
@@ -326,6 +451,33 @@ void hmi_render_tempesta_pages(void)
             break;
         case HMI_MENU_TEMPESTA_SENSORS:
             hmi_render_tempesta_sensors_page();
+            break;
+        case HMI_MENU_TEMPESTA_DIAG:
+            hmi_render_tempesta_diag_page();
+
+            // Check for 90-second timeout and auto-exit
+            if (tempesta_diag_active) {
+                time_t elapsed = time(NULL) - tempesta_diag_start_time;
+                if (elapsed >= 90) {
+
+                    // Exit diagnostic mode
+                    tempesta_exit_diagnostic_mode();
+
+                    // Release 3.3V bus power
+                    if (tempesta_diag_bus_requested) {
+                        fluctus_release_bus_power(POWER_BUS_3V3, "HMI_TEMPESTA_DIAG");
+                        tempesta_diag_bus_requested = false;
+                    }
+
+                    tempesta_diag_active = false;
+
+                    // Navigate back to TEMPESTA menu
+                    hmi_status.current_menu = HMI_MENU_TEMPESTA;
+                    hmi_status.selected_item = 0;
+                    hmi_status.current_page = 0;
+                    hmi_status.total_pages = 0;
+                }
+            }
             break;
         case HMI_MENU_TEMPESTA_CONTROLS:
             hmi_render_tempesta_controls_page();

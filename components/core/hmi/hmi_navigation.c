@@ -38,6 +38,8 @@ static void hmi_action_exit_servo_control(void);
 // TEMPESTA Actions
 static void hmi_action_toggle_tempesta(void);
 static void hmi_action_force_tempesta_collection(void);
+static void hmi_action_enter_tempesta_diag(void);
+static void hmi_action_exit_tempesta_diag(void);
 static void hmi_action_confirm_tempesta_reset_daily(void);
 static void hmi_action_confirm_tempesta_reset_weekly(void);
 static void hmi_action_confirm_tempesta_reset_rain(void);
@@ -119,7 +121,7 @@ static const nav_transition_t fluctus_detail_page_transitions[] = {
 static const nav_transition_t fluctus_solar_transitions[] = {
     // Page 4 has interactive controls
     // Item 0 (< Back) navigates back, Item 1 (Debug toggle) triggers action
-    { .item_index = 0, .next_menu = HMI_MENU_FLUCTUS,               .action = NAV_ACTION_NAVIGATE, .handler = NULL },
+    { .item_index = 0, .next_menu = HMI_MENU_FLUCTUS,       .action = NAV_ACTION_NAVIGATE, .handler = NULL },
     { .item_index = 1, .next_menu = HMI_MENU_FLUCTUS_SOLAR, .action = NAV_ACTION_TOGGLE,   .handler = hmi_action_toggle_solar_debug_mode },
 };
 
@@ -151,12 +153,17 @@ static const nav_transition_t fluctus_servo_control_transitions[] = {
 static const nav_transition_t tempesta_menu_transitions[] = {
     { .item_index = 0, .next_menu = HMI_MENU_MAIN,              .action = NAV_ACTION_NAVIGATE, .handler = NULL },
     { .item_index = 1, .next_menu = HMI_MENU_TEMPESTA_SENSORS,  .action = NAV_ACTION_NAVIGATE, .handler = NULL },
-    { .item_index = 2, .next_menu = HMI_MENU_TEMPESTA_CONTROLS, .action = NAV_ACTION_NAVIGATE, .handler = NULL },
-    { .item_index = 3, .next_menu = HMI_MENU_TEMPESTA_INTERVALS,.action = NAV_ACTION_NAVIGATE, .handler = NULL },
+    { .item_index = 2, .next_menu = HMI_MENU_TEMPESTA_DIAG,     .action = NAV_ACTION_EXECUTE,  .handler = hmi_action_enter_tempesta_diag },
+    { .item_index = 3, .next_menu = HMI_MENU_TEMPESTA_CONTROLS, .action = NAV_ACTION_NAVIGATE, .handler = NULL },
+    { .item_index = 4, .next_menu = HMI_MENU_TEMPESTA_INTERVALS,.action = NAV_ACTION_NAVIGATE, .handler = NULL },
 };
 
 static const nav_transition_t tempesta_detail_page_transitions[] = {
     { .item_index = 0xFF, .next_menu = HMI_MENU_TEMPESTA, .action = NAV_ACTION_NAVIGATE, .handler = NULL },
+};
+
+static const nav_transition_t tempesta_diag_page_transitions[] = {
+    { .item_index = 0xFF, .next_menu = HMI_MENU_TEMPESTA, .action = NAV_ACTION_EXECUTE, .handler = hmi_action_exit_tempesta_diag },
 };
 
 static const nav_transition_t tempesta_controls_transitions[] = {
@@ -338,8 +345,9 @@ static const nav_menu_metadata_t menu_metadata_table[] = {
     { .state = HMI_MENU_FLUCTUS_INTERVALS,      .item_count = 4, .transitions = fluctus_intervals_transitions,   .transition_count = 4, .is_realtime = false },
 
     // TEMPESTA Menus
-    { .state = HMI_MENU_TEMPESTA,          .item_count = 4, .transitions = tempesta_menu_transitions,        .transition_count = 4, .is_realtime = false },
+    { .state = HMI_MENU_TEMPESTA,          .item_count = 5, .transitions = tempesta_menu_transitions,        .transition_count = 5, .is_realtime = false },
     { .state = HMI_MENU_TEMPESTA_SENSORS,  .item_count = 1, .transitions = tempesta_detail_page_transitions, .transition_count = 1, .is_realtime = false },
+    { .state = HMI_MENU_TEMPESTA_DIAG,     .item_count = 1, .transitions = tempesta_diag_page_transitions,   .transition_count = 1, .is_realtime = true },
     { .state = HMI_MENU_TEMPESTA_CONTROLS, .item_count = 8, .transitions = tempesta_controls_transitions,    .transition_count = 8, .is_realtime = false },
     { .state = HMI_MENU_TEMPESTA_INTERVALS,.item_count = 3, .transitions = tempesta_intervals_transitions,   .transition_count = 3, .is_realtime = false },
 
@@ -1046,6 +1054,75 @@ static void hmi_action_edit_tempesta_power_save(void)
     }
 }
 
+/**
+ * @brief Enter TEMPESTA diagnostic mode
+ * Requests 3.3V bus power, enters diagnostic mode, navigates to diagnostic page
+ */
+static void hmi_action_enter_tempesta_diag(void)
+{
+    ESP_LOGI(TAG, "Entering TEMPESTA diagnostic mode");
+
+    // Request 3.3V bus power for sensors (I2C Bus B)
+    esp_err_t ret = fluctus_request_bus_power(POWER_BUS_3V3, "HMI_TEMPESTA_DIAG");
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to power 3.3V bus: %s", esp_err_to_name(ret));
+        // Don't proceed if we can't power the sensors
+        return;
+    }
+    tempesta_diag_bus_requested = true;
+
+    // Enter TEMPESTA diagnostic mode (powers hall array + AS5600 NORMAL)
+    ret = tempesta_enter_diagnostic_mode();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to enter diagnostic mode: %s", esp_err_to_name(ret));
+
+        // Clean up - release bus power
+        fluctus_release_bus_power(POWER_BUS_3V3, "HMI_TEMPESTA_DIAG");
+        tempesta_diag_bus_requested = false;
+        return;
+    }
+
+    // Mark diagnostic mode active and start timeout timer
+    tempesta_diag_active = true;
+    tempesta_diag_start_time = time(NULL);
+
+    // Navigate to diagnostic page
+    hmi_status.current_menu = HMI_MENU_TEMPESTA_DIAG;
+    hmi_status.selected_item = 0;
+    hmi_status.current_page = 0;  // Start on page 1 (Hall array)
+
+    ESP_LOGI(TAG, "Diagnostic mode ACTIVE (90s timeout)");
+}
+
+/**
+ * @brief Exit TEMPESTA diagnostic mode
+ * Cleans up power, exits diagnostic mode, returns to TEMPESTA menu
+ */
+static void hmi_action_exit_tempesta_diag(void)
+{
+    ESP_LOGI(TAG, "Exiting TEMPESTA diagnostic mode");
+
+    // Exit TEMPESTA diagnostic mode (disables hall array + AS5600 LPM3)
+    tempesta_exit_diagnostic_mode();
+
+    // Release 3.3V bus power
+    if (tempesta_diag_bus_requested) {
+        fluctus_release_bus_power(POWER_BUS_3V3, "HMI_TEMPESTA_DIAG");
+        tempesta_diag_bus_requested = false;
+    }
+
+    // Clear diagnostic state
+    tempesta_diag_active = false;
+
+    // Navigate back to TEMPESTA menu
+    hmi_status.current_menu = HMI_MENU_TEMPESTA;
+    hmi_status.selected_item = 0;
+    hmi_status.current_page = 0;
+    hmi_status.total_pages = 0;
+
+    ESP_LOGI(TAG, "Diagnostic mode EXITED");
+}
+
 // IMPLUVIUM Actions
 static void hmi_action_toggle_impluvium(void)
 {
@@ -1114,6 +1191,9 @@ static void hmi_action_enter_zone_edit(void)
 
 static void hmi_action_toggle_all_zones(void)
 {
+    // Refresh telemetry cache to ensure we have current zone configurations
+    telemetry_fetch_snapshot(TELEMETRY_SRC_IMPLUVIUM);
+
     // Get current zone configurations from telemetry snapshot
     impluvium_snapshot_t snapshot;
     if (telemetry_get_impluvium_data(&snapshot) != ESP_OK) {
@@ -1130,7 +1210,7 @@ static void hmi_action_toggle_all_zones(void)
     }
     bool enable_all = (enabled_count < IRRIGATION_ZONE_COUNT);
 
-    // Apply to all zones
+    // Apply to all zones (preserve existing target/deadband from refreshed snapshot)
     for (int i = 0; i < IRRIGATION_ZONE_COUNT; i++) {
         impluvium_update_zone_config(i,
                                       snapshot.zones[i].target_moisture_percent,

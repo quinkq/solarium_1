@@ -244,7 +244,7 @@ esp_err_t impluvium_init(void)
     // Create the main irrigation task
     BaseType_t xResult = xTaskCreate(impluvium_task,
                                      "IMPLUVIUM",
-                                     configMINIMAL_STACK_SIZE * 6,
+                                     configMINIMAL_STACK_SIZE * 5,
                                      NULL,
                                      5, // Medium priority
                                      &xIrrigationTaskHandle);
@@ -276,6 +276,11 @@ esp_err_t impluvium_init(void)
         ESP_LOGW(TAG, "Failed to register daily reset callback: %s", esp_err_to_name(ret));
         // Non-critical - continue initialization
     }
+
+    // Populate telemetry cache with initial zone configuration
+    // This ensures HMI has valid data before first watering cycle
+    telemetry_fetch_snapshot(TELEMETRY_SRC_IMPLUVIUM);
+    ESP_LOGI(TAG, "Initial telemetry cache populated");
 
     ESP_LOGI(TAG, "IMPLUVIUM irrigation system initialized successfully");
     return ESP_OK;

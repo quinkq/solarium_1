@@ -116,6 +116,35 @@ typedef struct {
     time_t snapshot_timestamp;
 } tempesta_snapshot_t;
 
+/**
+ * @brief TEMPESTA diagnostic data snapshot for HMI debugging
+ *
+ * Real-time sensor readings for hardware validation (HMI-exclusive, not telemetry).
+ * Updated continuously in diagnostic mode (125ms intervals for 8Hz HMI refresh).
+ * - Page 1: Hall array voltages + calculated wind direction
+ * - Page 2: AS5600 angle + rotation counter + magnet status
+ */
+typedef struct {
+    // Hall Array (Wind Direction) - Page 1
+    float hall_voltage_north;          // North sensor voltage (V)
+    float hall_voltage_east;           // East sensor voltage (V)
+    float hall_voltage_south;          // South sensor voltage (V)
+    float hall_voltage_west;           // West sensor voltage (V)
+    float hall_direction_deg;          // Calculated direction (0-360°, 0=North)
+    char hall_direction_cardinal[4];   // Cardinal direction (N/NNE/E/SE/S/SW/W/NW)
+    float hall_magnitude;              // Signal strength (0.0-1.0, normalized)
+
+    // AS5600 (Wind Speed Sensor) - Page 2
+    uint16_t as5600_raw_angle;         // Raw angle counts (0-4095)
+    float as5600_angle_deg;            // Angle in degrees (0-360°)
+    int32_t as5600_rotation_count;     // Total rotations since diagnostic start
+    bool as5600_magnet_detected;       // Magnet presence detected
+    bool as5600_magnet_too_weak;       // Magnet too far from sensor
+    bool as5600_magnet_too_strong;     // Magnet too close to sensor
+
+    time_t snapshot_timestamp;         // Reading timestamp
+} tempesta_diag_snapshot_t;
+
 typedef struct {
     // Temperature averaging
     float temperature_history[WEATHER_AVERAGING_SAMPLES];
@@ -256,5 +285,56 @@ esp_err_t tempesta_reset_tank_intake_total(void);
  * @return ESP_OK on success
  */
 esp_err_t tempesta_reset_all_counters(void);
+
+// ########################## Diagnostic Mode API ##########################
+
+/**
+ * @brief Enter diagnostic mode for real-time wind sensor debugging
+ *
+ * Diagnostic mode behavior:
+ * - Pauses normal collection task (prevents workflow conflicts)
+ * - Keeps Hall array powered continuously (no 10ms gating)
+ * - Keeps AS5600 in NORMAL mode (not LPM3)
+ * - Enables continuous sensor reading (125ms intervals for HMI)
+ * - Resets AS5600 rotation counter to 0
+ *
+ * @note Power management: HMI must request 3.3V bus (POWER_BUS_3V3) before calling
+ * @return ESP_OK on success, ESP_ERR_INVALID_STATE if system busy or not initialized
+ */
+esp_err_t tempesta_enter_diagnostic_mode(void);
+
+/**
+ * @brief Exit diagnostic mode and restore normal operation
+ *
+ * Restores normal operation:
+ * - Disables Hall array power (back to 10ms gating)
+ * - Returns AS5600 to LPM3 mode (power saving)
+ * - Resumes normal collection cycle
+ *
+ * @note Power management: HMI must release 3.3V bus after calling
+ */
+void tempesta_exit_diagnostic_mode(void);
+
+/**
+ * @brief Get live diagnostic data snapshot (for HMI rendering)
+ *
+ * Reads current sensor values in diagnostic mode:
+ * - Hall array: All 4 channels + calculated direction
+ * - AS5600: Current angle + rotation counter + magnet status
+ *
+ * @param[out] diag_data Pointer to diagnostic snapshot structure
+ * @return ESP_OK on success, ESP_ERR_INVALID_STATE if not in diagnostic mode,
+ *         ESP_ERR_INVALID_ARG if diag_data is NULL
+ * @note Only valid when in diagnostic mode (after tempesta_enter_diagnostic_mode)
+ * @note This is a direct API call - does NOT go through TELEMETRY
+ */
+esp_err_t tempesta_get_diagnostic_data(tempesta_diag_snapshot_t *diag_data);
+
+/**
+ * @brief Check if TEMPESTA is in diagnostic mode
+ * @return true if diagnostic mode active, false otherwise
+ * @note Thread-safe, quick mutex with 100ms timeout
+ */
+bool tempesta_is_diagnostic_mode_active(void);
 
 #endif // TEMPESTA_H

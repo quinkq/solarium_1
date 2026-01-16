@@ -242,70 +242,11 @@ static void IRAM_ATTR mcp23008_int_isr(void *arg)
 // DEBUG: Counter for handler task notifications
 static volatile uint32_t handler_call_count = 0;
 
-// Error tracking for diagnostics and recovery
-static uint32_t consecutive_i2c_errors = 0;
-static uint32_t consecutive_spurious_interrupts = 0;
-static uint32_t total_i2c_errors = 0;
-static uint32_t total_spurious_interrupts = 0;
-static uint32_t recovery_attempts = 0;
-static uint32_t recovery_successes = 0;
-
-// Throttling to prevent infinite loops during I2C failures
-#define MAX_CONSECUTIVE_ERRORS 10
-#define ERROR_BACKOFF_MS 100
-#define SPURIOUS_INT_THRESHOLD 5
-
-/**
- * @brief Attempt to recover MCP23008 from error state
- *
- * Tries to clear any pending interrupts by reading GPIO register
- * and verifying I2C communication is working.
- *
- * @return ESP_OK if recovery succeeded, error otherwise
- */
-static esp_err_t attempt_mcp_recovery(void)
-{
-    recovery_attempts++;
-    ESP_LOGW(TAG, "Attempting MCP23008 recovery (attempt #%lu)...", recovery_attempts);
-
-    uint8_t gpio_val, intf_val, intcap_val;
-    esp_err_t ret;
-
-    // Try reading GPIO register to verify I2C is working
-    ret = mcp23008_port_read(&mcp_dev, &gpio_val);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Recovery failed: Cannot read GPIO register (%s)", esp_err_to_name(ret));
-        return ret;
-    }
-
-    ESP_LOGI(TAG, "Recovery: GPIO register = 0x%02x", gpio_val);
-
-    // Try reading and clearing interrupt registers
-    ret = mcp23008_port_get_interrupt_flags(&mcp_dev, &intf_val);
-    if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "Recovery: INTF = 0x%02x", intf_val);
-
-        ret = mcp23008_port_get_interrupt_capture(&mcp_dev, &intcap_val);
-        if (ret == ESP_OK) {
-            ESP_LOGI(TAG, "Recovery: INTCAP = 0x%02x (interrupt cleared)", intcap_val);
-            recovery_successes++;
-            ESP_LOGI(TAG, "MCP23008 recovery successful (%lu/%lu success rate)",
-                     recovery_successes, recovery_attempts);
-            return ESP_OK;
-        }
-    }
-
-    ESP_LOGE(TAG, "Recovery failed: Cannot clear interrupts");
-    return ret;
-}
-
 /**
  * @brief MCP23008 interrupt handler task
  *
  * Waits for notification from ISR, reads interrupt registers, and dispatches
  * to appropriate handlers based on which pins caused the interrupt.
- *
- * Includes I2C error detection, spurious interrupt filtering, and recovery logic.
  *
  * Latency: ~106-225µs typical (ISR trigger -> I2C read complete)
  *
@@ -336,41 +277,7 @@ static void mcp23008_handler_task(void *pvParameters)
             // Read INTF to see which pins caused the interrupt
             ret = mcp23008_port_get_interrupt_flags(&mcp_dev, &int_flags);
             if (ret != ESP_OK) {
-                consecutive_i2c_errors++;
-                total_i2c_errors++;
-
-                ESP_LOGE(TAG, "I2C ERROR: Failed to read INTF: %s (consecutive: %lu, total: %lu)",
-                         esp_err_to_name(ret), consecutive_i2c_errors, total_i2c_errors);
-
-                // Throttle to prevent infinite loop
-                if (consecutive_i2c_errors >= MAX_CONSECUTIVE_ERRORS) {
-                    ESP_LOGE(TAG, "CRITICAL: %lu consecutive I2C errors - attempting recovery",
-                             consecutive_i2c_errors);
-
-                    // Disable interrupts during recovery
-                    gpio_intr_disable(MCP23008_INT_GPIO);
-
-                    vTaskDelay(pdMS_TO_TICKS(ERROR_BACKOFF_MS));
-
-                    if (attempt_mcp_recovery() == ESP_OK) {
-                        consecutive_i2c_errors = 0;
-                        consecutive_spurious_interrupts = 0;
-                        ESP_LOGI(TAG, "Recovery successful - resuming normal operation");
-
-                        // Dump diagnostics after successful recovery
-                        mcp23008_helper_print_diagnostics();
-                    } else {
-                        ESP_LOGE(TAG, "Recovery failed - disabling MCP23008 interrupts");
-
-                        // Dump diagnostics before giving up
-                        mcp23008_helper_print_diagnostics();
-
-                        // Don't re-enable interrupt - system needs manual intervention
-                        continue;
-                    }
-                }
-
-                // Add small delay to prevent tight loop
+                ESP_LOGE(TAG, "Failed to read INTF: %s", esp_err_to_name(ret));
                 vTaskDelay(pdMS_TO_TICKS(10));
                 gpio_intr_enable(MCP23008_INT_GPIO);
                 continue;
@@ -380,86 +287,20 @@ static void mcp23008_handler_task(void *pvParameters)
             // This also clears the interrupt
             ret = mcp23008_port_get_interrupt_capture(&mcp_dev, &captured_state);
             if (ret != ESP_OK) {
-                consecutive_i2c_errors++;
-                total_i2c_errors++;
-
-                ESP_LOGE(TAG, "I2C ERROR: Failed to read INTCAP: %s (consecutive: %lu, total: %lu)",
-                         esp_err_to_name(ret), consecutive_i2c_errors, total_i2c_errors);
-
-                // Same recovery logic as INTF failure
-                if (consecutive_i2c_errors >= MAX_CONSECUTIVE_ERRORS) {
-                    ESP_LOGE(TAG, "CRITICAL: %lu consecutive I2C errors - attempting recovery",
-                             consecutive_i2c_errors);
-
-                    gpio_intr_disable(MCP23008_INT_GPIO);
-                    vTaskDelay(pdMS_TO_TICKS(ERROR_BACKOFF_MS));
-
-                    if (attempt_mcp_recovery() == ESP_OK) {
-                        consecutive_i2c_errors = 0;
-                        consecutive_spurious_interrupts = 0;
-                        ESP_LOGI(TAG, "Recovery successful - resuming normal operation");
-
-                        // Dump diagnostics after successful recovery
-                        mcp23008_helper_print_diagnostics();
-                    } else {
-                        ESP_LOGE(TAG, "Recovery failed - disabling MCP23008 interrupts");
-
-                        // Dump diagnostics before giving up
-                        mcp23008_helper_print_diagnostics();
-
-                        continue;
-                    }
-                }
-
+                ESP_LOGE(TAG, "Failed to read INTCAP: %s", esp_err_to_name(ret));
                 vTaskDelay(pdMS_TO_TICKS(10));
                 gpio_intr_enable(MCP23008_INT_GPIO);
                 continue;
             }
 
-            // I2C read successful - reset error counter
-            consecutive_i2c_errors = 0;
-
             ESP_LOGV(TAG, "INTCAP: 0x%02x, INTF: 0x%02x", captured_state, int_flags);
 
             // Detect spurious interrupts (both registers zero)
             if (int_flags == 0x00 && captured_state == 0x00) {
-                consecutive_spurious_interrupts++;
-                total_spurious_interrupts++;
-
-                ESP_LOGW(TAG, "SPURIOUS INTERRUPT detected (INTF=0x00, INTCAP=0x00) - "
-                         "consecutive: %lu, total: %lu",
-                         consecutive_spurious_interrupts, total_spurious_interrupts);
-
-                if (consecutive_spurious_interrupts >= SPURIOUS_INT_THRESHOLD) {
-                    ESP_LOGE(TAG, "CRITICAL: %lu consecutive spurious interrupts - attempting recovery",
-                             consecutive_spurious_interrupts);
-
-                    gpio_intr_disable(MCP23008_INT_GPIO);
-                    vTaskDelay(pdMS_TO_TICKS(ERROR_BACKOFF_MS));
-
-                    if (attempt_mcp_recovery() == ESP_OK) {
-                        consecutive_i2c_errors = 0;
-                        consecutive_spurious_interrupts = 0;
-                        ESP_LOGI(TAG, "Recovery successful - resuming normal operation");
-
-                        // Dump diagnostics after successful recovery
-                        mcp23008_helper_print_diagnostics();
-                    } else {
-                        ESP_LOGE(TAG, "Recovery failed - disabling MCP23008 interrupts");
-
-                        // Dump diagnostics before giving up
-                        mcp23008_helper_print_diagnostics();
-
-                        continue;
-                    }
-                }
-
+                ESP_LOGV(TAG, "Spurious interrupt (INTF=0x00, INTCAP=0x00)");
                 gpio_intr_enable(MCP23008_INT_GPIO);
                 continue;
             }
-
-            // Valid interrupt - reset spurious counter
-            consecutive_spurious_interrupts = 0;
 
             // Dispatch to appropriate handlers based on interrupt flags
             // GP0-GP1: Encoder A/B
@@ -827,116 +668,3 @@ esp_err_t mcp23008_helper_register_button_callback(TaskHandle_t task_handle)
     return ESP_OK;
 }
 
-esp_err_t mcp23008_helper_get_diagnostics(mcp23008_diagnostics_t *diag)
-{
-    if (diag == NULL) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    // Snapshot diagnostic counters (no need for critical section - reads are atomic on 32-bit aligned data)
-    diag->total_interrupts = handler_call_count;
-    diag->total_i2c_errors = total_i2c_errors;
-    diag->total_spurious_interrupts = total_spurious_interrupts;
-    diag->consecutive_i2c_errors = consecutive_i2c_errors;
-    diag->consecutive_spurious = consecutive_spurious_interrupts;
-    diag->recovery_attempts = recovery_attempts;
-    diag->recovery_successes = recovery_successes;
-
-    return ESP_OK;
-}
-
-void mcp23008_helper_print_diagnostics(void)
-{
-    ESP_LOGI(TAG, "========================================");
-    ESP_LOGI(TAG, "    MCP23008 Diagnostics Report");
-    ESP_LOGI(TAG, "========================================");
-
-    // Interrupt statistics
-    ESP_LOGI(TAG, "Interrupt Statistics:");
-    ESP_LOGI(TAG, "  Total interrupts:    %lu", handler_call_count);
-    ESP_LOGI(TAG, "  ISR calls:           %lu", isr_call_count);
-    if (handler_call_count != isr_call_count) {
-        ESP_LOGW(TAG, "  WARNING: ISR/Handler mismatch (%ld pending)",
-                 (int32_t)(isr_call_count - handler_call_count));
-    }
-
-    // Error statistics
-    ESP_LOGI(TAG, "Error Statistics:");
-    ESP_LOGI(TAG, "  Total I2C errors:    %lu", total_i2c_errors);
-    ESP_LOGI(TAG, "  Consecutive I2C:     %lu (threshold: %d)", consecutive_i2c_errors, MAX_CONSECUTIVE_ERRORS);
-    ESP_LOGI(TAG, "  Total spurious:      %lu", total_spurious_interrupts);
-    ESP_LOGI(TAG, "  Consecutive spurious:%lu (threshold: %d)", consecutive_spurious_interrupts, SPURIOUS_INT_THRESHOLD);
-
-    if (total_i2c_errors > 0 || total_spurious_interrupts > 0) {
-        float error_rate = (float)(total_i2c_errors + total_spurious_interrupts) / handler_call_count * 100.0f;
-        ESP_LOGW(TAG, "  Error rate:          %.2f%%", error_rate);
-    }
-
-    // Recovery statistics
-    if (recovery_attempts > 0) {
-        ESP_LOGI(TAG, "Recovery Statistics:");
-        ESP_LOGI(TAG, "  Attempts:            %lu", recovery_attempts);
-        ESP_LOGI(TAG, "  Successes:           %lu", recovery_successes);
-        float success_rate = (float)recovery_successes / recovery_attempts * 100.0f;
-        if (success_rate < 100.0f) {
-            ESP_LOGW(TAG, "  Success rate:        %.1f%%", success_rate);
-        } else {
-            ESP_LOGI(TAG, "  Success rate:        %.1f%%", success_rate);
-        }
-    } else {
-        ESP_LOGI(TAG, "Recovery: No attempts (healthy)");
-    }
-
-    // Counter values
-    ESP_LOGI(TAG, "Counter Values:");
-    portENTER_CRITICAL(&mcp_spinlock);
-    int32_t enc_count = encoder_count;
-    uint32_t rain_count = rainfall_pulse_count;
-    uint32_t tank_count = tank_pulse_count;
-    bool btn_state = button_pressed;
-    portEXIT_CRITICAL(&mcp_spinlock);
-
-    ESP_LOGI(TAG, "  Encoder count:       %ld", enc_count);
-    ESP_LOGI(TAG, "  Rainfall pulses:     %lu", rain_count);
-    ESP_LOGI(TAG, "  Tank pulses:         %lu", tank_count);
-    ESP_LOGI(TAG, "  Button state:        %s", btn_state ? "PRESSED" : "RELEASED");
-
-    // Hardware state
-    ESP_LOGI(TAG, "Hardware State:");
-    int int_pin_level = gpio_get_level(MCP23008_INT_GPIO);
-    ESP_LOGI(TAG, "  INT pin (GPIO%d):    %s", MCP23008_INT_GPIO,
-             int_pin_level ? "HIGH (idle)" : "LOW (active)");
-
-    if (mcp_initialized) {
-        uint8_t gpio_val = 0, intf_val = 0;
-        esp_err_t ret;
-
-        ret = mcp23008_port_read(&mcp_dev, &gpio_val);
-        if (ret == ESP_OK) {
-            ESP_LOGI(TAG, "  GPIO register:       0x%02x", gpio_val);
-        } else {
-            ESP_LOGE(TAG, "  GPIO register:       ERROR (%s)", esp_err_to_name(ret));
-        }
-
-        ret = mcp23008_port_get_interrupt_flags(&mcp_dev, &intf_val);
-        if (ret == ESP_OK) {
-            ESP_LOGI(TAG, "  INTF register:       0x%02x %s", intf_val,
-                     intf_val ? "(pending interrupts)" : "(clear)");
-        } else {
-            ESP_LOGE(TAG, "  INTF register:       ERROR (%s)", esp_err_to_name(ret));
-        }
-    }
-
-    // Health assessment
-    ESP_LOGI(TAG, "========================================");
-    if (consecutive_i2c_errors >= MAX_CONSECUTIVE_ERRORS) {
-        ESP_LOGE(TAG, "  HEALTH: CRITICAL - I2C failure");
-    } else if (consecutive_spurious_interrupts >= SPURIOUS_INT_THRESHOLD) {
-        ESP_LOGE(TAG, "  HEALTH: CRITICAL - Spurious interrupts");
-    } else if (total_i2c_errors > 0 || total_spurious_interrupts > 0) {
-        ESP_LOGW(TAG, "  HEALTH: DEGRADED - Errors detected but recovered");
-    } else {
-        ESP_LOGI(TAG, "  HEALTH: OK - No errors detected");
-    }
-    ESP_LOGI(TAG, "========================================");
-}

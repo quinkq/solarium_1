@@ -141,43 +141,43 @@ static void hmi_render_impluvium_overview_stats_page(void)
 
                 // Active zone (if any)
                 if (data.active_zone != NO_ACTIVE_ZONE_ID) {
-                    snprintf(buf, sizeof(buf), "Active: Z%d", data.active_zone + 1);
+                    snprintf(buf, sizeof(buf), "Active: Z%d", data.active_zone);
                     hmi_fb_draw_string(2, y, buf, false);
                 }
             }
             break;
 
-        case 1:  // PAGE 2: Stats Zones 1-3
+        case 1:  // PAGE 2: Stats Zones 0-2
             // Header
             hmi_fb_draw_string(2, y, "Hr(l) Avg(l/h) Day(l)", false);
             y += 10;
 
-            // Zones 1-3
+            // Zones 0-2
             for (int i = 0; i < 3; i++) {
                 float vol_hour_l = data.zones[i].volume_used_hour_ml / 1000.0f;
                 float avg_hour_l = data.zones[i].avg_hourly_consumption_ml / 1000.0f;
                 float vol_day_l = data.zones[i].volume_used_today_ml / 1000.0f;
 
                 snprintf(buf, sizeof(buf), "Z%d: %.1f %.1f %.1f",
-                         i + 1, vol_hour_l, avg_hour_l, vol_day_l);
+                         i, vol_hour_l, avg_hour_l, vol_day_l);
                 hmi_fb_draw_string(2, y, buf, false);
                 y += 10;
             }
             break;
 
-        case 2:  // PAGE 3: Stats Zones 4-5 + Totals
+        case 2:  // PAGE 3: Stats Zones 3-4 + Totals
             // Header
             hmi_fb_draw_string(2, y, "Hr(l) Avg(l/h) Day(l)", false);
             y += 10;
 
-            // Zones 4-5
+            // Zones 3-4
             for (int i = 3; i < 5; i++) {
                 float vol_hour_l = data.zones[i].volume_used_hour_ml / 1000.0f;
                 float avg_hour_l = data.zones[i].avg_hourly_consumption_ml / 1000.0f;
                 float vol_day_l = data.zones[i].volume_used_today_ml / 1000.0f;
 
                 snprintf(buf, sizeof(buf), "Z%d: %.1f %.1f %.1f",
-                         i + 1, vol_hour_l, avg_hour_l, vol_day_l);
+                         i, vol_hour_l, avg_hour_l, vol_day_l);
                 hmi_fb_draw_string(2, y, buf, false);
                 y += 10;
             }
@@ -254,11 +254,11 @@ static void hmi_render_impluvium_zones_all_page(void)
     char buf[32];
     int y = 14;
 
-    // Show all 5 zones with enable status and current moisture
+    // Show all 5 zones with enable status and current moisture (Z0-Z4)
     for (int i = 0; i < IRRIGATION_ZONE_COUNT; i++) {
         const char *enabled_str = data.zones[i].watering_enabled ? "En" : "Dis";
         snprintf(buf, sizeof(buf), "Z%d: %s %.0f%%/%.0f%%",
-                 i + 1,
+                 i,
                  enabled_str,
                  data.zones[i].current_moisture_percent,
                  data.zones[i].target_moisture_percent);
@@ -503,10 +503,10 @@ static void hmi_render_impluvium_learning_all_page(void)
     char buf[32];
     int y = 14;
 
-    // Show all 5 zones with confidence and PPMP ratio
+    // Show all 5 zones with confidence and PPMP ratio (Z0-Z4)
     for (int i = 0; i < IRRIGATION_ZONE_COUNT; i++) {
         snprintf(buf, sizeof(buf), "Z%d: %.0f%% %.1f",
-                 i + 1,
+                 i,
                  data.zones[i].confidence_level * 100.0f,
                  data.zones[i].calculated_ppmp_ratio);
         hmi_fb_draw_string(2, y, buf, false);
@@ -843,12 +843,12 @@ static void hmi_render_impluvium_zone_config_page(void)
             // Item 0: Back
             hmi_fb_draw_string(8, y, "< Back", selected);
         } else if (i >= 1 && i <= 5) {
-            // Items 1-5: Individual Zones
+            // Items 1-5: Individual Zones (displayed as Z0-Z4)
             uint8_t zone_idx = i - 1;
             char buf[32];
             const char *en_marker = data.zones[zone_idx].watering_enabled ? "[*]" : "[ ]";
             snprintf(buf, sizeof(buf), "Z%d:%s %.0f%% +/-%.0f%%",
-                     zone_idx + 1,
+                     zone_idx,
                      en_marker,
                      data.zones[zone_idx].target_moisture_percent,
                      data.zones[zone_idx].moisture_deadband_percent);
@@ -874,7 +874,7 @@ static void hmi_render_impluvium_zone_edit_page(void)
 
     // Title
     char title[32];
-    snprintf(title, sizeof(title), "Zone %d Config%s", editing_zone_id + 1, zone_editing ? "*" : "");
+    snprintf(title, sizeof(title), "Zone %d Config%s", editing_zone_id, zone_editing ? "*" : "");
     hmi_fb_draw_string(12, 2, title, false);
     hmi_fb_draw_hline(0, 10, 128);
 
@@ -962,7 +962,7 @@ static void hmi_render_impluvium_manual_water_page(void)
 
     // Title
     char title[32];
-    snprintf(title, sizeof(title), "Manual Water Z%d*", manual_water_zone + 1);
+    snprintf(title, sizeof(title), "Manual Water Z%d*", manual_water_zone);
     hmi_fb_draw_string(4, 2, title, false);
     hmi_fb_draw_hline(0, 10, 128);
 

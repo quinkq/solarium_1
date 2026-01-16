@@ -155,17 +155,19 @@ if (confidence >= 0.70f) {
 **Function**: `impluvium_state_watering()`
 
 **Process**:
-1. **Power Management**: Request 12V bus for valves and pumps
-2. **Valve Control**: Open zone valve
-3. **Pump Ramp-Up**: Start pump at learned duty cycle (or default 50%)
-4. **Flow Monitoring**: Count pulses from flow sensor
-5. **Real-Time Safety**:
+1. **Power Management**: Request 12V bus for valves and pumps, enable level shifter (SN74AHCT125)
+2. **STELLARIA Dimming**: Request 5% dimming for 12V bus load reduction (1s stabilization delay)
+3. **Valve Control**: Open zone valve (1.5s actuation delay)
+4. **Pump Ramp-Up**: Start pump at learned duty cycle (or default 50%), 5s ramp
+5. **Flow Monitoring**: Count pulses from flow sensor, 3s flow establishment delay
+6. **Real-Time Safety**:
    - Emergency cutoffs (pressure, flow, overcurrent)
    - Anomaly detection (see Section 5)
    - Max 60-second timeout enforcement
 
 **Manual Watering Mode**:
 - Triggered via HMI (5-300 seconds, 5s increments)
+- **Bypasses MEASURING state**: Creates single-item queue directly (no moisture checks)
 - Uses learned pump duty but **bypasses all learning updates**
 - Only respects pressure safety limits
 - Used for testing or forcing water regardless of moisture
@@ -174,8 +176,15 @@ if (confidence >= 0.70f) {
 
 **Function**: `impluvium_state_stopping()` → `impluvium_process_zone_watering_data()`
 
-#### Step 4.1: Data Collection
+#### Step 4.1: Shutdown and Data Collection
 
+**Shutdown sequence**:
+1. Pump ramp-down (3s for gentle hardware stress reduction)
+2. Pressure equalization delay (1s)
+3. Restore STELLARIA to previous intensity
+4. Close valve, release level shifter
+
+**Data collection**:
 ```c
 total_pulses = flow_sensor_final - flow_sensor_start;
 volume_ml = (total_pulses / PULSES_PER_LITER) * 1000;
@@ -521,22 +530,25 @@ Out-of-bounds values → use previous valid value, no update
     │              │  2. Read all zone moisture levels
     │              │  3. Build watering queue (prioritize by deficit)
     │              │  4. Calculate predictions (learning algorithm)
+    │              │  * Manual mode: skip 2-4, create single-item queue
     └──────┬───────┘
            │ Queue ready
            ↓
     ┌──────────────┐
-    │  WATERING    │  1. Power on valves/pump (12V)
-    │              │  2. Open valve, start pump at learned duty
-    │   (loops for │  3. Monitor flow/pressure (500ms)
-    │  each zone)  │  4. Stop at target pulses or timeout
+    │  WATERING    │  1. Power on valves/pump (12V), enable level shifter
+    │              │  2. Dim STELLARIA to 5% (1s delay)
+    │   (loops for │  3. Open valve, ramp pump at learned duty (5s)
+    │  each zone)  │  4. Monitor flow/pressure (500ms)
+    │              │  5. Stop at target pulses or timeout (manual: time-based)
     └──────┬───────┘
            │ Zone complete
            ↓
     ┌──────────────┐
-    │  STOPPING    │  1. Stop pump, close valve
-    │              │  2. Read final moisture
-    │              │  3. Update learning algorithm
-    │              │  4. Update RTC accumulator
+    │  STOPPING    │  1. Ramp down pump (3s), equalize pressure (1s)
+    │              │  2. Restore STELLARIA, close valve, release level shifter
+    │              │  3. Read final moisture (skip if manual)
+    │              │  4. Update learning algorithm (skip if manual)
+    │              │  5. Update RTC accumulator
     └──────┬───────┘
            │ More zones? → Loop to WATERING
            │ All done? ↓
@@ -562,11 +574,5 @@ Out-of-bounds values → use previous valid value, no update
 3. **Execution**: Use learned pump duty, monitor for anomalies
 4. **Learning**: Update ppmp/pump/gain with exponential moving averages
 5. **Storage**: Save to flash once daily at midnight (wear reduction)
-
-**Result**: Continuous improvement in watering precision while adapting to:
-- Soil characteristics (per-zone)
-- Seasonal temperature changes
-- Plant growth patterns
-- System-specific hydraulic behavior
 
 All while maintaining safety, handling sensor failures gracefully, and preventing overfitting through confidence-based blending.

@@ -178,35 +178,49 @@ esp_err_t impluvium_set_pump_speed(uint32_t pwm_duty)
 }
 
 /**
- * @brief Ramps up the pump speed over a defined period.
+ * @brief Ramps pump speed up or down over a defined period.
  *
- * Linearly increases the pump's PWM duty cycle from a minimum value
+ * RAMP_UP: Linearly increases the pump's PWM duty cycle from minimum value
  * to the zone's learned optimal duty cycle. This gradual start-up
  * reduces mechanical stress on the pump and pipes.
  *
+ * RAMP_DOWN: Linearly decreases the pump's PWM duty cycle from current value
+ * to zero.
+ *
  * @param zone_id The ID of the zone being watered.
+ * @param direction PUMP_RAMP_UP or PUMP_RAMP_DOWN
  * @return ESP_OK on success, ESP_FAIL on failure.
  */
-esp_err_t impluvium_pump_ramp_up(uint8_t zone_id)
+esp_err_t impluvium_pump_ramp(uint8_t zone_id, pump_ramp_direction_t direction)
 {
-    ESP_LOGI(TAG, "Ramping up pump for zone %d...", zone_id);
+    uint32_t start_duty, target_duty, ramp_duration_ms;
+    int steps = 100; // 100 steps for a smooth ramp
 
-    uint32_t start_duty = PUMP_MIN_DUTY;
-    uint32_t target_duty = irrigation_zones[zone_id].learning.calculated_pump_duty_cycle;
-    uint32_t ramp_duration_ms = PUMP_RAMP_UP_TIME_MS;
-    int steps = 50; // 50 steps for a smooth ramp
+    if (direction == PUMP_RAMP_UP) {
+        ESP_LOGI(TAG, "Ramping up pump for zone %d...", zone_id);
+        start_duty = PUMP_MIN_DUTY;
+        target_duty = irrigation_zones[zone_id].learning.calculated_pump_duty_cycle;
+        ramp_duration_ms = PUMP_RAMPUP_TIME_MS;
+    } else { // PUMP_RAMP_DOWN
+        ESP_LOGI(TAG, "Ramping down pump for zone %d...", zone_id);
+        start_duty = irrigation_system.pump_pwm_duty; // Current duty
+        target_duty = 0;
+        ramp_duration_ms = PUMP_RAMPDOWN_TIME_MS;
+    }
+
     uint32_t step_delay = ramp_duration_ms / steps;
 
     for (int i = 0; i <= steps; i++) {
-        uint32_t duty = start_duty + ((target_duty - start_duty) * i) / steps;
+        int32_t duty_delta = (int32_t)target_duty - (int32_t)start_duty;
+        uint32_t duty = start_duty + (duty_delta * i) / steps;
         if (impluvium_set_pump_speed(duty) != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to set pump speed during ramp-up");
+            ESP_LOGE(TAG, "Failed to set pump speed during ramp");
             return ESP_FAIL;
         }
         vTaskDelay(pdMS_TO_TICKS(step_delay));
     }
 
-    ESP_LOGI(TAG, "Pump ramp-up complete for zone %d at %" PRIu32 " duty.", zone_id, target_duty);
+    ESP_LOGI(TAG, "Pump ramp complete for zone %d at %" PRIu32 " duty.", zone_id, target_duty);
     return ESP_OK;
 }
 
