@@ -737,7 +737,7 @@ Out-of-bounds values → use previous valid value or defaults, no learning updat
     │              │  5. Update RTC accumulator
     └──────┬───────┘
            │ More zones? → Loop to WATERING
-           │ All done? ↓ Restore STELLARIA, close valve, release level shifter
+           │ All done? ↓ 6. Restore STELLARIA, close valve, release level shifter
     ┌──────────────┐
     │ MAINTENANCE  │  1. Set 5-min verification timer (RF learning)
     │              │  2. Save learning data (if midnight)

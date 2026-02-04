@@ -206,6 +206,13 @@ typedef enum {
     EMERGENCY_RESOLVED       // Auto-recovered, logging event
 } emergency_state_t;
 
+// Shutdown Reason (for unified set_shutdown function)
+// Note: Safety emergencies use impluvium_perform_emergency_stop(reason) directly (immediate kill)
+typedef enum {
+    IMPLUVIUM_SHUTDOWN_USER,      // User disabled via HMI - graceful stop (finish current zone)
+    IMPLUVIUM_SHUTDOWN_LOAD_SHED  // FLUCTUS load shedding - graceful stop (finish current zone)
+} impluvium_shutdown_reason_t;
+
 typedef struct {
     emergency_state_t state;                      // Current emergency state
     uint8_t test_zone;                            // Current zone being tested (0-4)
@@ -235,7 +242,9 @@ typedef struct {
     bool emergency_stop;                                         // Emergency shutdown flag
     bool sensors_powered;                                        // 3.3V sensor bus state
     bool power_save_mode;                                        // Power save mode (60min moisture check interval)
-    bool load_shed_shutdown;                                     // Load shedding shutdown flag
+    bool load_shed_shutdown;                                     // Load shedding shutdown flag (legacy, kept for compatibility)
+    bool graceful_stop_requested;                                // Graceful stop requested - finish current zone then disable
+    impluvium_shutdown_reason_t shutdown_reason;                 // Reason for shutdown (for logging)
     bool manual_watering_active;                                 // Manual watering mode active (safety override)
     uint8_t manual_water_zone;                                   // Zone being manually watered (0-4)
     uint16_t manual_water_duration_sec;                          // Manual watering duration in seconds
@@ -427,15 +436,19 @@ esp_err_t impluvium_write_realtime_to_telemetry_cache(impluvium_snapshot_rt_t *c
 esp_err_t impluvium_init(void);
 
 /**
- * @brief Enable/disable IMPLUVIUM system master switch
+ * @brief Enable/disable IMPLUVIUM system (unified shutdown function)
  *
- * When disabled, allows current watering to finish, stops moisture check timer,
- * and transitions to IMPLUVIUM_DISABLED state.
+ * When disabled (shutdown=true), requests graceful stop - current zone finishes,
+ * then system transitions to IMPLUVIUM_DISABLED state. Reason determines logging.
  *
- * @param enable True to enable system (resumes normal operation), false to disable
- * @return ESP_OK on success, ESP_ERR_INVALID_STATE if not initialized
+ * For safety emergencies (pressure/flow issues), use impluvium_perform_emergency_stop(reason)
+ * directly, which performs immediate hardware kill and triggers diagnostics.
+ *
+ * @param shutdown True to disable system (graceful stop), false to re-enable
+ * @param reason Shutdown reason (USER for HMI, LOAD_SHED for FLUCTUS)
+ * @return ESP_OK on success, ESP_FAIL if mutex timeout
  */
-esp_err_t impluvium_set_system_enabled(bool enable);
+esp_err_t impluvium_set_shutdown(bool shutdown, impluvium_shutdown_reason_t reason);
 
 /**
  * @brief Get current IMPLUVIUM operational state (lightweight, no snapshot fetch)
@@ -529,12 +542,7 @@ esp_err_t impluvium_set_power_save_mode(bool enable);
 esp_err_t impluvium_set_check_intervals(uint32_t optimal_min, uint32_t cool_min,
                                         uint32_t power_save_min, uint32_t night_hours);
 
-/**
- * @brief Set shutdown state for IMPLUVIUM irrigation system (for load shedding)
- * @param shutdown True to shutdown all irrigation operations, false to restore
- * @return ESP_OK on success, ESP_ERR_INVALID_STATE if not initialized
- */
-esp_err_t impluvium_set_shutdown(bool shutdown);
+// Note: impluvium_set_shutdown() declared above with reason parameter
 
 /**
  * @brief Update zone configuration and save to LittleFS

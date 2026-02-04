@@ -247,6 +247,11 @@ esp_err_t impluvium_state_watering(void);
 esp_err_t impluvium_state_stopping(void);
 esp_err_t impluvium_state_maintenance(void);
 
+// --- Emergency Stop Function (impluvium.c) ---
+// Immediate hardware kill - stops pump, closes valves, releases power
+// Pass reason=NULL for graceful shutdown, non-NULL for safety emergency (triggers diagnostics)
+void impluvium_perform_emergency_stop(const char *reason);
+
 // --- Safety Functions (impluvium_safety.c) ---
 void impluvium_set_anomaly(anomaly_type_t type, float value);
 esp_err_t impluvium_pre_check(void);
@@ -256,7 +261,6 @@ void impluvium_check_moisture_gain_rate(const char *task_tag, float current_mois
 bool impluvium_should_stop_watering(const char *task_tag, float current_moisture, uint32_t time_since_start_ms);
 bool impluvium_handle_safety_failure(uint32_t *error_count, const char *failure_reason, const char *task_tag);
 void impluvium_periodic_safety_check(const char **failure_reason, uint32_t time_since_start_ms);
-esp_err_t impluvium_emergency_stop(const char *reason);
 esp_err_t emergency_diagnostics_init(void);
 esp_err_t emergency_diagnostics_start(const char *reason);
 esp_err_t emergency_diagnostics_check_moisture_levels(void);

@@ -210,7 +210,24 @@ esp_err_t impluvium_pump_speed_ramping(uint8_t zone_id, pump_ramp_direction_t di
 
     uint32_t step_delay = ramp_duration_ms / steps;
 
+    // Calculate how often to perform safety checks - align with monitoring task interval
+    int safety_check_interval = WATERING_MONITORING_INTERVAL_MS / step_delay;
+    if (safety_check_interval < 1) {
+        safety_check_interval = 1;  // At least check every step if ramp is very slow
+    }
+
     for (int i = 0; i <= steps; i++) {
+        // Periodic safety check (throttled to WATERING_MONITORING_INTERVAL_MS intervals)
+        if (i % safety_check_interval == 0) {
+            const char *failure_reason = NULL;
+            impluvium_periodic_safety_check(&failure_reason, 0);  // Pass 0 to skip flow check
+            if (failure_reason != NULL) {
+                ESP_LOGE(TAG, "Safety failure during pump ramp: %s", failure_reason);
+                impluvium_set_pump_speed(0);
+                return ESP_FAIL;
+            }
+        }
+
         int32_t duty_delta = (int32_t)target_duty - (int32_t)start_duty;
         uint32_t duty = start_duty + (duty_delta * i) / steps;
         if (impluvium_set_pump_speed(duty) != ESP_OK) {

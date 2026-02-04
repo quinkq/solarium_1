@@ -112,7 +112,7 @@ esp_err_t impluvium_state_measuring(void)
             ESP_LOGW(TAG, "Pre-check failed with safety violation - entering maintenance");
             impluvium_change_state(IMPLUVIUM_MAINTENANCE);
         } else {
-            ESP_LOGW(TAG, "Pre-check failed - system not ready, returning to standby");
+            ESP_LOGW(TAG, "Pre-check failed - system not ready, skipping cycle - returning to standby");
             impluvium_change_state(IMPLUVIUM_STANDBY);
         }
         return ESP_FAIL;
@@ -484,43 +484,67 @@ esp_err_t impluvium_state_stopping(void)
     irrigation_system.queue_index++;
     irrigation_system.active_zone = NO_ACTIVE_ZONE_ID; // Reset active zone
 
-    if (irrigation_system.queue_index < irrigation_system.watering_queue_size) {
+    // Check for graceful stop request (user disable or load shedding)
+    // If set, skip remaining zones and finish the session early
+    bool graceful_stop = irrigation_system.graceful_stop_requested;
+
+    if (graceful_stop) {
+        const char *reason_str = (irrigation_system.shutdown_reason == IMPLUVIUM_SHUTDOWN_LOAD_SHED)
+            ? "load shedding" : "user request";
+        ESP_LOGW(TAG, "Graceful stop requested (%s) - skipping remaining %d zones",
+                 reason_str,
+                 irrigation_system.watering_queue_size - irrigation_system.queue_index);
+        irrigation_system.graceful_stop_requested = false;  // Clear flag
+    } else if (irrigation_system.queue_index < irrigation_system.watering_queue_size) {
         // More zones to water - go back to WATERING state for the next zone
         ESP_LOGI(TAG,
                  "Moving to next zone in queue: %d/%d",
                  irrigation_system.queue_index + 1,
                  irrigation_system.watering_queue_size);
         impluvium_change_state(IMPLUVIUM_WATERING);
-    } else {
-        // All zones completed - finish session
+        return ESP_OK;
+    }
+
+    // ============================================================================
+    // Session Complete (all zones done OR graceful stop requested)
+    // ============================================================================
+    if (!graceful_stop) {
         ESP_LOGI(TAG, "All %d zones in queue completed", irrigation_system.watering_queue_size);
+    }
 
-        // Restore STELLARIA to previous intensity (irrigation complete)
-        stellaria_request_irrigation_dim(false);
+    // Restore STELLARIA to previous intensity (irrigation complete)
+    stellaria_request_irrigation_dim(false);
 
-        // Schedule delayed verification (5 minutes from now) to update redistribution factors
-        if (irrigation_system.verification_zone_count > 0) {
-            irrigation_system.verification_pending = true;
-            if (xTimerStart(xVerificationTimer, 0) == pdPASS) {
-                ESP_LOGI(TAG, "Started verification timer for %d zones (5 min delay)",
-                         irrigation_system.verification_zone_count);
-            } else {
-                ESP_LOGE(TAG, "Failed to start verification timer");
-                irrigation_system.verification_pending = false;
-                irrigation_system.verification_zone_count = 0;
-            }
+    // Schedule delayed verification (5 minutes from now) to update redistribution factors
+    // Skip if graceful stop - system is shutting down anyway
+    if (!graceful_stop && irrigation_system.verification_zone_count > 0) {
+        irrigation_system.verification_pending = true;
+        if (xTimerStart(xVerificationTimer, 0) == pdPASS) {
+            ESP_LOGI(TAG, "Started verification timer for %d zones (5 min delay)",
+                     irrigation_system.verification_zone_count);
+        } else {
+            ESP_LOGE(TAG, "Failed to start verification timer");
+            irrigation_system.verification_pending = false;
+            irrigation_system.verification_zone_count = 0;
         }
+    }
 
-        // Power off all buses now that all zones are done
-        fluctus_release_bus_power(POWER_BUS_12V, "IMPLUVIUM");
-        fluctus_release_bus_power(POWER_BUS_5V, "IMPLUVIUM");
-        fluctus_release_bus_power(POWER_BUS_3V3, "IMPLUVIUM");
+    // Power off all buses now that session is done
+    fluctus_release_bus_power(POWER_BUS_12V, "IMPLUVIUM");
+    fluctus_release_bus_power(POWER_BUS_5V, "IMPLUVIUM");
+    fluctus_release_bus_power(POWER_BUS_3V3, "IMPLUVIUM");
 
-        // Reset queue and state
-        irrigation_system.queue_index = 0;
-        irrigation_system.watering_queue_size = 0;
-        irrigation_system.last_moisture_check = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    // Reset queue and state
+    irrigation_system.queue_index = 0;
+    irrigation_system.watering_queue_size = 0;
+    irrigation_system.last_moisture_check = xTaskGetTickCount() * portTICK_PERIOD_MS;
 
+    if (graceful_stop) {
+        // Graceful stop - go directly to DISABLED (skip MAINTENANCE)
+        ESP_LOGI(TAG, "Graceful stop complete - transitioning to DISABLED");
+        impluvium_change_state(IMPLUVIUM_DISABLED);
+    } else {
+        // Normal completion - go to MAINTENANCE for telemetry
         impluvium_change_state(IMPLUVIUM_MAINTENANCE);
     }
 

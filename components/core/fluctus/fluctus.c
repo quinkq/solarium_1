@@ -84,7 +84,7 @@ void fluctus_handle_power_state_change(fluctus_power_state_t new_state)
                 stellaria_set_power_save_mode(false);  // Disable power save mode
                 stellaria_set_shutdown(false);         // Restore from shutdown
                 impluvium_set_power_save_mode(false);  // Normal moisture check intervals
-                impluvium_set_shutdown(false);         // Restore irrigation operations
+                impluvium_set_shutdown(false, IMPLUVIUM_SHUTDOWN_LOAD_SHED);         // Restore irrigation operations
                 tempesta_set_power_save_mode(false);   // Normal 15min weather collection
                 tempesta_set_shutdown(false);          // Restore weather monitoring
                 tempesta_set_pms5003_enabled(true);    // Enable air quality sensor
@@ -100,7 +100,7 @@ void fluctus_handle_power_state_change(fluctus_power_state_t new_state)
                 stellaria_set_power_save_mode(true);   // Enable power save mode (max 12% intensity)
                 stellaria_set_shutdown(false);         // Ensure not in shutdown
                 impluvium_set_power_save_mode(true);   // 60min moisture check interval
-                impluvium_set_shutdown(false);         // Keep irrigation operational
+                impluvium_set_shutdown(false, IMPLUVIUM_SHUTDOWN_LOAD_SHED);         // Keep irrigation operational
                 tempesta_set_power_save_mode(false);   // Keep normal weather collection
                 tempesta_set_shutdown(false);          // Keep weather monitoring
                 tempesta_set_pms5003_enabled(true);    // Keep air quality sensor enabled
@@ -115,7 +115,7 @@ void fluctus_handle_power_state_change(fluctus_power_state_t new_state)
                 ESP_LOGI(TAG, "Power state: LOW_POWER - STELLARIA disabled, TEMPESTA power save, realtime telemetry off, WiFi power save");
                 stellaria_set_shutdown(true);          // Shutdown STELLARIA
                 impluvium_set_power_save_mode(true);   // Keep 60min moisture check interval
-                impluvium_set_shutdown(false);         // Keep irrigation operational
+                impluvium_set_shutdown(false, IMPLUVIUM_SHUTDOWN_LOAD_SHED);         // Keep irrigation operational
                 tempesta_set_power_save_mode(true);    // 60min weather collection interval
                 tempesta_set_shutdown(false);          // Keep weather monitoring
                 tempesta_set_pms5003_enabled(true);    // Keep air quality sensor enabled
@@ -129,7 +129,7 @@ void fluctus_handle_power_state_change(fluctus_power_state_t new_state)
                 // Minimal operation - STELLARIA + IMPLUVIUM shutdown, TEMPESTA skip PMS5003, MQTT buffering only
                 ESP_LOGI(TAG, "Power state: VERY_LOW - STELLARIA and IMPLUVIUM disabled, MQTT buffering only, WiFi power save");
                 stellaria_set_shutdown(true);          // Shutdown STELLARIA
-                impluvium_set_shutdown(true);          // Shutdown all irrigation operations
+                impluvium_set_shutdown(true, IMPLUVIUM_SHUTDOWN_LOAD_SHED);          // Shutdown all irrigation operations
                 tempesta_set_power_save_mode(true);    // 60min weather collection interval
                 tempesta_set_shutdown(false);          // Keep weather monitoring
                 tempesta_set_pms5003_enabled(false);   // Skip air quality sensor to save power
@@ -143,7 +143,7 @@ void fluctus_handle_power_state_change(fluctus_power_state_t new_state)
                 // Emergency operation - only essential systems (TEMPESTA + solar tracking + WiFi off), MQTT buffering only
                 ESP_LOGI(TAG, "Power state: CRITICAL - TEMPESTA, solar tracking, and WiFi disabled, MQTT buffering only");
                 stellaria_set_shutdown(true);          // Shutdown STELLARIA
-                impluvium_set_shutdown(true);          // Shutdown all irrigation operations
+                impluvium_set_shutdown(true, IMPLUVIUM_SHUTDOWN_LOAD_SHED);          // Shutdown all irrigation operations
                 tempesta_set_shutdown(true);           // Shutdown weather monitoring
                 wifi_helper_set_shutdown(true);                     // Shutdown WiFi (save ~20mA)
                 telemetry_enable_telemetry_publishing(false);       // Buffering only (critical power)

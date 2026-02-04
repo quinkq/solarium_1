@@ -1136,11 +1136,11 @@ static void hmi_action_toggle_impluvium(void)
 {
     impluvium_state_t state = impluvium_get_state();
     if (state == IMPLUVIUM_DISABLED) {
-        impluvium_set_system_enabled(true);
+        impluvium_set_shutdown(false, IMPLUVIUM_SHUTDOWN_USER);
         ESP_LOGI(TAG, "IMPLUVIUM enabled");
     } else {
-        impluvium_set_system_enabled(false);
-        ESP_LOGI(TAG, "IMPLUVIUM disabled");
+        impluvium_set_shutdown(true, IMPLUVIUM_SHUTDOWN_USER);
+        ESP_LOGI(TAG, "IMPLUVIUM disabled (graceful - current zone will finish)");
     }
 
     // Force telemetry cache update so HMI sees new values immediately

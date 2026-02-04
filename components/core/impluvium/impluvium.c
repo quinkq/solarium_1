@@ -781,11 +781,14 @@ esp_err_t impluvium_write_realtime_to_telemetry_cache(impluvium_snapshot_rt_t *c
 // ########################## Emergency Shutdown Logic ##########################
 
 /**
- * @brief Immediately stop all irrigation operations (internal helper)
+ * @brief Immediately stop all irrigation operations
  *
  * Performs emergency abort bypassing normal state machine flow.
- * Must be called with xIrrigationMutex already held.
- * Safe to call from any state - performs minimal necessary cleanup.
+ * Safe to call from any context.
+ *
+ * @param reason If non-NULL, this is a safety emergency (pressure/flow issue) -
+ *               sets emergency flags and notifies main task for diagnostics.
+ *               If NULL, this is a graceful shutdown (user/load-shed) - no diagnostics.
  *
  * Actions:
  * - Stop pump immediately (PWM = 0)
@@ -795,10 +798,21 @@ esp_err_t impluvium_write_realtime_to_telemetry_cache(impluvium_snapshot_rt_t *c
  * - Notify monitoring task to stop
  * - Restore Stellaria lighting
  * - Transition to DISABLED state
+ * - If safety emergency: set flags and notify main task for diagnostics
  */
-static void impluvium_perform_emergency_stop(void)
+void impluvium_perform_emergency_stop(const char *reason)
 {
-    ESP_LOGW(TAG, "EMERGENCY STOP - Immediate abort of all irrigation operations");
+    if (reason != NULL) {
+        ESP_LOGE(TAG, "EMERGENCY STOP: %s - Immediate hardware kill", reason);
+
+        // Set emergency flags for diagnostics (only for safety emergencies)
+        if (!irrigation_system.emergency_stop) {
+            irrigation_system.emergency_stop = true;
+            irrigation_system.emergency.failure_reason = reason;
+        }
+    } else {
+        ESP_LOGW(TAG, "EMERGENCY STOP - Immediate abort of all irrigation operations");
+    }
 
     // Stop pump immediately (no ramp-down)
     impluvium_set_pump_speed(0);
@@ -839,6 +853,11 @@ static void impluvium_perform_emergency_stop(void)
     // Transition to DISABLED state
     impluvium_change_state(IMPLUVIUM_DISABLED);
 
+    // If safety emergency, notify main task for diagnostics
+    if (reason != NULL && xIrrigationTaskHandle != NULL) {
+        xTaskNotify(xIrrigationTaskHandle, IRRIGATION_TASK_NOTIFY_EMERGENCY_SHUTDOWN, eSetBits);
+    }
+
     ESP_LOGI(TAG, "Emergency stop complete - all actuators disabled, buses released");
 }
 
@@ -869,43 +888,7 @@ esp_err_t impluvium_set_power_save_mode(bool enable)
     return ESP_OK;
 }
 
-/**
- * @brief Enable/disable IMPLUVIUM system master switch
- *
- * @param enable true to enable system, false to disable
- * @return ESP_OK on success, ESP_FAIL if mutex timeout
- */
-esp_err_t impluvium_set_system_enabled(bool enable)
-{
-    if (xSemaphoreTake(xIrrigationMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
-        return ESP_FAIL;
-    }
-
-    if (!enable) {
-        ESP_LOGI(TAG, "System disabled via master switch");
-
-        // EMERGENCY OVERRIDE: Immediately abort watering if in progress
-        if (irrigation_system.state == IMPLUVIUM_WATERING ||
-            irrigation_system.state == IMPLUVIUM_STOPPING) {
-            ESP_LOGW(TAG, "Watering in progress - performing emergency stop (override)");
-            impluvium_perform_emergency_stop();
-        } else {
-            // Normal transition for other states
-            impluvium_change_state(IMPLUVIUM_DISABLED);
-        }
-
-        // Stop moisture check timer
-        xTimerStop(xMoistureCheckTimer, 0);
-    } else {
-        ESP_LOGI(TAG, "System enabled via master switch");
-        // Transition back to STANDBY and restart moisture timer
-        impluvium_change_state(IMPLUVIUM_STANDBY);
-        xTimerStart(xMoistureCheckTimer, 0);
-    }
-
-    xSemaphoreGive(xIrrigationMutex);
-    return ESP_OK;
-}
+// impluvium_set_system_enabled removed - use impluvium_set_shutdown(shutdown, IMPLUVIUM_SHUTDOWN_USER) instead
 
 /**
  * @brief Get current IMPLUVIUM operational state (lightweight, no snapshot fetch)
@@ -1073,43 +1056,55 @@ esp_err_t impluvium_force_water_zone(uint8_t zone_id, uint16_t duration_sec)
 }
 
 /**
- * @brief Set shutdown state for IMPLUVIUM irrigation system (for load shedding)
+ * @brief Enable/disable IMPLUVIUM system (unified shutdown function)
  *
- * Disables all irrigation operations during critical battery conditions.
+ * When shutdown=true, requests graceful stop - if watering is in progress,
+ * current zone will finish before system transitions to DISABLED state.
+ * This preserves learning data and prevents partial watering.
  *
- * @param shutdown true to shutdown, false to restore operation
+ * For safety emergencies (pressure/flow issues), use impluvium_perform_emergency_stop(reason)
+ * directly, which performs immediate hardware kill.
+ *
+ * @param shutdown true to disable system (graceful stop), false to re-enable
+ * @param reason Shutdown reason (USER for HMI, LOAD_SHED for FLUCTUS)
  * @return ESP_OK on success, ESP_FAIL if mutex timeout
  */
-esp_err_t impluvium_set_shutdown(bool shutdown)
+esp_err_t impluvium_set_shutdown(bool shutdown, impluvium_shutdown_reason_t reason)
 {
-    // CRITICAL: Use longer timeout for load shedding shutdown (monitoring task may be holding mutex)
-    // Safety-critical operation - MUST succeed even if monitoring task is active
+    const char *reason_str = (reason == IMPLUVIUM_SHUTDOWN_LOAD_SHED) ? "load shedding" : "user request";
+
+    // Use longer timeout for shutdown operations (monitoring task may be holding mutex)
     if (xSemaphoreTake(xIrrigationMutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
-        ESP_LOGE(TAG, "CRITICAL: Failed to acquire mutex for load shedding shutdown - continuing anyway");
-        // This should never happen, but log and return failure
+        ESP_LOGE(TAG, "Failed to acquire mutex for shutdown operation");
         return ESP_FAIL;
     }
 
-    irrigation_system.load_shed_shutdown = shutdown;
+    // Update legacy flag for backwards compatibility
+    irrigation_system.load_shed_shutdown = (shutdown && reason == IMPLUVIUM_SHUTDOWN_LOAD_SHED);
 
     if (shutdown) {
-        ESP_LOGI(TAG, "Load shedding shutdown - transitioning to DISABLED state");
+        ESP_LOGI(TAG, "System shutdown requested via %s", reason_str);
+        irrigation_system.shutdown_reason = reason;
 
-        // EMERGENCY OVERRIDE: Immediately abort watering if in progress
-        // (FLUCTUS has revoked 12V bus power - cannot continue safely)
         if (irrigation_system.state == IMPLUVIUM_WATERING ||
             irrigation_system.state == IMPLUVIUM_STOPPING) {
-            ESP_LOGW(TAG, "Watering in progress - performing emergency stop (load shedding override)");
-            impluvium_perform_emergency_stop();
+            // GRACEFUL STOP: Let current zone finish, then disable
+            // The state machine will check this flag in impluvium_state_stopping()
+            ESP_LOGI(TAG, "Watering in progress - requesting graceful stop (current zone will finish)");
+            irrigation_system.graceful_stop_requested = true;
         } else {
-            // Normal transition for other states
+            // Not watering - can transition immediately
             impluvium_change_state(IMPLUVIUM_DISABLED);
         }
 
-        // Stop moisture check timer
+        // Stop moisture check timer (no new cycles)
         xTimerStop(xMoistureCheckTimer, 0);
     } else {
-        ESP_LOGI(TAG, "Load shedding shutdown lifted - restoring normal operation");
+        ESP_LOGI(TAG, "System re-enabled via %s", reason_str);
+
+        // Clear shutdown flags
+        irrigation_system.graceful_stop_requested = false;
+
         // Transition back to STANDBY and restart moisture timer
         impluvium_change_state(IMPLUVIUM_STANDBY);
         xTimerStart(xMoistureCheckTimer, 0);

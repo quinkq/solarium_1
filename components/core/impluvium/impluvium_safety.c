@@ -61,12 +61,12 @@ esp_err_t impluvium_pre_check(void)
 
     // Global temperature safety limits (wider range for system protection)
     if (current_temperature < MIN_TEMPERATURE_GLOBAL || current_temperature > MAX_TEMPERATURE_GLOBAL) {
-        ESP_LOGE(TAG,
-                 "Pre-check failed: Temperature %.1f°C outside global safety range (%.1f°C to %.1f°C)",
+        ESP_LOGW(TAG,
+                 "Pre-check failed: Temperature %.1f°C outside global safety range (%.1f°C to %.1f°C) - skipping cycle",
                  current_temperature,
                  MIN_TEMPERATURE_GLOBAL,
                  MAX_TEMPERATURE_GLOBAL);
-        impluvium_emergency_stop("Temperature outside global safety range");
+        // Environmental condition, not hardware failure - just skip this cycle
         return ESP_FAIL;
     }
 
@@ -111,7 +111,7 @@ esp_err_t impluvium_pre_check(void)
                  "Pre-check failed: Outlet pressure %.2f bar is above maximum %.2f bar",
                  irrigation_system.outlet_pressure,
                  MAX_PRESSURE_BAR);
-        impluvium_emergency_stop("System's outlet pressure too high");
+        impluvium_perform_emergency_stop("System's outlet pressure too high");
         return ESP_FAIL;
     }
 #endif
@@ -322,7 +322,7 @@ bool impluvium_handle_safety_failure(uint32_t *error_count, const char *failure_
 
     if (*error_count >= MAX_ERROR_COUNT) {
         ESP_LOGE(task_tag, "Maximum safety failures reached: %s", failure_reason);
-        impluvium_emergency_stop(failure_reason);
+        impluvium_perform_emergency_stop(failure_reason);
         return false;  // Emergency triggered
     } else if (*error_count == 2) {
         ESP_LOGW(task_tag, "Reducing pump speed due to safety issue");
@@ -377,7 +377,9 @@ void impluvium_periodic_safety_check(const char **failure_reason, uint32_t time_
                      MAX_PRESSURE_BAR);
             *failure_reason = "Outlet pressure too high";
         }
-        if (time_since_start_ms > 1000 && irrigation_system.current_flow_rate < MIN_FLOW_RATE_LH) {
+        // Allow some pump ramp-up (3s) to complete before checking flow rate
+        // (flow is intentionally low during the 5-second ramp period)
+        if (time_since_start_ms > (PUMP_RAMPUP_TIME_MS - 2000) && irrigation_system.current_flow_rate < MIN_FLOW_RATE_LH) {
             ESP_LOGW(TAG, "Flow rate too low: %.1f < %.1f L/h", irrigation_system.current_flow_rate, MIN_FLOW_RATE_LH);
             *failure_reason = "Flow rate too low.";
             impluvium_set_anomaly(ANOMALY_FLOW_ISSUE, irrigation_system.current_flow_rate);
@@ -396,24 +398,6 @@ void impluvium_periodic_safety_check(const char **failure_reason, uint32_t time_
 // ########################## Irrigation System ##########################
 // ------------------- Emergency Diagnostics Functions -------------------
 
-/**
- * @brief Emergency stop - immediate shutdown
- */
-esp_err_t impluvium_emergency_stop(const char *reason)
-{
-    ESP_LOGE(TAG, "EMERGENCY STOP TRIGGERED: %s - Immediate irrigation shutdown", reason);
-
-    // Only trigger if not already in an emergency shutdown
-    if (!irrigation_system.emergency_stop) {
-        irrigation_system.emergency_stop = true;
-        // Store the reason for the diagnostics phase
-        irrigation_system.emergency.failure_reason = reason;
-        // Signal the main task to handle the emergency
-        xTaskNotify(xIrrigationTaskHandle, IRRIGATION_TASK_NOTIFY_EMERGENCY_SHUTDOWN, eSetBits);
-    }
-
-    return ESP_OK;
-}
 
 /**
  * @brief Initialize emergency diagnostics system
@@ -558,12 +542,34 @@ esp_err_t emergency_diagnostics_test_zone(uint8_t zone_id)
     // Reset flow counter
     pcnt_unit_clear_count(flow_pcnt_unit);
 
-    // Wait for test duration, checking for overcurrent midway
-    vTaskDelay(pdMS_TO_TICKS(EMERGENCY_TEST_DURATION_MS / 5));
+    // Wait for test duration with periodic safety checks (500ms intervals)
+    // This prevents running the pump against a blockage for the full test duration
+    bool test_aborted = false;
+    for (int i = 0; i < (EMERGENCY_TEST_DURATION_MS / WATERING_MONITORING_INTERVAL_MS); i++) {
+        vTaskDelay(pdMS_TO_TICKS(WATERING_MONITORING_INTERVAL_MS));
 
-    // Overcurrent monitoring delegated to Fluctus (power management) system.
+        // Safety check (pass 0 to skip flow rate check - we're testing at minimum duty)
+        const char *safety_failure = NULL;
+        impluvium_periodic_safety_check(&safety_failure, 0);
+        if (safety_failure != NULL) {
+            ESP_LOGW(TAG, "Diagnostic test aborted for zone %d: %s", zone_id, safety_failure);
+            impluvium_set_pump_speed(0);
+            impluvium_close_valve(zone_id);
+            fluctus_release_level_shifter("IMPLUVIUM_DIAG");
+            fluctus_release_bus_power(POWER_BUS_12V, "IMPLUVIUM_DIAG");
+            irrigation_system.emergency.failed_zones_mask |= (1U << zone_id);
+            irrigation_system.emergency.test_flow_rates[zone_id] = 0.0f;
+            irrigation_system.emergency.test_pressures[zone_id] = irrigation_system.outlet_pressure;
+            test_aborted = true;
+            break;
+        }
+    }
 
-    vTaskDelay(pdMS_TO_TICKS(EMERGENCY_TEST_DURATION_MS));
+    if (test_aborted) {
+        irrigation_system.emergency.test_cycle_count++;
+        vTaskDelay(pdMS_TO_TICKS(2000));  // Small delay between tests
+        return ESP_FAIL;
+    }
 
     // Measure results
     int test_pulses;
