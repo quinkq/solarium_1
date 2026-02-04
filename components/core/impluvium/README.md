@@ -197,21 +197,28 @@ MONITORING_TASK_NOTIFY_STOP_MONITORING   // Stop monitoring
 
 ### 1. Learning Algorithm (impluvium_learning.c)
 
-**4-Phase Cycle:**
-1. **Predict:** `target_pulses = (PPMP_ratio × deficit × temp_correction × confidence) + (default × (1 - confidence))`
-2. **Execute:** Water with real-time monitoring, adaptive pump control
-3. **Measure:** Check moisture 3× post-watering (5min, 10min, 15min)
-4. **Update:** Store event, recalculate PPMP ratio, update confidence
+**Learning Cycle:**
+1. **Predict:** 2-tier confidence blending (linear 0→70%: `blend = learned × (conf/0.70) + default × (1 - conf/0.70)`, above 70%: 100% learned), temp correction ±1%/°C, dynamic moisture cutoff (accounts for soil redistribution)
+2. **Execute:** Water with real-time monitoring, ratio-based pump duty adjustment (±15% max per cycle)
+3. **Measure:** Store pre-computed PPMP ratio, record immediate moisture
+4. **Update:** Update confidence (20% EMA + boost floor), adjust pump duty (ratio-based)
+5. **Verify:** 5-min delayed reading → update soil redistribution factor (15% EMA)
 
 **Learning Data (per zone):**
 ```c
 typedef struct {
-    float pulses_used_history[15];
-    float moisture_increase_percent_history[15];
-    bool anomaly_flags[15];
-    uint8_t history_entry_count;  // 0-15
-    float calculated_ppmp_ratio;  // Pulses per moisture percent
-    float confidence_level;       // 0.0-1.0 (successful/total predictions)
+    float ppmp_ratio_history[15];           // Pre-computed PPMP ratios
+    bool anomaly_flags[15];                 // Invalid cycles (rain, errors)
+    uint8_t history_entry_count;            // Valid entries (0-15)
+    uint8_t history_index;                  // Circular buffer position
+    float last_temperature_correction;      // Most recent temp factor
+    float calculated_ppmp_ratio;            // Weighted average PPMP
+    uint32_t calculated_pump_duty_cycle;    // Optimal PWM (0-1023)
+    float soil_redistribution_factor;       // Moisture redistribution (1.0-3.0)
+    float measured_moisture_gain_rate;      // Latest gain rate (%/sec)
+    float confidence_level;                 // EMA-based confidence (0.0-1.0)
+    uint32_t successful_predictions;        // Success count (legacy)
+    uint32_t total_predictions;             // Total count (legacy)
 } zone_learning_t;
 ```
 
@@ -228,10 +235,16 @@ typedef struct {
 - 3+ consecutive anomalies (algorithm not converging)
 
 **Confidence Interpretation:**
-- `0.0-0.3`: Early learning, heavily weighted to defaults (safe but inefficient)
-- `0.3-0.7`: Transitioning, blending learned + defaults (adaptive)
-- `0.7-1.0`: High confidence, mostly learned values (optimized)
+- `0.0-0.25`: Initial learning, boost floor applied after first good prediction (≤20% error)
+- `0.25-0.70`: Transitioning, linear blend (conf=0.35 → 50% learned + 50% default)
+- `0.70-1.0`: High confidence, 100% learned predictions (optimized)
 - Low confidence (<0.5) after 15+ events: Check for anomalies or hardware issues
+
+**Soil Redistribution Factor (RF) Interpretation:**
+- `1.0-1.2`: Sandy soil (fast drainage, minimal redistribution)
+- `1.3-1.7`: Loam (moderate redistribution, typical)
+- `1.8-3.0`: Clay (slow drainage, significant upward redistribution)
+- Default: 1.5 (conservative mid-range estimate)
 
 **History Size Rationale:**
 - 15 events = 2-3 weeks of daily watering
@@ -265,8 +278,14 @@ esp_err_t impluvium_set_check_intervals(
 | Cool interval | 10-90 min | Slower evaporation at 10-20°C allows longer intervals |
 | Power save interval | 30-120 min | Battery conservation, acceptable for slow-growing deficit |
 | Night minimum | 1-6 hours | Minimal evaporation at night, avoid unnecessary sensor power cycles |
+| Default PPMP | 15.0 pulses/% | Conservative starting efficiency estimate for unknown soil |
+| PPMP bounds | 2.0-100.0 pulses/% | Hardware-safe clamping range (prevents sensor glitch damage) |
+| Default target pulses | 100 (~250mL) | Conservative initial watering volume |
+| Target pulses bounds | 20-600 (50-1500mL) | Safety min/max to prevent under/over-watering |
 | Pump min duty | 42% | Centrifugal pump stall protection (manufacturer spec) |
 | Pump max duty | 100% | Full power available, adaptive control adjusts down if needed |
+| Pump duty adjustment | ±15% per cycle | Prevents oscillation from noisy gain rate measurements |
+| Soil RF range | 1.0-3.0 | Sandy (instant) to clay (slow redistribution) |
 | Max watering time | 60 sec | Safety timeout: prevents runoff, limits damage if valve stuck |
 | Min flow rate | 15 L/h | Blockage detection threshold (below = clogged line/failed pump) |
 | Max pressure | 2.5 bar | Hydraulic safety: prevents hose burst, solenoid damage |
@@ -331,9 +350,9 @@ typedef enum {
 ├─ Zone settings: target_moisture, deadband, enabled
 └─ Trigger: MQTT/HMI config updates
 
-/data/irrigation/learning.dat (350B, CRC16)
-├─ Learned params: PPMP ratio, pump duty, confidence
-├─ Recent history: 5 events per zone
+/data/irrigation/learning.dat (~350B, CRC16)
+├─ Learned params: PPMP ratio, pump duty, soil redistribution factor, confidence
+├─ Recent history: 5 most recent valid PPMP ratios per zone (pre-computed)
 └─ Trigger: Daily at midnight
 ```
 
@@ -478,8 +497,9 @@ typedef struct {
 
         // Learning
         float calculated_ppmp_ratio, confidence_level;
-        uint32_t calculated_pump_duty;
-        float target_moisture_gain_rate, last_temperature_correction;
+        uint32_t calculated_pump_duty_cycle;
+        float soil_redistribution_factor;
+        float measured_moisture_gain_rate, last_temperature_correction;
         uint32_t successful_predictions, total_predictions;
         uint8_t history_entry_count;
     } zones[5];
@@ -496,7 +516,7 @@ typedef struct {
     float water_level_percent, outlet_pressure_bar;
     float current_flow_rate_lh, current_moisture_gain_rate;
     uint8_t pump_duty_percent, active_zone;
-    bool pressure_alarm, flow_alarm;
+    bool emergency_stop, pressure_alarm, flow_alarm;
 
     uint8_t watering_queue_size, queue_index;
     struct {
@@ -591,7 +611,7 @@ All sensors use two-point or factory calibration with typical operating ranges:
 
 **Workflow-Driven Telemetry**: The component publishes snapshots at workflow completion (end of MAINTENANCE state), not on every state transition. This reduces telemetry traffic and ensures HMI/MQTT receive complete watering cycle data (all zones measured, queued, watered, and learned) rather than fragmented state updates.
 
-**Confidence-Weighted Learning**: Predictions blend learned values with defaults using confidence: `target = (learned × confidence) + (default × (1 - confidence))`. Early in learning (confidence <0.3), the system relies heavily on safe defaults. As confidence grows (0.3-1.0), it transitions to optimized learned behavior. This prevents premature optimization while building reliable historical data.
+**Confidence-Weighted Learning**: 2-tier blending system - below 70% confidence uses linear interpolation `target = learned × (conf/0.70) + default × (1 - conf/0.70)`, above 70% uses 100% learned predictions. Early learning (confidence <0.25) accelerates via boost floor after first good prediction. As confidence grows (0.25→0.70), the system gradually transitions from safe defaults to optimized learned behavior. This prevents premature optimization while building reliable historical data with 20% EMA weight for responsive adaptation to hardware changes.
 
 **Dual Persistence Strategy**: Hot operational data (hourly/daily usage) lives in RTC RAM for fast access and survives resets. Cold configuration data (zone targets, learned PPMP ratios) persists to LittleFS with daily writes. This minimizes flash wear while maintaining data continuity through normal reboots - only complete power loss resets usage counters.
 

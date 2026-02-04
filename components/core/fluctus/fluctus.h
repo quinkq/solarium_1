@@ -115,12 +115,12 @@
 #define FLUCTUS_NOTIFY_CONFIG_UPDATE         (1UL << 5)  // Configuration updated - recalculate timeouts (monitoring task)
 
 // Battery Voltage Thresholds (12V AGM, 50% SOC = 0%)
-#define FLUCTUS_BATTERY_LEVEL_POWER_SAVING    12.48f  // 40% SOC - Limit STELLARIA
+#define FLUCTUS_BATTERY_LEVEL_POWER_SAVING    12.48f  // 40% SOC - Impose limit on STELLARIA
 #define FLUCTUS_BATTERY_LEVEL_LOW_POWER       12.33f  // 25% SOC - Turn off STELLARIA
 #define FLUCTUS_BATTERY_LEVEL_VERY_LOW        12.23f  // 15% SOC - Turn off IMPLUVIUM  
 #define FLUCTUS_BATTERY_LEVEL_CRITICAL        12.08f  // 0% SOC  - Turn off TEMPESTA + Solar
 
-#define FLUCTUS_STATE_DEBOUNCE_REQUIRED_COUNT 5  // Require 5 consecutive readings to change state
+#define FLUCTUS_STATE_DEBOUNCE_REQUIRED_COUNT 3  // Require 3 consecutive readings to change state
 
 // Battery Voltage Hysteresis (+0.1V for turn-on)
 #define FLUCTUS_BATTERY_HYSTERESIS            0.10f
@@ -130,8 +130,8 @@
 #define FLUCTUS_BATTERY_LEVEL_CRITICAL_ON     (FLUCTUS_BATTERY_LEVEL_CRITICAL + FLUCTUS_BATTERY_HYSTERESIS)
 
 // Overcurrent Protection
-#define FLUCTUS_OVERCURRENT_THRESHOLD_1       3.0f    // Amps, 5-second delay
-#define FLUCTUS_OVERCURRENT_THRESHOLD_2       4.0f    // Amps, immediate shutdown
+#define FLUCTUS_OVERCURRENT_THRESHOLD_1       3.5f    // Amps, 5-second delay
+#define FLUCTUS_OVERCURRENT_THRESHOLD_2       4.5f    // Amps, immediate shutdown
 #define FLUCTUS_OVERCURRENT_DELAY_MS          5000    // Delay for threshold 1
 
 // Mutex timeout constants

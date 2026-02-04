@@ -67,6 +67,7 @@ uint8_t editing_zone_id = 0;                    // 0-4
 bool editing_zone_enabled = true;
 float editing_zone_target = 45;              // 20-80%
 float editing_zone_deadband = 5;             // 1-20%
+float editing_zone_moisture_gain_rate = 1.0f;  // 0.1-3.0 %/sec
 
 // IMPLUVIUM manual water input state (shared via hmi_private.h)
 bool manual_water_input = false;

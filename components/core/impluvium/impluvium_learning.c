@@ -92,7 +92,10 @@ float impluvium_calculate_temperature_correction(zone_learning_t *learning)
 }
 
 /**
- * @brief Calculate weighted learning ratio from historical data
+ * @brief Calculate weighted learning PPMP ratio from historical data
+ *
+ * Traverses circular buffer from newest to oldest entry, applying recency weighting.
+ * Recent 3 cycles get 70% weight, older cycles get 30% weight.
  *
  * @param[in] learning Zone learning data
  * @param[out] valid_cycles Number of valid historical cycles found
@@ -100,92 +103,138 @@ float impluvium_calculate_temperature_correction(zone_learning_t *learning)
  */
 float impluvium_calculate_pulse_per_moisture_percent(zone_learning_t *learning, uint8_t *valid_cycles)
 {
-    float weighted_ratio = 0.0f;
+    float weighted_ppmp_ratio = 0.0f;
     float total_weight = 0.0f;
     *valid_cycles = 0;
 
-    for (uint8_t h = 0; h < learning->history_entry_count; h++) {
-        // Skip anomalous cycles (rain, manual watering, etc.)
-        if (!learning->anomaly_flags[h] && learning->moisture_increase_percent_history[h] > 0) {
-            // Calculate recency: most recent entries get higher weight
-            // Recent entries are at (history_index - 1), (history_index - 2), etc. with wraparound
-            uint8_t relative_age = (learning->history_index - h - 1 + LEARNING_HISTORY_SIZE) % LEARNING_HISTORY_SIZE;
-            float weight = (relative_age < 3) ? LEARNING_WEIGHT_RECENT : (1.0f - LEARNING_WEIGHT_RECENT);
+    // Traverse circular buffer from newest to oldest
+    // age=0 is most recent, age=1 is second most recent, etc.
+    for (uint8_t age = 0; age < learning->history_entry_count; age++) {
 
-            // Calculate pulses per moisture percent for this cycle
-            float ratio = learning->pulses_used_history[h] / learning->moisture_increase_percent_history[h];
+        // Calculate actual buffer index for this age
+        // history_index points to next write slot, so most recent will be at (history_index - 1)
+        uint8_t index = (learning->history_index - age - 1 + LEARNING_HISTORY_SIZE) % LEARNING_HISTORY_SIZE;
 
-            weighted_ratio += ratio * weight;
+        // Skip anomalous cycles (rain, manual watering, etc.) and invalid ratios
+        float ppmp_ratio = learning->ppmp_ratio_history[index];
+        if (!learning->anomaly_flags[index] && ppmp_ratio > 0.0f) {
+
+            // Recent 3 cycles get higher weight (70%), older ones get lower (30%)
+            float weight = (age < 3) ? LEARNING_WEIGHT_RECENT : (1.0f - LEARNING_WEIGHT_RECENT);
+
+            // Accumulate weighted sum
+            weighted_ppmp_ratio += ppmp_ratio * weight;
             total_weight += weight;
             (*valid_cycles)++;
 
-            ESP_LOGD(TAG,
-                     "Cycle %d (age %d): %d pulses, %.2f%% increase, ratio %.1f, weight %.2f",
-                     h,
-                     relative_age,
-                     (int) learning->pulses_used_history[h],
-                     learning->moisture_increase_percent_history[h],
-                     ratio,
-                     weight);
+            ESP_LOGD(TAG, "History[%d] (age %d): PPMP ratio %.1f, weight %.2f",
+                     index, age, ppmp_ratio, weight);
         }
     }
 
-    return (total_weight > 0 && *valid_cycles >= 2) ? (weighted_ratio / total_weight) : 0.0f;
+    // Need at least 2 valid cycles for meaningful average
+    if (*valid_cycles < 2 || total_weight <= 0) {
+        ESP_LOGD(TAG, "Insufficient data: %d valid cycles, %.2f total weight", *valid_cycles, total_weight);
+        return 0.0f;
+    }
+
+    // Calculate final weighted average
+    float calculated_ppmp = weighted_ppmp_ratio / total_weight;
+    ESP_LOGD(TAG, "Weighted PPMP: %.1f (from %d cycles, weight %.2f)", calculated_ppmp, *valid_cycles, total_weight);
+
+    return calculated_ppmp;
 }
 
 /**
- * @brief Calculate target pulses for a single zone
+ * @brief Calculate target pulses for a single zone BEFORE watering - called from measuring state.
+ *
+ * Uses learned data (PPMP, soil redistribution) + confidence-based blending to predict
+ * water needs. Falls back to defaults for early learning phase or invalid data.
+ *
+ * Workflow (5 phases):
+ * 1. Calculate temperature correction (±1%/°C from 20°C)
+ * 2. Calculate & clamp PPMP ratio (learned pulses per moisture %)
+ * 3. Apply confidence-based blending (high/medium/low confidence → learned/blend/default)
+ * 4. Clamp final target pulses to safe limits
+ * 5. Compute dynamic moisture cutoff (accounts for soil redistribution)
  *
  * @param[in] zone_id Zone identifier
  * @param[in] queue_index Index in watering queue
  * @return ESP_OK on success
  */
-esp_err_t impluvium_calculate_zone_target_pulses(uint8_t zone_id, uint8_t queue_index)
+esp_err_t impluvium_precalculate_zone_watering_targets(uint8_t zone_id, uint8_t queue_index)
 {
     irrigation_zone_t *zone = &irrigation_zones[zone_id];
     zone_learning_t *learning = &zone->learning;
 
+    // ============================================================================
+    // PHASE 1: Calculate Temperature Correction
+    // ============================================================================
     // Calculate temperature correction
     float calculated_temp_correction = impluvium_calculate_temperature_correction(learning);
 
+    // ============================================================================
+    // PHASE 2: Calculate & Clamp PPMP Ratio
+    // ============================================================================
     // Check if we have sufficient learning data
     if (learning->history_entry_count >= LEARNING_MIN_CYCLES) {
         uint8_t valid_cycles;
         float calculated_ppmp_ratio = impluvium_calculate_pulse_per_moisture_percent(learning, &valid_cycles);
 
+        // Validate and clamp PPMP to reasonable bounds
         if (calculated_ppmp_ratio > 0.0f) {
+            // Clamp to valid range and log if clamping occurred
+            bool was_clamped = false;
+            if (calculated_ppmp_ratio < MINIMUM_PULSES_PER_MOISTURE_PERCENT) {
+                ESP_LOGW(TAG, "Zone %d: PPMP ratio %.1f below minimum, clamping to %.1f",
+                         zone_id, calculated_ppmp_ratio, MINIMUM_PULSES_PER_MOISTURE_PERCENT);
+                calculated_ppmp_ratio = MINIMUM_PULSES_PER_MOISTURE_PERCENT;
+                was_clamped = true;
+            } else if (calculated_ppmp_ratio > MAXIMUM_PULSES_PER_MOISTURE_PERCENT) {
+                ESP_LOGW(TAG, "Zone %d: PPMP ratio %.1f above maximum, clamping to %.1f",
+                         zone_id, calculated_ppmp_ratio, MAXIMUM_PULSES_PER_MOISTURE_PERCENT);
+                calculated_ppmp_ratio = MAXIMUM_PULSES_PER_MOISTURE_PERCENT;
+                was_clamped = true;
+            }
+
             learning->calculated_ppmp_ratio = calculated_ppmp_ratio;
 
-            // Calculate learned prediction
-            float learned_target_pulses = irrigation_system.watering_queue[queue_index].moisture_deficit_percent *
+            // Effective deficit accounts for soil redistribution
+            float effective_moisture_deficit = irrigation_system.watering_queue[queue_index].moisture_deficit_percent /
+                                                learning->soil_redistribution_factor;
+
+            // Calculate learned prediction (using effective deficit)
+            float learning_adjusted_target_pulses = effective_moisture_deficit *
                                          calculated_ppmp_ratio * calculated_temp_correction;
 
-            // Calculate default prediction for blending
-            float default_target_pulses = irrigation_system.watering_queue[queue_index].moisture_deficit_percent *
-                                        DEFAULT_PULSES_PER_PERCENT * calculated_temp_correction;
+            // Calculate default prediction for blending (using effective deficit)
+            float default_target_pulses = effective_moisture_deficit *
+                                        DEFAULT_PULSES_PER_MOISTURE_PERCENT * calculated_temp_correction;
 
-            // Apply confidence-based blending
+            // ============================================================================
+            // PHASE 3: Apply Confidence-Based Linear Blending
+            // ============================================================================
+            // Linear blend from 0% learned at conf=0 to 100% learned at conf=HIGH_CONFIDENCE_THRESHOLD
             float target_pulses;
             float confidence = learning->confidence_level;
 
-            if (confidence >= 0.70f) {
+            if (confidence >= HIGH_CONFIDENCE_THRESHOLD) {
                 // High confidence: Use full learned prediction
-                target_pulses = learned_target_pulses;
-                ESP_LOGI(TAG, "Zone %d: High confidence (%.0f%%), using learned prediction",
-                        zone_id, confidence * 100.0f);
-            } else if (confidence >= 0.40f) {
-                // Medium confidence: Blend learned + default
-                float blend_factor = (confidence - 0.40f) / 0.30f; // 0.0 to 1.0 scale
-                target_pulses = (learned_target_pulses * blend_factor) + (default_target_pulses * (1.0f - blend_factor));
-                ESP_LOGI(TAG, "Zone %d: Medium confidence (%.0f%%), blending predictions (%.0f%% learned)",
-                        zone_id, confidence * 100.0f, blend_factor * 100.0f);
+                target_pulses = learning_adjusted_target_pulses;
+                ESP_LOGI(TAG, "Zone %d: High confidence (%.0f%%), using 100%% learned",
+                         zone_id, confidence * 100.0f);
             } else {
-                // Low confidence: Use mostly default with slight learned influence
-                target_pulses = (default_target_pulses * 0.8f) + (learned_target_pulses * 0.2f);
-                ESP_LOGI(TAG, "Zone %d: Low confidence (%.0f%%), using mostly default prediction",
-                        zone_id, confidence * 100.0f);
+                // Linear interpolation: blend_factor scales from 0.0 to 1.0 as confidence rises
+                float blend_factor = confidence / HIGH_CONFIDENCE_THRESHOLD;
+                target_pulses = (learning_adjusted_target_pulses * blend_factor) +
+                                (default_target_pulses * (1.0f - blend_factor));
+                ESP_LOGI(TAG, "Zone %d: Confidence %.0f%%, blending %.0f%% learned + %.0f%% default",
+                         zone_id, confidence * 100.0f, blend_factor * 100.0f, (1.0f - blend_factor) * 100.0f);
             }
 
+            // ============================================================================
+            // PHASE 4: Clamp Final Target Pulses
+            // ============================================================================
             // Limit to reasonable range
             if (target_pulses < MINIMUM_TARGET_PULSES)
                 target_pulses = MINIMUM_TARGET_PULSES;
@@ -195,18 +244,20 @@ esp_err_t impluvium_calculate_zone_target_pulses(uint8_t zone_id, uint8_t queue_
             irrigation_system.watering_queue[queue_index].target_pulses = (uint16_t) target_pulses;
 
             ESP_LOGI(TAG,
-                     "Zone %d: Final prediction %d pulses (learned: %.1f, default: %.1f pulses/%%, temp: %.2f°C)",
+                     "Zone %d: Final prediction %d pulses (PPMP: %.1f%s, temp corr: %.2f, RF: %.2f)",
                      zone_id,
                      irrigation_system.watering_queue[queue_index].target_pulses,
                      calculated_ppmp_ratio,
-                     DEFAULT_PULSES_PER_PERCENT,
-                     calculated_temp_correction);
+                     was_clamped ? " [clamped]" : "",
+                     calculated_temp_correction,
+                     learning->soil_redistribution_factor);
         } else {
-            // Not enough valid learning data
+            // PPMP is invalid (<=0) - use default
             irrigation_system.watering_queue[queue_index].target_pulses = DEFAULT_TARGET_PULSES;
             ESP_LOGW(TAG,
-                     "Zone %d: Insufficient valid learning data (%d cycles), using default %d pulses",
+                     "Zone %d: Invalid PPMP ratio (%.1f), insufficient valid learning data (%d cycles), using default %d pulses",
                      zone_id,
+                     calculated_ppmp_ratio,
                      valid_cycles,
                      DEFAULT_TARGET_PULSES);
         }
@@ -221,31 +272,43 @@ esp_err_t impluvium_calculate_zone_target_pulses(uint8_t zone_id, uint8_t queue_
                  DEFAULT_TARGET_PULSES);
     }
 
+    // ============================================================================
+    // PHASE 5: Compute Dynamic Moisture Cutoff
+    // ============================================================================
+    // Compute dynamic moisture cutoff for this zone (accounts for soil redistribution)
+    float start_moisture = irrigation_system.watering_queue[queue_index].measured_moisture_percent;
+    float target_moisture = zone->target_moisture_percent;
+    float rf = learning->soil_redistribution_factor;
+    irrigation_system.watering_queue[queue_index].dynamic_moisture_cutoff =
+        start_moisture + (target_moisture - start_moisture) / rf;
+
     ESP_LOGI(TAG,
-             "Queue[%d]: Zone %d, deficit %.2f%%, target %d pulses",
+             "Queue[%d]: Zone %d, deficit %.2f%%, target %d pulses, cutoff %.1f%% (RF=%.2f)",
              queue_index,
              zone_id,
              irrigation_system.watering_queue[queue_index].moisture_deficit_percent,
-             irrigation_system.watering_queue[queue_index].target_pulses);
+             irrigation_system.watering_queue[queue_index].target_pulses,
+             irrigation_system.watering_queue[queue_index].dynamic_moisture_cutoff,
+             rf);
 
     return ESP_OK;
 }
 
 /**
- * @brief Calculate watering predictions for all zones in queue
+ * @brief Calculate watering predictions for all zones in queue BEFORE watering - called from measuring state.
  *
  * Orchestrates the learning algorithm to predict optimal water amounts
  * for each zone in the watering queue.
  *
  * @return ESP_OK on success, ESP_ERR_* on failure
  */
-esp_err_t impluvium_calculate_zone_watering_predictions(void)
+esp_err_t impluvium_precalculate_zone_watering_predictions(void)
 {
     ESP_LOGI(TAG, "Calculating watering predictions for %d zones", irrigation_system.watering_queue_size);
 
     for (uint8_t i = 0; i < irrigation_system.watering_queue_size; i++) {
         uint8_t zone_id = irrigation_system.watering_queue[i].zone_id;
-        esp_err_t ret = impluvium_calculate_zone_target_pulses(zone_id, i);
+        esp_err_t ret = impluvium_precalculate_zone_watering_targets(zone_id, i);
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "Failed to calculate target pulses for zone %d: %s", zone_id, esp_err_to_name(ret));
             return ret;
@@ -256,31 +319,120 @@ esp_err_t impluvium_calculate_zone_watering_predictions(void)
 }
 
 /**
- * @brief Update learning algorithm with post-watering data
+ * @brief Adjust pump duty cycle based on measured vs target gain rate
  *
- * This function records the results of a watering cycle for future learning:
- * 1. Stores pulses used and moisture increase achieved
- * 2. Marks anomalous cycles (rain, manual watering, sensor errors)
- * 3. Maintains circular buffer of historical data
- * 4. Updates learning statistics
+ * Called once per zone after watering completes. Compares the measured moisture
+ * gain rate against the configurable target and adjusts pump duty for the next event.
+ * This provides between-event optimization without mid-watering control complexity.
  *
- * Anomaly Detection Criteria:
- * - Excessive moisture increase (>0.3V indicates rain/manual watering)
+ * @param zone_id Zone that was watered (0-4)
+ * @param measured_moisture_increase Moisture increase observed (%)
+ * @param watering_duration_ms Duration of watering event (ms)
+ * @param target_moisture_gain_rate Configurable target gain rate (%/sec)
+ */
+void impluvium_update_pump_duty_from_gain_rate(uint8_t zone_id,
+                                                float measured_moisture_increase,
+                                                uint32_t watering_duration_ms,
+                                                float target_moisture_gain_rate)
+{
+    if (zone_id >= IRRIGATION_ZONE_COUNT) {
+        return;
+    }
+
+    zone_learning_t *learning = &irrigation_zones[zone_id].learning;
+
+    // Validate watering duration
+    if (watering_duration_ms < 3000 || watering_duration_ms > MAX_WATERING_TIME_MS) {
+        ESP_LOGD(TAG, "Zone %d: Invalid watering duration %lums for pump duty adjustment",
+                 zone_id, watering_duration_ms);
+        return;
+    }
+
+    // Calculate measured gain rate
+    float measured_gain_rate = measured_moisture_increase / (watering_duration_ms / 1000.0f);
+
+    // Store UNCLAMPED measured rate for telemetry/diagnostics (shows actual soil behavior)
+    learning->measured_moisture_gain_rate = measured_gain_rate;
+
+    // Clamp gain rate for calculations to prevent extreme adjustments
+    float clamped_gain_rate = measured_gain_rate;
+    bool was_clamped = false;
+
+    if (clamped_gain_rate < MIN_TARGET_GAIN_RATE_PER_SEC) {
+        ESP_LOGW(TAG, "Zone %d: Measured gain rate %.2f%%/sec below minimum, clamping to 0.1",
+                 zone_id, measured_gain_rate);
+        clamped_gain_rate = 0.1f;
+        was_clamped = true;
+    } else if (clamped_gain_rate > MAX_TARGET_GAIN_RATE_PER_SEC) {
+        ESP_LOGW(TAG, "Zone %d: Measured gain rate %.2f%%/sec above maximum, clamping to 3.0",
+                 zone_id, measured_gain_rate);
+        clamped_gain_rate = 3.0f;
+        was_clamped = true;
+    }
+
+    // Adjust pump duty toward target gain rate for NEXT event (using clamped value)
+    float gain_ratio = target_moisture_gain_rate / clamped_gain_rate;
+
+    // Clamp to max 15% change per event (prevents oscillation)
+    if (gain_ratio > PUMP_DUTY_ADJUSTMENT_MAX_RATIO) {
+        gain_ratio = PUMP_DUTY_ADJUSTMENT_MAX_RATIO;
+    }
+    if (gain_ratio < PUMP_DUTY_ADJUSTMENT_MIN_RATIO) {
+        gain_ratio = PUMP_DUTY_ADJUSTMENT_MIN_RATIO;
+    }
+
+    uint32_t old_duty = learning->calculated_pump_duty_cycle;
+    uint32_t new_duty = (uint32_t)(old_duty * gain_ratio);
+
+    // Clamp to pump limits
+    if (new_duty < PUMP_MIN_DUTY) {
+        new_duty = PUMP_MIN_DUTY;
+    }
+    if (new_duty > PUMP_MAX_DUTY) {
+        new_duty = PUMP_MAX_DUTY;
+    }
+
+    learning->calculated_pump_duty_cycle = new_duty;
+
+    ESP_LOGI(TAG, "Zone %d pump duty adjusted: %lu → %lu (gain: %.2f%s vs target %.2f %%/sec, ratio %.2f)",
+             zone_id, old_duty, new_duty, measured_gain_rate,
+             was_clamped ? " [clamped]" : "", target_moisture_gain_rate, gain_ratio);
+}
+
+/**
+ * @brief Update learning algorithm with POST-watering data. Called from stopping state.
+ *
+ * Records watering results in circular buffer, updates confidence via EMA (10% weight),
+ * and optimizes pump duty for next cycle. Handles both valid and anomalous cycles.
+ *
+ * Workflow (4 phases):
+ * 1. Store data in circular buffer (pulses, moisture increase, anomaly flag)
+ * 2. Calculate basic statistics (pulses per moisture %)
+ * 3. Update confidence & pump duty (valid cycles only, EMA-based)
+ * 4. Log learning progress (after minimum cycles reached)
+ *
+ * Anomaly Detection Criteria (set via impluvium_set_anomaly):
+ * - Excessive moisture increase rate (>5%/sec indicates rain/manual watering)
  * - Extreme temperature conditions (<5°C or >45°C)
- * - Flow anomalies detected during watering
- * - Other system-detected anomalies
+ * - Flow rate below minimum threshold (<15 L/h)
+ * - Invalid temperature reading from TEMPESTA
  *
  * @param zone_id Zone that was watered (0-4)
  * @param pulses_used Number of flow sensor pulses during watering
- * @param moisture_increase_percent Percentage increase observed in moisture sensor (final - initial)
+ * @param measured_moisture_increase Percentage increase observed in moisture sensor (final - initial)
+ * @param watering_duration_ms Duration of watering (for gain rate calculation)
  * @param learning_valid Whether this cycle should be used for learning
  * @return ESP_OK on success, ESP_ERR_INVALID_ARG on invalid parameters
  */
-esp_err_t impluvium_process_zone_watering_data(uint8_t zone_id,
+esp_err_t impluvium_postprocess_zone_watering_data(uint8_t zone_id,
                                                    uint32_t pulses_used,
-                                                   float moisture_increase_percent,
+                                                   float measured_moisture_increase,
+                                                   uint32_t watering_duration_ms,
                                                    bool learning_valid)
 {
+    // ============================================================================
+    // PHASE 1: Store Data in Circular Buffer
+    // ============================================================================
     if (zone_id >= IRRIGATION_ZONE_COUNT) {
         ESP_LOGE(TAG, "Invalid zone_id %d for learning update", zone_id);
         return ESP_ERR_INVALID_ARG;
@@ -289,13 +441,17 @@ esp_err_t impluvium_process_zone_watering_data(uint8_t zone_id,
     irrigation_zone_t *zone = &irrigation_zones[zone_id];
     zone_learning_t *learning = &zone->learning;
 
+    // Calculate PPMP ratio for this cycle (pulses per 1% moisture increase)
+    float measured_ppmp_ratio = (measured_moisture_increase > 0.0f)
+                                    ? ((float)pulses_used / measured_moisture_increase)
+                                    : 0.0f;
+
     // Get current write position in circular buffer
     uint8_t index = learning->history_index;
 
-    // Store the learning data
-    learning->pulses_used_history[index] = pulses_used;
-    learning->moisture_increase_percent_history[index] = moisture_increase_percent;
-    learning->anomaly_flags[index] = !learning_valid; // Invert: true = anomaly (stored for future calculations)
+    // Store pre-computed PPMP ratio and anomaly flag
+    learning->ppmp_ratio_history[index] = measured_ppmp_ratio;
+    learning->anomaly_flags[index] = !learning_valid; // valid learning = NOT anomaly
 
     // Advance circular buffer index
     learning->history_index = (learning->history_index + 1) % LEARNING_HISTORY_SIZE;
@@ -305,61 +461,65 @@ esp_err_t impluvium_process_zone_watering_data(uint8_t zone_id,
         learning->history_entry_count++;
     }
 
-    // Calculate basic statistics for this cycle (pulses per 1% moisture)
-    float measured_ppmp_ratio = (moisture_increase_percent > 0) ? (pulses_used / moisture_increase_percent) : 0;
-
     ESP_LOGI(TAG,
              "Zone %d learning update: %lu pulses → %.2f%% increase (%.1f pulses/%%), %s",
              zone_id,
              pulses_used,
-             moisture_increase_percent,
+             measured_moisture_increase,
              measured_ppmp_ratio,
              learning_valid ? "valid" : "anomaly");
 
-    // Real-time learning updates (only for valid cycles)
-    if (learning_valid && measured_ppmp_ratio > 0.1f && measured_ppmp_ratio < 50.0f) { // Reasonable measured_ppmp_ratio range
-        // Update learned measured_ppmp_ratio with exponential moving average (10% new, 90% old)
-        learning->calculated_ppmp_ratio =
-            (learning->calculated_ppmp_ratio * 0.9f) + (measured_ppmp_ratio * 0.1f);
-
-        ESP_LOGD(TAG, "Zone %d: Real-time measured_ppmp_ratio update: %.1f pulses/%% (was %.1f)",
-                 zone_id, learning->calculated_ppmp_ratio, measured_ppmp_ratio);
-    }
-
+    // ============================================================================
+    // PHASE 3: Update Confidence & Pump Duty (Valid Cycles Only)
+    // ============================================================================
     // ### Confidence tracking calculations (only for valid predictions)
     if (learning_valid) {
-        learning->total_predictions++;
+        float prediction_quality = 0.0f;
 
-        // Check if prediction was reasonably accurate (within 20% of expected)
+        // Calculate prediction quality with smooth gradient scoring
         if (learning->calculated_ppmp_ratio > 0) {
-            float expected_increase = (pulses_used / learning->calculated_ppmp_ratio);
-            float accuracy = fabs(moisture_increase_percent - expected_increase) / expected_increase;
-            if (accuracy <= 0.20f) { // Within 20% tolerance
-                learning->successful_predictions++;
+            float expected_moisture_increase = pulses_used / learning->calculated_ppmp_ratio;
+            float relative_error = fabs(measured_moisture_increase - expected_moisture_increase) / expected_moisture_increase;
+
+            // Smooth gradient: 1.0 at 0% error, linearly decreasing to 0.0 at 30% error
+            if (relative_error <= 0.30f) {
+                prediction_quality = 1.0f - (relative_error / 0.30f);
             }
+            // Errors > 30% contribute 0.0 quality
         }
 
-        // Update confidence level based on success rate
-        if (learning->total_predictions > 0) {
-            learning->confidence_level = (float) learning->successful_predictions / learning->total_predictions;
+        // Update confidence using Exponential Moving Average
+        float ema_retain = 1.0f - CONFIDENCE_EMA_WEIGHT;
+        learning->confidence_level = (learning->confidence_level * ema_retain) + (prediction_quality * CONFIDENCE_EMA_WEIGHT);
+
+        // Confidence boost: When prediction is accurate but confidence is still low, boost to floor
+        // This accelerates convergence after PPMP is learned correctly
+        if (learning->history_entry_count >= LEARNING_MIN_CYCLES &&
+            prediction_quality >= 0.50f &&
+            learning->confidence_level < CONFIDENCE_BOOST_FLOOR) {
+            ESP_LOGI(TAG, "Zone %d: Accurate prediction with low confidence, boosting %.0f%% → %.0f%%",
+                     zone_id, learning->confidence_level * 100.0f, CONFIDENCE_BOOST_FLOOR * 100.0f);
+            learning->confidence_level = CONFIDENCE_BOOST_FLOOR;
         }
+
+        // Update legacy counters for telemetry/logging
+        learning->total_predictions++;
+        if (prediction_quality >= 0.33f) { // Equivalent to ≤20% error threshold
+            learning->successful_predictions++;
+        }
+
+        // Between-event pump duty optimization (only for valid cycles)
+        impluvium_update_pump_duty_from_gain_rate(zone_id,
+                                                   measured_moisture_increase,
+                                                   watering_duration_ms,
+                                                   irrigation_zones[zone_id].target_moisture_gain_rate);
     }
 
+    // ============================================================================
+    // PHASE 4: Log Learning Progress
+    // ============================================================================
     // Update learned parameters and log progress (only after sufficient learning cycles)
     if (learning->history_entry_count >= LEARNING_MIN_CYCLES) {
-        // Update pump duty cycle (only for valid cycles)
-        if (learning_valid) {
-            // Exponential moving average for pump duty cycle (10% new, 90% old)
-            learning->calculated_pump_duty_cycle =
-                (uint32_t)((learning->calculated_pump_duty_cycle * 0.9f) + (irrigation_system.pump_pwm_duty * 0.1f));
-
-            ESP_LOGI(TAG,
-                     "Zone %d: Updated learned pump duty cycle to %" PRIu32 ", confidence %.2f",
-                     zone_id,
-                     learning->calculated_pump_duty_cycle,
-                     learning->confidence_level);
-        }
-
         // Count valid entries for logging (cached calculation instead of loop each time)
         uint8_t valid_entries = 0;
         for (uint8_t i = 0; i < learning->history_entry_count; i++) {
@@ -415,6 +575,92 @@ esp_err_t impluvium_set_check_intervals(uint32_t optimal_min, uint32_t cool_min,
 }
 
 /**
+ * @brief Update soil redistribution factors from delayed moisture readings
+ *
+ * Called 5 minutes after a watering session completes. Powers on sensors, reads
+ * delayed moisture for each zone that was watered, and updates soil redistribution
+ * factors based on immediate vs delayed moisture readings.
+ *
+ * Batched operation - checks all watered zones in one sensor power-on cycle to
+ * minimize power consumption.
+ *
+ * Physics: Water initially concentrates at application depth, then redistributes
+ * upward/downward over time. The redistribution factor (RF = delayed/immediate)
+ * quantifies how much moisture movement occurs, allowing better target predictions.
+ *
+ * @return ESP_OK on success (cleanup always happens even if reads fail)
+ */
+esp_err_t impluvium_update_redistribution_from_delayed_readings(void)
+{
+    ESP_LOGI(TAG, "Starting delayed verification for %d zones", irrigation_system.verification_zone_count);
+
+    // Power on sensor bus for moisture readings
+    if (impluvium_request_power_buses(POWER_ONLY_SENSORS, "IMPLUVIUM_VERIFY") != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to power on sensors for verification - skipping");
+        goto cleanup;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(1000));  // Allow sensors to stabilize
+
+    // Check each zone that was watered
+    for (uint8_t i = 0; i < irrigation_system.verification_zone_count; i++) {
+        uint8_t zone_id = irrigation_system.verification_zones[i].zone_id;
+        float moisture_start = irrigation_system.verification_zones[i].moisture_at_start_percent;
+        float moisture_immediate = irrigation_system.verification_zones[i].moisture_immediate_percent;
+
+        // Read delayed moisture level
+        float delayed_moisture;
+        if (impluvium_read_moisture_sensor(zone_id, &delayed_moisture) != ESP_OK) {
+            ESP_LOGW(TAG, "Zone %d: Failed to read delayed moisture - skipping verification", zone_id);
+            continue;
+        }
+
+        // Calculate immediate and delayed increases
+        float immediate_increase = moisture_immediate - moisture_start;
+        float delayed_increase = delayed_moisture - moisture_start;
+
+        // Validate: delayed should be >= immediate, and immediate should be meaningful
+        if (delayed_increase > immediate_increase && immediate_increase > 0.5f) {
+            float measured_factor = delayed_increase / immediate_increase;
+
+            // Clamp to valid range
+            if (measured_factor < MIN_SOIL_REDISTRIBUTION_FACTOR) {
+                measured_factor = MIN_SOIL_REDISTRIBUTION_FACTOR;
+            }
+            if (measured_factor > MAX_SOIL_REDISTRIBUTION_FACTOR) {
+                measured_factor = MAX_SOIL_REDISTRIBUTION_FACTOR;
+            }
+
+            // Update redistribution factor using EMA (15% weight to new measurement)
+            zone_learning_t *learning = &irrigation_zones[zone_id].learning;
+            float old_factor = learning->soil_redistribution_factor;
+            learning->soil_redistribution_factor =
+                (learning->soil_redistribution_factor * (1.0f - SOIL_REDISTRIBUTION_EMA_WEIGHT)) +
+                (measured_factor * SOIL_REDISTRIBUTION_EMA_WEIGHT);
+
+            ESP_LOGI(TAG, "Zone %d RF updated: %.2f → %.2f (measured: %.2f, immediate: +%.1f%%, delayed: +%.1f%%)",
+                     zone_id, old_factor, learning->soil_redistribution_factor, measured_factor,
+                     immediate_increase, delayed_increase);
+        } else {
+            ESP_LOGW(TAG, "Zone %d: Invalid redistribution data - immediate: +%.1f%%, delayed: +%.1f%% (skipping)",
+                     zone_id, immediate_increase, delayed_increase);
+        }
+    }
+
+    // Power off sensor bus
+    impluvium_release_power_buses(POWER_ONLY_SENSORS, "IMPLUVIUM_VERIFY");
+
+cleanup:
+    // Clear verification state
+    irrigation_system.verification_pending = false;
+    irrigation_system.verification_zone_count = 0;
+    memset(irrigation_system.verification_zones, 0, sizeof(irrigation_system.verification_zones));
+
+    ESP_LOGI(TAG, "Delayed verification complete");
+    return ESP_OK;
+}
+
+/**
  * @brief Reset learning data for specific zone to defaults
  */
 esp_err_t impluvium_reset_zone_learning(uint8_t zone_id)
@@ -431,10 +677,8 @@ esp_err_t impluvium_reset_zone_learning(uint8_t zone_id)
     ESP_LOGI(TAG, "Resetting learning data for zone %d to defaults", zone_id);
 
     // Clear history arrays
-    memset(irrigation_zones[zone_id].learning.pulses_used_history, 0,
-           sizeof(irrigation_zones[zone_id].learning.pulses_used_history));
-    memset(irrigation_zones[zone_id].learning.moisture_increase_percent_history, 0,
-           sizeof(irrigation_zones[zone_id].learning.moisture_increase_percent_history));
+    memset(irrigation_zones[zone_id].learning.ppmp_ratio_history, 0,
+           sizeof(irrigation_zones[zone_id].learning.ppmp_ratio_history));
     memset(irrigation_zones[zone_id].learning.anomaly_flags, 0,
            sizeof(irrigation_zones[zone_id].learning.anomaly_flags));
 
@@ -445,9 +689,10 @@ esp_err_t impluvium_reset_zone_learning(uint8_t zone_id)
     irrigation_zones[zone_id].learning.total_predictions = 0;
 
     // Reset calculated values to defaults
-    irrigation_zones[zone_id].learning.calculated_ppmp_ratio = DEFAULT_PULSES_PER_PERCENT;
+    irrigation_zones[zone_id].learning.calculated_ppmp_ratio = DEFAULT_PULSES_PER_MOISTURE_PERCENT;
     irrigation_zones[zone_id].learning.calculated_pump_duty_cycle = PUMP_DEFAULT_DUTY;
-    irrigation_zones[zone_id].learning.target_moisture_gain_rate = TARGET_MOISTURE_GAIN_RATE;
+    irrigation_zones[zone_id].learning.soil_redistribution_factor = DEFAULT_SOIL_REDISTRIBUTION_FACTOR;
+    irrigation_zones[zone_id].learning.measured_moisture_gain_rate = 0.0f; // No measurement yet
     irrigation_zones[zone_id].learning.confidence_level = 0.0f;
     irrigation_zones[zone_id].learning.last_temperature_correction = 1.0f;
 

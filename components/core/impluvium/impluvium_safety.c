@@ -18,6 +18,28 @@
 static const char *TAG = "IMPLUVIUM_SAFETY";
 
 /**
+ * @brief Set anomaly flag with "first wins" semantics
+ *
+ * Only sets the anomaly if none is currently recorded. This ensures the first
+ * detected anomaly is preserved for diagnostics, even if multiple issues occur.
+ *
+ * @param type Anomaly type (ANOMALY_MOISTURE_SPIKE, ANOMALY_FLOW_ISSUE, ANOMALY_TEMPERATURE_EXTREME)
+ * @param value Context-dependent value for diagnostics:
+ *              - MOISTURE_SPIKE: actual gain rate (%/sec)
+ *              - FLOW_ISSUE: actual flow rate (L/h)
+ *              - TEMPERATURE_EXTREME: actual temperature (°C)
+ */
+void impluvium_set_anomaly(anomaly_type_t type, float value)
+{
+    if (irrigation_system.current_anomaly.type == ANOMALY_NONE) {
+        irrigation_system.current_anomaly.type = type;
+        irrigation_system.current_anomaly.anomaly_timestamp = time(NULL);
+        irrigation_system.current_anomaly.expected_vs_actual = value;
+        ESP_LOGW(TAG, "Anomaly recorded: type=%d, value=%.2f", type, value);
+    }
+}
+
+/**
  * @brief Perform one-time safety checks before watering
  *
  * Validates:
@@ -29,7 +51,7 @@ static const char *TAG = "IMPLUVIUM_SAFETY";
  */
 esp_err_t impluvium_pre_check(void)
 {
-    // Check temperature
+    // Fetch temperature
     float current_temperature = tempesta_get_temperature();
 
     if (current_temperature == WEATHER_INVALID_VALUE) {
@@ -113,7 +135,8 @@ void impluvium_calc_flow_rate(const char *task_tag,
 {
     int current_pulse_count;
     if (pcnt_unit_get_count(flow_pcnt_unit, &current_pulse_count) == ESP_OK) {
-        if (*last_flow_time > 0 && current_time - *last_flow_time >= FLOW_RATE_CALC_PERIOD_MS) {
+        if (*last_flow_time > 0 &&
+            current_time - *last_flow_time >= WATERING_MONITORING_INTERVAL_MS) {
             uint32_t pulse_diff = current_pulse_count - *last_pulse_count;
             uint32_t time_diff_ms = current_time - *last_flow_time;
 
@@ -134,42 +157,111 @@ void impluvium_calc_flow_rate(const char *task_tag,
 }
 
 /**
- * @brief Perform smart watering cutoffs based on real-time conditions
- * @return ESP_OK if cutoff triggered, ESP_FAIL to continue watering
+ * @brief Check moisture gain rate for anomalies during watering
+ *
+ * Calculates average moisture gain rate (total increase / total time) and detects:
+ * - Moisture spikes (>5.0 %/sec after 2s) - rain, sensor failure, manual watering
+ * - Low gain rate (<0.1 %/sec after 5s) - pump/flow/valve issues
+ *
+ * Anomalies do NOT stop watering, but mark data for learning exclusion.
+ * Gain rate is also stored for realtime telemetry monitoring.
+ *
+ * Note: Uses averaging method (vs instantaneous) for noise immunity - thresholds
+ * are tuned for 2-5s windows.
+ *
+ * @param task_tag Logging tag
+ * @param current_moisture Current moisture reading (%)
+ * @param time_since_start_ms Elapsed watering time (ms)
  */
-esp_err_t impluvium_watering_cutoffs_check(const char *task_tag, uint32_t time_since_start_ms)
+void impluvium_check_moisture_gain_rate(const char *task_tag, float current_moisture, uint32_t time_since_start_ms)
+{
+    if (irrigation_system.queue_index >= irrigation_system.watering_queue_size) {
+        irrigation_system.current_moisture_gain_rate = 0.0f;
+        return;
+    }
+
+    watering_queue_item_t *queue_item = &irrigation_system.watering_queue[irrigation_system.queue_index];
+    float moisture_increase = current_moisture - queue_item->moisture_at_start_percent;
+
+    // Calculate average rate after 1 second for meaningful value
+    if (time_since_start_ms > 1000) {
+        irrigation_system.current_moisture_gain_rate = moisture_increase / (time_since_start_ms / 1000.0f);
+
+        // Check for anomalous spike after 2 seconds (continue watering but mark for learning exclusion)
+        if (time_since_start_ms > 2000 &&
+            irrigation_system.current_moisture_gain_rate > MOISTURE_SPIKE_RATE_THRESHOLD_PER_SEC) {
+            ESP_LOGW(task_tag,
+                     "Zone %d moisture spike detected: %.2f%%/sec - continuing watering but marking as anomaly",
+                     irrigation_system.active_zone,
+                     irrigation_system.current_moisture_gain_rate);
+            impluvium_set_anomaly(ANOMALY_MOISTURE_SPIKE, irrigation_system.current_moisture_gain_rate);
+            // DO NOT stop watering - let it complete normally but exclude from learning
+        }
+
+        // Check for low gain rate after 5 seconds (possible pump/flow/valve issue)
+        if (time_since_start_ms > 5000 &&
+            irrigation_system.current_moisture_gain_rate < MOISTURE_LOW_GAIN_RATE_THRESHOLD_PER_SEC &&
+            irrigation_system.current_moisture_gain_rate >= 0.0f) {
+            ESP_LOGW(task_tag,
+                     "Zone %d low moisture gain rate: %.3f%%/sec - possible pump/flow/valve issue",
+                     irrigation_system.active_zone,
+                     irrigation_system.current_moisture_gain_rate);
+            impluvium_set_anomaly(ANOMALY_FLOW_ISSUE, irrigation_system.current_moisture_gain_rate);
+        }
+    } else {
+        irrigation_system.current_moisture_gain_rate = 0.0f;
+    }
+}
+
+/**
+ * @brief Check watering cutoff conditions
+ *
+ * Determines if watering should stop based on:
+ * - Manual watering timer
+ * - Maximum watering time safety limit
+ * - Target pulses reached
+ * - Safety margin moisture target reached
+ *
+ * Note: Moisture spike anomaly detection is handled in impluvium_update_moisture_gain_rate()
+ *
+ * @param task_tag Logging tag
+ * @param current_moisture Fresh moisture sensor reading (%)
+ * @param time_since_start_ms Elapsed watering time (ms)
+ * @return true if watering should stop, false to continue
+ */
+bool impluvium_should_stop_watering(const char *task_tag, float current_moisture, uint32_t time_since_start_ms)
 {
     if (irrigation_system.active_zone >= IRRIGATION_ZONE_COUNT ||
         irrigation_system.queue_index >= irrigation_system.watering_queue_size) {
-        return ESP_FAIL;
+        return false;
     }
 
-    irrigation_zone_t *active_zone = &irrigation_zones[irrigation_system.active_zone];
+    //irrigation_zone_t *active_zone = &irrigation_zones[irrigation_system.active_zone];
     watering_queue_item_t *queue_item = &irrigation_system.watering_queue[irrigation_system.queue_index];
 
     // **MANUAL WATERING MODE**: Use time-based cutoff only, skip moisture checks
     if (irrigation_system.manual_watering_active) {
         uint32_t current_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
 
-        // Check if manual watering duration has elapsed
+        // Check if manual watering duration has elapsed (vars set in impluvium.c)
         if (current_time >= irrigation_system.manual_water_end_time) {
             ESP_LOGI(task_tag,
                      "Manual watering time completed for zone %d (%d seconds)",
                      irrigation_system.active_zone,
                      irrigation_system.manual_water_duration_sec);
             xTaskNotify(xIrrigationTaskHandle, IRRIGATION_TASK_NOTIFY_WATERING_CUTOFF, eSetBits);
-            return ESP_OK;
+            return true;
         }
 
         // Continue manual watering (pressure safety checks still performed in periodic_safety_check)
-        return ESP_FAIL;
+        return false;
     }
 
     // Check maximum watering time hasn't been exceeded
     if (time_since_start_ms > MAX_WATERING_TIME_MS) {
         ESP_LOGW(TAG, "Zone %d max watering time reached - stopping", irrigation_system.active_zone);
         xTaskNotify(xIrrigationTaskHandle, IRRIGATION_TASK_NOTIFY_WATERING_CUTOFF, eSetBits);
-        return ESP_OK;
+        return true;
     }
 
     // Check if target pulses reached
@@ -184,67 +276,73 @@ esp_err_t impluvium_watering_cutoffs_check(const char *task_tag, uint32_t time_s
                      pulses_used,
                      queue_item->target_pulses);
             xTaskNotify(xIrrigationTaskHandle, IRRIGATION_TASK_NOTIFY_WATERING_CUTOFF, eSetBits);
-            return ESP_OK;
+            return true;
         }
     }
 
-    // Check moisture level and safety margin
-    float measured_moisture_percent;
-    if (impluvium_read_moisture_sensor(irrigation_system.active_zone, &measured_moisture_percent) == ESP_OK) {
-        irrigation_zones[irrigation_system.active_zone].last_moisture_percent =
-            measured_moisture_percent; // Store last reading
-        // Calculate, store, and check the current moisture gain rate
-        float moisture_increase = measured_moisture_percent - queue_item->moisture_at_start_percent;
-
-        if (time_since_start_ms > 1000) { // Calculate after 1 second to get a meaningful rate
-            irrigation_system.current_moisture_gain_rate = (moisture_increase / (time_since_start_ms / 1000.0f));
-
-            // Check for anomalous spike after 2 seconds
-            if (time_since_start_ms > 2000 &&
-                irrigation_system.current_moisture_gain_rate > MOISTURE_SPIKE_RATE_THRESHOLD_PER_SEC) {
-                ESP_LOGW(task_tag,
-                         "Zone %d moisture spike detected: %.2f%%/sec increase - possible rain/manual watering",
-                         irrigation_system.active_zone,
-                         irrigation_system.current_moisture_gain_rate);
-                irrigation_system.current_anomaly.type = ANOMALY_MOISTURE_SPIKE;
-                irrigation_system.current_anomaly.anomaly_timestamp = time(NULL);
-                irrigation_system.current_anomaly.expected_vs_actual = irrigation_system.current_moisture_gain_rate;
-                xTaskNotify(xIrrigationTaskHandle, IRRIGATION_TASK_NOTIFY_WATERING_CUTOFF, eSetBits);
-                return ESP_OK; // Stop watering
-            }
-        } else {
-            irrigation_system.current_moisture_gain_rate = 0.0f;
-        }
-
-        // Check if moisture reached target - with safety margin (target - 2%)
-        float safety_target = active_zone->target_moisture_percent - 2.0f;
-        if (measured_moisture_percent >= safety_target) {
-            ESP_LOGI(task_tag,
-                     "Zone %d safety margin reached: %.1f%% >= %.1f%%",
-                     irrigation_system.active_zone,
-                     measured_moisture_percent,
-                     safety_target);
-            xTaskNotify(xIrrigationTaskHandle, IRRIGATION_TASK_NOTIFY_WATERING_CUTOFF, eSetBits);
-            return ESP_OK;
-        }
-
-        // Store for anomaly detection
-        irrigation_system.last_moisture_reading_percent = measured_moisture_percent;
+    // Check if moisture reached dynamic cutoff (accounts for soil redistribution per zone)
+    if (current_moisture >= queue_item->dynamic_moisture_cutoff) {
+        ESP_LOGI(task_tag,
+                 "Zone %d dynamic cutoff reached: %.1f%% >= %.1f%%",
+                 irrigation_system.active_zone,
+                 current_moisture,
+                 queue_item->dynamic_moisture_cutoff);
+        xTaskNotify(xIrrigationTaskHandle, IRRIGATION_TASK_NOTIFY_WATERING_CUTOFF, eSetBits);
+        return true;
     }
 
-    return ESP_FAIL; // Continue watering
+    return false; // Continue watering
 }
 
 /**
- * @brief Perform comprehensive safety monitoring while watering
- * @return true if safe to continue, false if emergency stop was triggered
+ * @brief Handle safety failure - increment counter, log, and trigger emergency if needed
+ *
+ * Centralizes error handling logic for all safety checks (pressure, level, flow, moisture).
+ * Accumulates errors across entire watering event (reset only when watering completes).
+ *
+ * @param error_count Pointer to error counter (accumulates across watering event)
+ * @param failure_reason Failure description (if NULL, no failure this cycle)
+ * @param task_tag Logging tag
+ * @return true if safe to continue, false if emergency stop triggered
  */
-bool impluvium_periodic_safety_check(uint32_t *error_count, uint32_t time_since_start_ms)
+bool impluvium_handle_safety_failure(uint32_t *error_count, const char *failure_reason, const char *task_tag)
 {
-    // Allow 4 consecutive errors before emergency stop (immediate if current exceeds limits set in FLUCTUS)
-    const uint32_t MAX_ERROR_COUNT = 4;
-    const char *failure_reason = NULL;
+    if (failure_reason == NULL) {
+        return true;  // No failure this cycle
+    }
 
+    const uint32_t MAX_ERROR_COUNT = MAX_FAILURE_ERROR_COUNT;
+    (*error_count)++;
+
+    ESP_LOGW(task_tag,
+             "Safety failure %" PRIu32 "/%" PRIu32 ": %s",
+             *error_count,
+             MAX_ERROR_COUNT,
+             failure_reason);
+
+    if (*error_count >= MAX_ERROR_COUNT) {
+        ESP_LOGE(task_tag, "Maximum safety failures reached: %s", failure_reason);
+        impluvium_emergency_stop(failure_reason);
+        return false;  // Emergency triggered
+    } else if (*error_count == 2) {
+        ESP_LOGW(task_tag, "Reducing pump speed due to safety issue");
+        impluvium_set_pump_speed(PUMP_MIN_DUTY);
+    }
+
+    return true;  // Safe to continue (for now)
+}
+
+/**
+ * @brief Check critical safety sensors (pressure, level, flow)
+ *
+ * Reads sensors and sets failure_reason if any check fails.
+ * Does NOT reset failure_reason or handle errors - caller must do that.
+ *
+ * @param failure_reason Pointer to failure reason string (set if failure detected)
+ * @param time_since_start_ms Elapsed watering time
+ */
+void impluvium_periodic_safety_check(const char **failure_reason, uint32_t time_since_start_ms)
+{
     // Read outlet pressure and level sensors
 #ifdef CONFIG_IMPLUVIUM_DRY_TEST_MODE
     // Dry test mode: Use fixed safe values instead of reading sensors
@@ -255,23 +353,21 @@ bool impluvium_periodic_safety_check(uint32_t *error_count, uint32_t time_since_
     esp_err_t ret = impluvium_read_pressure(&irrigation_system.outlet_pressure);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Safety check: Failed to read outlet pressure sensor: %s", esp_err_to_name(ret));
-        failure_reason = "Outlet pressure sensor read failed";
+        *failure_reason = "Outlet pressure sensor read failed";
     }
     ret = impluvium_read_water_level(&irrigation_system.water_level);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Safety check: Failed to read water level: %s", esp_err_to_name(ret));
-        failure_reason = "Water level sensor read failed";
+        *failure_reason = "Water level sensor read failed";
     }
 #endif
 
     // Overcurrent monitoring delegated to Fluctus (power management) system.
 
     // Check safety parameters
-    if (failure_reason == NULL) {
+    if (*failure_reason == NULL) {
 #ifdef CONFIG_IMPLUVIUM_DRY_TEST_MODE
-        // Dry test mode: Bypass pressure and water level checks (use fixed safe values)
-        // Only check flow rate if we want to allow it to fail (for testing), but user wants to bypass it
-        // So we skip flow rate check entirely in dry test mode
+        // Dry test mode: Bypass pressure and water level checks
         ESP_LOGD(TAG, "DRY_TEST_MODE: Bypassing pressure, water level, and flow rate safety checks");
 #else
         if (irrigation_system.outlet_pressure > MAX_PRESSURE_BAR) {
@@ -279,43 +375,22 @@ bool impluvium_periodic_safety_check(uint32_t *error_count, uint32_t time_since_
                      "Outlet pressure too high: %.2f > %.2f bar",
                      irrigation_system.outlet_pressure,
                      MAX_PRESSURE_BAR);
-            failure_reason = "Outlet pressure too high";
+            *failure_reason = "Outlet pressure too high";
         }
         if (time_since_start_ms > 1000 && irrigation_system.current_flow_rate < MIN_FLOW_RATE_LH) {
             ESP_LOGW(TAG, "Flow rate too low: %.1f < %.1f L/h", irrigation_system.current_flow_rate, MIN_FLOW_RATE_LH);
-            failure_reason = "Flow rate too low.";
+            *failure_reason = "Flow rate too low.";
+            impluvium_set_anomaly(ANOMALY_FLOW_ISSUE, irrigation_system.current_flow_rate);
         }
         if (irrigation_system.water_level < MIN_WATER_LEVEL_PERCENT - 3.0f) { // Stop watering below 2%
             ESP_LOGW(TAG, "Water level too low, currently at: %.1f %%", irrigation_system.water_level);
-            failure_reason = "Water level critically low";
+            *failure_reason = "Water level critically low";
         }
 #endif
     }
 
-    // Handle safety failures
-    if (failure_reason != NULL) {
-        // Increment error count
-        (*error_count)++;
-
-        ESP_LOGW(TAG,
-                 "Safety failure %" PRIu32 "/%" PRIu32 ": %s (Outlet pressure: %.2f, Flow: %.1f)",
-                 *error_count,
-                 (uint32_t) MAX_ERROR_COUNT,
-                 failure_reason,
-                 irrigation_system.outlet_pressure,
-                 irrigation_system.current_flow_rate);
-
-        if (*error_count >= MAX_ERROR_COUNT) {
-            ESP_LOGE(TAG, "Maximum safety failures reached for: %s", failure_reason);
-            impluvium_emergency_stop(failure_reason);
-            return false; // Emergency triggered
-        } else if (*error_count == 1) {
-            ESP_LOGW(TAG, "Reducing pump speed due to safety issue");
-            impluvium_set_pump_speed(PUMP_MIN_DUTY);
-        }
-    }
-
-    return true; // Safe to continue
+    // failure_reason is now set (or NULL if all checks passed)
+    // Caller must handle the failure using impluvium_handle_safety_failure()
 }
 
 // ########################## Irrigation System ##########################
@@ -710,6 +785,7 @@ void impluvium_monitoring_task(void *pvParameters)
     // Monitoring state variables
     static bool continuous_monitoring = false;
     static uint32_t error_count = 0;
+    const char *failure_reason = NULL;  // Shared between periodic_safety_check and moisture sensor check
     static uint32_t last_pulse_count = 0;
     static uint32_t last_flow_measurement_time = 0;
     uint32_t notification_value = 0;
@@ -720,7 +796,7 @@ void impluvium_monitoring_task(void *pvParameters)
         xTaskNotifyWait(0x00,
                         ULONG_MAX,
                         &notification_value,
-                        continuous_monitoring ? pdMS_TO_TICKS(MONITORING_INTERVAL_MS) : portMAX_DELAY);
+                        continuous_monitoring ? pdMS_TO_TICKS(WATERING_MONITORING_INTERVAL_MS) : portMAX_DELAY);
                         
         // Monitor stack usage (debug - watermark shows minimum free stack ever reached)
         UBaseType_t stack_high_water = uxTaskGetStackHighWaterMark(NULL);
@@ -731,6 +807,7 @@ void impluvium_monitoring_task(void *pvParameters)
             ESP_LOGI(task_tag, "Starting continuous monitoring for watering");
             continuous_monitoring = true;
             error_count = 0;
+            failure_reason = NULL;
             last_flow_measurement_time = 0; // Reset flow measurement
             pcnt_unit_get_count(flow_pcnt_unit, (int *) &last_pulse_count);
         }
@@ -762,23 +839,41 @@ void impluvium_monitoring_task(void *pvParameters)
                 uint32_t current_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
                 uint32_t time_since_start_ms = current_time - irrigation_system.watering_start_time;
 
+                // Reset failure reason at start of monitoring cycle
+                failure_reason = NULL;
+
                 // Update flow rate
                 impluvium_calc_flow_rate(task_tag, &last_pulse_count, &last_flow_measurement_time, current_time);
 
-                // Safety monitoring
-                if (!impluvium_periodic_safety_check(&error_count, time_since_start_ms)) {
-                    // Emergency condition detected. The stop function notifies the main task.
-                    continuous_monitoring = false;
+                // Check critical safety sensors (pressure, level, flow) - sets failure_reason if any fail
+                impluvium_periodic_safety_check(&failure_reason, time_since_start_ms);
+
+                // Read moisture sensor once for all subsequent operations
+                float current_moisture;
+                if (impluvium_read_moisture_sensor(irrigation_system.active_zone, &current_moisture) == ESP_OK) {
+                    // Successful read - store and use fresh data
+                    irrigation_zones[irrigation_system.active_zone].last_moisture_percent = current_moisture;
+
+                    // Check moisture gain rate for anomalies (spike, low flow)
+                    impluvium_check_moisture_gain_rate(task_tag, current_moisture, time_since_start_ms);
+                } else {
+                    // Moisture sensor read failed - use last known value for cutoff checks
+                    current_moisture = irrigation_zones[irrigation_system.active_zone].last_moisture_percent;
+
+                    // Set failure reason (don't override critical sensor failure)
+                    if (failure_reason == NULL) {
+                        failure_reason = "Moisture sensor read failed during watering";
+                        ESP_LOGW(task_tag, "Moisture sensor read failed, using last known value: %.1f%%", current_moisture);
+                    }
                 }
 
-                // Real-time moisture monitoring and smart cutoffs
-                impluvium_watering_cutoffs_check(task_tag, time_since_start_ms);
+                // Always check cutoff conditions (flow/time checks work even if moisture is stale)
+                impluvium_should_stop_watering(task_tag, current_moisture, time_since_start_ms);
 
-                // Use the gain rate calculated in the check function for adaptive control
-                uint8_t zone_id = irrigation_system.active_zone;
-                if (zone_id < IRRIGATION_ZONE_COUNT) {
-                    impluvium_pump_adaptive_control(irrigation_system.current_moisture_gain_rate,
-                                                    irrigation_zones[zone_id].learning.target_moisture_gain_rate);
+                // Handle any safety failure that occurred this cycle (pressure/level/flow/moisture)
+                if (!impluvium_handle_safety_failure(&error_count, failure_reason, task_tag)) {
+                    // Emergency stop triggered - stop monitoring
+                    continuous_monitoring = false;
                 }
 
                 // Release mutex before calling telemetry (avoid deadlock)

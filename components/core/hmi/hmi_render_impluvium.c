@@ -539,7 +539,7 @@ static void hmi_render_impluvium_learning_1_page(void)
     y += 10;
 
     // Pump duty
-    snprintf(buf, sizeof(buf), "Pump duty: %lu", data.zones[0].calculated_pump_duty);
+    snprintf(buf, sizeof(buf), "Pump duty: %lu", data.zones[0].calculated_pump_duty_cycle);
     hmi_fb_draw_string(2, y, buf, false);
     y += 10;
 
@@ -577,7 +577,7 @@ static void hmi_render_impluvium_learning_2_page(void)
     hmi_fb_draw_string(2, y, buf, false);
     y += 10;
 
-    snprintf(buf, sizeof(buf), "Pump duty: %lu", data.zones[1].calculated_pump_duty);
+    snprintf(buf, sizeof(buf), "Pump duty: %lu", data.zones[1].calculated_pump_duty_cycle);
     hmi_fb_draw_string(2, y, buf, false);
     y += 10;
 
@@ -613,7 +613,7 @@ static void hmi_render_impluvium_learning_3_page(void)
     hmi_fb_draw_string(2, y, buf, false);
     y += 10;
 
-    snprintf(buf, sizeof(buf), "Pump duty: %lu", data.zones[2].calculated_pump_duty);
+    snprintf(buf, sizeof(buf), "Pump duty: %lu", data.zones[2].calculated_pump_duty_cycle);
     hmi_fb_draw_string(2, y, buf, false);
     y += 10;
 
@@ -649,7 +649,7 @@ static void hmi_render_impluvium_learning_4_page(void)
     hmi_fb_draw_string(2, y, buf, false);
     y += 10;
 
-    snprintf(buf, sizeof(buf), "Pump duty: %lu", data.zones[3].calculated_pump_duty);
+    snprintf(buf, sizeof(buf), "Pump duty: %lu", data.zones[3].calculated_pump_duty_cycle);
     hmi_fb_draw_string(2, y, buf, false);
     y += 10;
 
@@ -685,7 +685,7 @@ static void hmi_render_impluvium_learning_5_page(void)
     hmi_fb_draw_string(2, y, buf, false);
     y += 10;
 
-    snprintf(buf, sizeof(buf), "Pump duty: %lu", data.zones[4].calculated_pump_duty);
+    snprintf(buf, sizeof(buf), "Pump duty: %lu", data.zones[4].calculated_pump_duty_cycle);
     hmi_fb_draw_string(2, y, buf, false);
     y += 10;
 
@@ -743,7 +743,7 @@ static void hmi_render_impluvium_monitor_page(void)
     y += 10;
 
     // Pump
-    snprintf(buf, sizeof(buf), "Pump%%: %lu%%",
+    snprintf(buf, sizeof(buf), "Pump%%: %" PRIu16 " %%",
              (realtime.pump_pwm_duty * 100) / 1023);
     hmi_fb_draw_string(2, y, buf, false);
 
@@ -870,7 +870,7 @@ static void hmi_render_impluvium_zone_config_page(void)
  */
 static void hmi_render_impluvium_zone_edit_page(void)
 {
-    const uint8_t TOTAL_ITEMS = 7;
+    const uint8_t TOTAL_ITEMS = 8;
 
     // Title
     char title[32];
@@ -893,7 +893,7 @@ static void hmi_render_impluvium_zone_edit_page(void)
     char buf[32];
     for (uint8_t i = first_visible; i < last_visible; i++) {
         bool selected = (i == hmi_status.selected_item);
-        bool is_editable = (i == 2 || i == 3);  // Target and Deadband are editable
+        bool is_editable = (i == 2 || i == 3 || i == 4);  // Target, Deadband, and Gain Rate are editable
 
         // Cursor logic: always blink on editable fields when selected
         if (selected && is_editable) {
@@ -937,13 +937,24 @@ static void hmi_render_impluvium_zone_edit_page(void)
                     }
                 }
                 break;
-            case 4:  // Reset Learning
+            case 4:  // Moisture Gain Rate
+                {
+                    bool editing_this = (zone_editing && i == hmi_status.selected_item);
+                    snprintf(buf, sizeof(buf), "M.Gain: %.1f%%/s", editing_zone_moisture_gain_rate);
+                    hmi_fb_draw_string(8, y, buf, selected);
+                    // Draw blinking "*" separately (not inverted)
+                    if (editing_this && hmi_status.blink_state) {
+                        hmi_fb_draw_string(104, y, "*", false);
+                    }
+                }
+                break;
+            case 5:  // Reset Learning
                 hmi_fb_draw_string(8, y, "Reset Learning", selected);
                 break;
-            case 5:  // Manual Water
+            case 6:  // Manual Water
                 hmi_fb_draw_string(8, y, "Manual Water", selected);
                 break;
-            case 6:  // Save
+            case 7:  // Save
                 hmi_fb_draw_string(8, y, "< Save", selected);
                 break;
         }

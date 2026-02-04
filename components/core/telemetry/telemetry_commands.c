@@ -403,3 +403,227 @@ esp_err_t telemetry_handle_interval_command(const char *topic, const uint8_t *da
 
     return ret;
 }
+
+/**
+ * @brief Handle zone configuration command from MQTT
+ *
+ * Expected MessagePack format:
+ * {
+ *   "zone_id": <uint8>,                        // 0-4
+ *   "enabled": <bool>,
+ *   "target_moisture": <float>,                // 20.0-80.0 %
+ *   "deadband": <float>,                       // 1.0-20.0 %
+ *   "target_moisture_gain_rate": <float>       // 0.1-3.0 %/sec
+ * }
+ *
+ * @param[in] data Raw MessagePack binary data
+ * @param[in] data_len Length of data in bytes
+ * @return ESP_OK on success, ESP_FAIL on parse/validation error
+ */
+esp_err_t telemetry_handle_zone_config_command(const uint8_t *data, size_t data_len)
+{
+    esp_err_t ret = ESP_OK;
+
+    // Parse MessagePack
+    msgpack_unpacked unpacked;
+    msgpack_unpacked_init(&unpacked);
+
+    size_t offset = 0;
+    msgpack_unpack_return unpack_ret = msgpack_unpack_next(&unpacked, (const char*)data, data_len, &offset);
+
+    if (unpack_ret != MSGPACK_UNPACK_SUCCESS) {
+        ESP_LOGE(TAG, "Failed to unpack zone config MessagePack payload (ret=%d)", unpack_ret);
+        msgpack_unpacked_destroy(&unpacked);
+        return ESP_FAIL;
+    }
+
+    msgpack_object root = unpacked.data;
+
+    if (root.type != MSGPACK_OBJECT_MAP) {
+        ESP_LOGE(TAG, "Expected map, got type %d", root.type);
+        msgpack_unpacked_destroy(&unpacked);
+        return ESP_FAIL;
+    }
+
+    // Extract fields
+    uint8_t zone_id = 0;
+    bool enabled = false;
+    float target_moisture = 0.0f;
+    float deadband = 0.0f;
+    float target_moisture_gain_rate = 1.0f;
+
+    bool zone_id_found = false;
+    bool enabled_found = false;
+    bool target_found = false;
+    bool deadband_found = false;
+    bool gain_rate_found = false;
+
+    msgpack_object_kv *kv = root.via.map.ptr;
+    for (uint32_t i = 0; i < root.via.map.size; i++) {
+        if (kv[i].key.type != MSGPACK_OBJECT_STR) continue;
+
+        const char *key = kv[i].key.via.str.ptr;
+        size_t key_len = kv[i].key.via.str.size;
+
+        if (strncmp(key, "zone_id", key_len) == 0 && kv[i].val.type == MSGPACK_OBJECT_POSITIVE_INTEGER) {
+            zone_id = (uint8_t)kv[i].val.via.u64;
+            zone_id_found = true;
+        }
+        else if (strncmp(key, "enabled", key_len) == 0 && kv[i].val.type == MSGPACK_OBJECT_BOOLEAN) {
+            enabled = kv[i].val.via.boolean;
+            enabled_found = true;
+        }
+        else if (strncmp(key, "target_moisture", key_len) == 0) {
+            if (kv[i].val.type == MSGPACK_OBJECT_FLOAT32 || kv[i].val.type == MSGPACK_OBJECT_FLOAT64) {
+                target_moisture = (float)kv[i].val.via.f64;
+                target_found = true;
+            }
+            else if (kv[i].val.type == MSGPACK_OBJECT_POSITIVE_INTEGER) {
+                target_moisture = (float)kv[i].val.via.u64;
+                target_found = true;
+            }
+        }
+        else if (strncmp(key, "deadband", key_len) == 0) {
+            if (kv[i].val.type == MSGPACK_OBJECT_FLOAT32 || kv[i].val.type == MSGPACK_OBJECT_FLOAT64) {
+                deadband = (float)kv[i].val.via.f64;
+                deadband_found = true;
+            }
+            else if (kv[i].val.type == MSGPACK_OBJECT_POSITIVE_INTEGER) {
+                deadband = (float)kv[i].val.via.u64;
+                deadband_found = true;
+            }
+        }
+        else if (strncmp(key, "target_moisture_gain_rate", key_len) == 0) {
+            if (kv[i].val.type == MSGPACK_OBJECT_FLOAT32 || kv[i].val.type == MSGPACK_OBJECT_FLOAT64) {
+                target_moisture_gain_rate = (float)kv[i].val.via.f64;
+                gain_rate_found = true;
+            }
+            else if (kv[i].val.type == MSGPACK_OBJECT_POSITIVE_INTEGER) {
+                target_moisture_gain_rate = (float)kv[i].val.via.u64;
+                gain_rate_found = true;
+            }
+        }
+    }
+
+    msgpack_unpacked_destroy(&unpacked);
+
+    // Validate required fields
+    if (!zone_id_found || !enabled_found || !target_found || !deadband_found || !gain_rate_found) {
+        ESP_LOGE(TAG, "Missing required fields (zone_id=%d, enabled=%d, target=%d, deadband=%d, gain_rate=%d)",
+                 zone_id_found, enabled_found, target_found, deadband_found, gain_rate_found);
+        ret = ESP_FAIL;
+    }
+
+    // Validate ranges
+    if (zone_id >= IRRIGATION_ZONE_COUNT) {
+        ESP_LOGE(TAG, "Invalid zone_id %d (must be 0-%d)", zone_id, IRRIGATION_ZONE_COUNT - 1);
+        ret = ESP_FAIL;
+    }
+
+    if (target_moisture < 20.0f || target_moisture > 80.0f) {
+        ESP_LOGE(TAG, "Invalid target_moisture %.1f%% (must be 20-80)", target_moisture);
+        ret = ESP_FAIL;
+    }
+
+    if (deadband < 1.0f || deadband > 20.0f) {
+        ESP_LOGE(TAG, "Invalid deadband %.1f%% (must be 1-20)", deadband);
+        ret = ESP_FAIL;
+    }
+
+    if (target_moisture_gain_rate < 0.1f || target_moisture_gain_rate > 3.0f) {
+        ESP_LOGE(TAG, "Invalid target_moisture_gain_rate %.2f%%/s (must be 0.1-3.0)", target_moisture_gain_rate);
+        ret = ESP_FAIL;
+    }
+
+    // Apply configuration if validation passed
+    if (ret == ESP_OK) {
+        ret = impluvium_update_zone_config(zone_id, target_moisture, deadband, target_moisture_gain_rate, enabled);
+
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, "Zone %d config updated: enabled=%d, target=%.1f%%, deadband=%.1f%%, gain_rate=%.2f%%/s",
+                     zone_id, enabled, target_moisture, deadband, target_moisture_gain_rate);
+
+            // Force telemetry cache update
+            telemetry_fetch_snapshot(TELEMETRY_SRC_IMPLUVIUM);
+        } else {
+            ESP_LOGE(TAG, "Failed to apply zone %d config", zone_id);
+        }
+    }
+
+    // Publish ACK
+    extern esp_mqtt_client_handle_t mqtt_client;
+    if (!mqtt_client) {
+        ESP_LOGW(TAG, "MQTT client not initialized, cannot publish zone ACK");
+        return ret;
+    }
+
+    // Build ACK message
+    msgpack_sbuffer sbuf;
+    msgpack_sbuffer_init(&sbuf);
+
+    msgpack_packer pk;
+    msgpack_packer_init(&pk, &sbuf, msgpack_sbuffer_write);
+
+    // Root map with 3 fields: status, zone_id, config
+    msgpack_pack_map(&pk, 3);
+
+    // Field 1: status
+    msgpack_pack_str(&pk, 6);
+    msgpack_pack_str_body(&pk, "status", 6);
+    const char *status = (ret == ESP_OK) ? "ok" : "error";
+    msgpack_pack_str(&pk, strlen(status));
+    msgpack_pack_str_body(&pk, status, strlen(status));
+
+    // Field 2: zone_id
+    msgpack_pack_str(&pk, 7);
+    msgpack_pack_str_body(&pk, "zone_id", 7);
+    msgpack_pack_uint8(&pk, zone_id);
+
+    // Field 3: config (nested map)
+    msgpack_pack_str(&pk, 6);
+    msgpack_pack_str_body(&pk, "config", 6);
+    msgpack_pack_map(&pk, 5);  // 5 config fields
+
+    // config.enabled
+    msgpack_pack_str(&pk, 7);
+    msgpack_pack_str_body(&pk, "enabled", 7);
+    if (enabled) {
+        msgpack_pack_true(&pk);
+    } else {
+        msgpack_pack_false(&pk);
+    }
+
+    // config.target_moisture
+    msgpack_pack_str(&pk, 15);
+    msgpack_pack_str_body(&pk, "target_moisture", 15);
+    msgpack_pack_float(&pk, target_moisture);
+
+    // config.deadband
+    msgpack_pack_str(&pk, 8);
+    msgpack_pack_str_body(&pk, "deadband", 8);
+    msgpack_pack_float(&pk, deadband);
+
+    // config.target_moisture_gain_rate
+    msgpack_pack_str(&pk, 25);
+    msgpack_pack_str_body(&pk, "target_moisture_gain_rate", 25);
+    msgpack_pack_float(&pk, target_moisture_gain_rate);
+
+    // config.zone_id (redundant, but useful for clients)
+    msgpack_pack_str(&pk, 7);
+    msgpack_pack_str_body(&pk, "zone_id", 7);
+    msgpack_pack_uint8(&pk, zone_id);
+
+    // Publish ACK (QoS 0)
+    int msg_id = esp_mqtt_client_publish(mqtt_client, TELEMETRY_MQTT_TOPIC_ZONE_ACK,
+                                         sbuf.data, sbuf.size, 0, 0);
+
+    if (msg_id >= 0) {
+        ESP_LOGI(TAG, "Published zone ACK: status=%s, zone_id=%d", status, zone_id);
+    } else {
+        ESP_LOGW(TAG, "Failed to publish zone ACK (msg_id=%d)", msg_id);
+    }
+
+    msgpack_sbuffer_destroy(&sbuf);
+
+    return ret;
+}

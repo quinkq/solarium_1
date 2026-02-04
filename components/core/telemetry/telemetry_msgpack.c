@@ -440,8 +440,8 @@ esp_err_t telemetry_msgpack_encode_impluvium_system(const impluvium_snapshot_t *
     msgpack_packer pk;
     msgpack_packer_init(&pk, &sbuf, msgpack_sbuffer_write);
 
-    // System state (5) + water (1) + stats (5) + emergency (5) + anomaly (2) + ts (1) = 19 fields
-    msgpack_pack_map(&pk, 19);
+    // System state (5) + water (1) + stats (5) + emergency (5) + anomaly (3) + ts (1) = 20 fields
+    msgpack_pack_map(&pk, 20);
 
     // Timestamp
     msgpack_pack_str(&pk, 2); msgpack_pack_str_body(&pk, "ts", 2);
@@ -504,12 +504,15 @@ esp_err_t telemetry_msgpack_encode_impluvium_system(const impluvium_snapshot_t *
         msgpack_pack_nil(&pk);
     }
 
-    // Anomaly tracking (2)
+    // Anomaly tracking (3)
     msgpack_pack_str(&pk, 4); msgpack_pack_str_body(&pk, "anom", 4);
     msgpack_pack_uint8(&pk, data->current_anomaly_type);
 
     msgpack_pack_str(&pk, 3); msgpack_pack_str_body(&pk, "ats", 3);
     msgpack_pack_uint64(&pk, data->anomaly_timestamp);
+
+    msgpack_pack_str(&pk, 4); msgpack_pack_str_body(&pk, "aval", 4);
+    msgpack_pack_float(&pk, data->anomaly_value);
 
     if (sbuf.size > max_len) {
         msgpack_sbuffer_destroy(&sbuf);
@@ -549,8 +552,8 @@ esp_err_t telemetry_msgpack_encode_impluvium_zone(const impluvium_snapshot_t *da
     msgpack_packer pk;
     msgpack_packer_init(&pk, &sbuf, msgpack_sbuffer_write);
 
-    // Zone data: zid (1) + config (5) + stats (4) + learning (8) + ts (1) = 19 fields
-    msgpack_pack_map(&pk, 19);
+    // Zone data: zid (1) + config (5) + stats (4) + learning (10) + ts (1) = 21 fields
+    msgpack_pack_map(&pk, 21);
 
     // Timestamp
     msgpack_pack_str(&pk, 2); msgpack_pack_str_body(&pk, "ts", 2);
@@ -589,15 +592,21 @@ esp_err_t telemetry_msgpack_encode_impluvium_zone(const impluvium_snapshot_t *da
     msgpack_pack_str(&pk, 4); msgpack_pack_str_body(&pk, "eday", 4);
     msgpack_pack_uint8(&pk, data->zones[zone_id].events_day);
 
-    // Learning algorithm (8)
+    // Learning algorithm (10)
     msgpack_pack_str(&pk, 4); msgpack_pack_str_body(&pk, "ppmp", 4);
     msgpack_pack_float(&pk, data->zones[zone_id].calculated_ppmp_ratio);
 
     msgpack_pack_str(&pk, 3); msgpack_pack_str_body(&pk, "pdu", 3);
-    msgpack_pack_uint32(&pk, data->zones[zone_id].calculated_pump_duty);
+    msgpack_pack_uint32(&pk, data->zones[zone_id].calculated_pump_duty_cycle);
+
+    msgpack_pack_str(&pk, 2); msgpack_pack_str_body(&pk, "rf", 2);
+    msgpack_pack_float(&pk, data->zones[zone_id].soil_redistribution_factor);
+
+    msgpack_pack_str(&pk, 3); msgpack_pack_str_body(&pk, "tgr", 3);
+    msgpack_pack_float(&pk, data->zones[zone_id].target_moisture_gain_rate);
 
     msgpack_pack_str(&pk, 3); msgpack_pack_str_body(&pk, "mgr", 3);
-    msgpack_pack_float(&pk, data->zones[zone_id].target_moisture_gain_rate);
+    msgpack_pack_float(&pk, data->zones[zone_id].measured_moisture_gain_rate);
 
     msgpack_pack_str(&pk, 4); msgpack_pack_str_body(&pk, "conf", 4);
     msgpack_pack_float(&pk, data->zones[zone_id].confidence_level);

@@ -51,7 +51,7 @@ esp_err_t impluvium_save_zone_config(void)
     irrigation_config_file_t config_file = {0};
 
     config_file.magic = 0x494D5043;  // "IMPC"
-    config_file.version = 1;
+    config_file.version = 2;
     config_file.last_saved = time(NULL);
 
     // Copy zone configuration from RAM
@@ -64,7 +64,7 @@ esp_err_t impluvium_save_zone_config(void)
         config_file.zones[i].enabled = irrigation_zones[i].watering_enabled;
         config_file.zones[i].target_moisture_percent = irrigation_zones[i].target_moisture_percent;
         config_file.zones[i].moisture_deadband_percent = irrigation_zones[i].moisture_deadband_percent;
-        config_file.zones[i].padding = 0;
+        config_file.zones[i].target_moisture_gain_rate = irrigation_zones[i].target_moisture_gain_rate;
     }
 
     xSemaphoreGive(xIrrigationMutex);
@@ -137,8 +137,8 @@ esp_err_t impluvium_load_zone_config(void)
         return ESP_FAIL;
     }
 
-    if (config_file.version != 1) {
-        ESP_LOGW(TAG, "Config file version mismatch (%d) - using defaults", config_file.version);
+    if (config_file.version != 2) {
+        ESP_LOGW(TAG, "Config file version mismatch (%d, expected 2) - using defaults", config_file.version);
         return ESP_FAIL;
     }
 
@@ -160,10 +160,11 @@ esp_err_t impluvium_load_zone_config(void)
         irrigation_zones[i].watering_enabled = config_file.zones[i].enabled;
         irrigation_zones[i].target_moisture_percent = config_file.zones[i].target_moisture_percent;
         irrigation_zones[i].moisture_deadband_percent = config_file.zones[i].moisture_deadband_percent;
+        irrigation_zones[i].target_moisture_gain_rate = config_file.zones[i].target_moisture_gain_rate;
 
-        ESP_LOGI(TAG, "Zone %d config loaded: enabled=%d, target=%.1f%%, deadband=%.1f%%",
+        ESP_LOGI(TAG, "Zone %d config loaded: enabled=%d, target=%.1f%%, deadband=%.1f%%, gain_rate=%.2f%%/sec",
                  i, config_file.zones[i].enabled, config_file.zones[i].target_moisture_percent,
-                 config_file.zones[i].moisture_deadband_percent);
+                 config_file.zones[i].moisture_deadband_percent, config_file.zones[i].target_moisture_gain_rate);
     }
 
     xSemaphoreGive(xIrrigationMutex);
@@ -186,7 +187,7 @@ esp_err_t impluvium_save_learning_data_all_zones(void)
     irrigation_learning_file_t learning_file = {0};
 
     learning_file.magic = 0x494D504C;  // "IMPL"
-    learning_file.version = 1;
+    learning_file.version = 3;
     learning_file.last_saved = time(NULL);
 
     for (uint8_t zone_id = 0; zone_id < IRRIGATION_ZONE_COUNT; zone_id++) {
@@ -195,29 +196,27 @@ esp_err_t impluvium_save_learning_data_all_zones(void)
         // Copy learned parameters
         learning_file.zones[zone_id].calculated_ppmp_ratio = learning->calculated_ppmp_ratio;
         learning_file.zones[zone_id].calculated_pump_duty_cycle = learning->calculated_pump_duty_cycle;
-        learning_file.zones[zone_id].target_moisture_gain_rate = learning->target_moisture_gain_rate;
+        learning_file.zones[zone_id].soil_redistribution_factor = learning->soil_redistribution_factor;
+        learning_file.zones[zone_id].measured_moisture_gain_rate = learning->measured_moisture_gain_rate;
         learning_file.zones[zone_id].confidence_level = learning->confidence_level;
         learning_file.zones[zone_id].successful_predictions = learning->successful_predictions;
         learning_file.zones[zone_id].total_predictions = learning->total_predictions;
 
-        // Copy 5 most recent valid entries from circular buffer
+        // Copy 5 most recent valid entries from circular buffer (newest-first order)
         uint8_t stored_count = 0;
-        for (uint8_t i = 0; i < learning->history_entry_count && stored_count < LEARNING_STORED_HISTORY; i++) {
-            // Start from most recent entry and work backwards
-            uint8_t idx = (learning->history_index - i - 1 + LEARNING_HISTORY_SIZE) % LEARNING_HISTORY_SIZE;
+        for (uint8_t age = 0; age < learning->history_entry_count && stored_count < LEARNING_STORED_HISTORY; age++) {
+            // Traverse from most recent entry backwards
+            uint8_t idx = (learning->history_index - age - 1 + LEARNING_HISTORY_SIZE) % LEARNING_HISTORY_SIZE;
 
-            // Only store valid (non-anomalous) entries
-            if (!learning->anomaly_flags[idx]) {
-                learning_file.zones[zone_id].pulses_used[stored_count] = learning->pulses_used_history[idx];
-                learning_file.zones[zone_id].moisture_increase_percent[stored_count] =
-                    learning->moisture_increase_percent_history[idx];
+            // Only store valid (non-anomalous) entries with valid ratios
+            if (!learning->anomaly_flags[idx] && learning->ppmp_ratio_history[idx] > 0.0f) {
+                learning_file.zones[zone_id].ppmp_ratio[stored_count] = learning->ppmp_ratio_history[idx];
                 learning_file.zones[zone_id].anomaly_flags[stored_count] = false;
                 stored_count++;
             }
         }
 
         learning_file.zones[zone_id].history_count = stored_count;
-        learning_file.zones[zone_id].history_write_index = 0;  // Reset to start on load
     }
 
 
@@ -280,8 +279,8 @@ esp_err_t impluvium_load_learning_data_all_zones(void)
         return ESP_FAIL;
     }
 
-    if (learning_file.version != 1) {
-        ESP_LOGW(TAG, "Learning file version mismatch (%d) - using defaults", learning_file.version);
+    if (learning_file.version != 3) {
+        ESP_LOGW(TAG, "Learning file version mismatch (%d, expected 3) - using defaults", learning_file.version);
         return ESP_FAIL;
     }
 
@@ -305,30 +304,32 @@ esp_err_t impluvium_load_learning_data_all_zones(void)
         // Load learned parameters
         learning->calculated_ppmp_ratio = learning_file.zones[zone_id].calculated_ppmp_ratio;
         learning->calculated_pump_duty_cycle = learning_file.zones[zone_id].calculated_pump_duty_cycle;
-        learning->target_moisture_gain_rate = learning_file.zones[zone_id].target_moisture_gain_rate;
+        learning->soil_redistribution_factor = learning_file.zones[zone_id].soil_redistribution_factor;
+        learning->measured_moisture_gain_rate = learning_file.zones[zone_id].measured_moisture_gain_rate;
         learning->confidence_level = learning_file.zones[zone_id].confidence_level;
         learning->successful_predictions = learning_file.zones[zone_id].successful_predictions;
         learning->total_predictions = learning_file.zones[zone_id].total_predictions;
 
-        // Load recent history
+        // Load recent history (file stores newest-first, convert to circular buffer order)
         uint8_t stored_count = learning_file.zones[zone_id].history_count;
         if (stored_count > LEARNING_STORED_HISTORY) {
             stored_count = LEARNING_STORED_HISTORY;  // Sanity check
         }
 
+        // Reverse order: file[0]=newest → RAM[stored_count-1], file[last]=oldest → RAM[0]
+        // This ensures circular buffer traversal (history_index - age - 1) reads newest first
         for (uint8_t i = 0; i < stored_count; i++) {
-            learning->pulses_used_history[i] = learning_file.zones[zone_id].pulses_used[i];
-            learning->moisture_increase_percent_history[i] =
-                learning_file.zones[zone_id].moisture_increase_percent[i];
-            learning->anomaly_flags[i] = learning_file.zones[zone_id].anomaly_flags[i];
+            uint8_t ram_idx = stored_count - 1 - i;
+            learning->ppmp_ratio_history[ram_idx] = learning_file.zones[zone_id].ppmp_ratio[i];
+            learning->anomaly_flags[ram_idx] = learning_file.zones[zone_id].anomaly_flags[i];
         }
 
         learning->history_entry_count = stored_count;
         learning->history_index = stored_count % LEARNING_HISTORY_SIZE;
 
-        ESP_LOGI(TAG, "Zone %d learning loaded: ppmp=%.1f, pump_duty=%lu, confidence=%.2f, history=%d entries",
+        ESP_LOGI(TAG, "Zone %d learning loaded: ppmp=%.1f, pump_duty=%lu, RF=%.2f, confidence=%.2f, history=%d entries",
                  zone_id, learning->calculated_ppmp_ratio, learning->calculated_pump_duty_cycle,
-                 learning->confidence_level, stored_count);
+                 learning->soil_redistribution_factor, learning->confidence_level, stored_count);
     }
 
     xSemaphoreGive(xIrrigationMutex);
@@ -485,12 +486,14 @@ void impluvium_handle_midnight_reset(void)
  * @param[in] zone_id Zone identifier (0-4)
  * @param[in] target_moisture_percent Target moisture level (0-100%)
  * @param[in] moisture_deadband_percent Tolerance around target (0-50%)
+ * @param[in] target_moisture_gain_rate Target gain rate for pump optimization (%/sec, 0.1-3.0)
  * @param[in] enabled Enable/disable zone for watering
  * @return ESP_OK on success, ESP_ERR_INVALID_ARG on invalid parameters, ESP_FAIL on save failure
  */
 esp_err_t impluvium_update_zone_config(uint8_t zone_id,
                                        float target_moisture_percent,
                                        float moisture_deadband_percent,
+                                       float target_moisture_gain_rate,
                                        bool enabled)
 {
     // Validate parameters
@@ -509,6 +512,12 @@ esp_err_t impluvium_update_zone_config(uint8_t zone_id,
         return ESP_ERR_INVALID_ARG;
     }
 
+    if (target_moisture_gain_rate < MIN_TARGET_GAIN_RATE_PER_SEC || target_moisture_gain_rate > MAX_TARGET_GAIN_RATE_PER_SEC) {
+        ESP_LOGE(TAG, "Invalid target_moisture_gain_rate %.2f%%/sec (must be %.1f-%.1f)",
+                 target_moisture_gain_rate, MIN_TARGET_GAIN_RATE_PER_SEC, MAX_TARGET_GAIN_RATE_PER_SEC);
+        return ESP_ERR_INVALID_ARG;
+    }
+
     // Update zone configuration in RAM
     if (xSemaphoreTake(xIrrigationMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
         ESP_LOGE(TAG, "Failed to acquire mutex for zone config update");
@@ -518,9 +527,10 @@ esp_err_t impluvium_update_zone_config(uint8_t zone_id,
     irrigation_zones[zone_id].watering_enabled = enabled;
     irrigation_zones[zone_id].target_moisture_percent = target_moisture_percent;
     irrigation_zones[zone_id].moisture_deadband_percent = moisture_deadband_percent;
+    irrigation_zones[zone_id].target_moisture_gain_rate = target_moisture_gain_rate;
 
-    ESP_LOGI(TAG, "Zone %d config updated: enabled=%d, target=%.1f%%, deadband=%.1f%%",
-             zone_id, enabled, target_moisture_percent, moisture_deadband_percent);
+    ESP_LOGI(TAG, "Zone %d config updated: enabled=%d, target=%.1f%%, deadband=%.1f%%, gain_rate=%.2f%%/sec",
+             zone_id, enabled, target_moisture_percent, moisture_deadband_percent, target_moisture_gain_rate);
 
     xSemaphoreGive(xIrrigationMutex);
 

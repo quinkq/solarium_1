@@ -62,6 +62,12 @@ extern TaskHandle_t xIrrigationMonitoringTaskHandle;
 extern TimerHandle_t xMoistureCheckTimer;
 
 /**
+ * Verification timer handle (one-shot).
+ * Fires 5 minutes after watering to update redistribution factors.
+ */
+extern TimerHandle_t xVerificationTimer;
+
+/**
  * Hardware device handles
  */
 extern abp_t abp_dev;              // ABP pressure sensor (SPI)
@@ -92,20 +98,21 @@ extern const gpio_num_t zone_valve_gpios[IRRIGATION_ZONE_COUNT];
 /**
  * @brief Zone configuration file structure (user-editable settings)
  *
- * Stored in /irrigation/config.dat (~50 bytes)
- * Write trigger: When user updates via MQTT (future feature)
+ * Stored in /irrigation/config.dat (~70 bytes)
+ * Write trigger: When user updates via MQTT or HMI
+ * Version 2: Added target_moisture_gain_rate per zone
  */
 typedef struct {
     uint32_t magic;                    // 0x494D5043 ("IMPC")
-    uint16_t version;                  // Format version (1)
+    uint16_t version;                  // Format version (2)
     uint16_t crc16;                    // CRC16-CCITT of zones[] data
 
     struct {
-        bool enabled;                       // Zone enabled/disabled
-        float target_moisture_percent;      // Desired moisture level
-        float moisture_deadband_percent;    // Tolerance around target
-        uint8_t padding;                    // Alignment
-    } zones[IRRIGATION_ZONE_COUNT];         // 10 bytes × 5 = 50 bytes
+        bool enabled;                          // Zone enabled/disabled
+        float target_moisture_percent;         // Desired moisture level
+        float moisture_deadband_percent;       // Tolerance around target
+        float target_moisture_gain_rate;       // Configurable target gain rate (%/sec)
+    } zones[IRRIGATION_ZONE_COUNT];            // 13 bytes × 5 = 65 bytes
 
     uint32_t last_saved;               // Timestamp (epoch seconds)
 } __attribute__((packed)) irrigation_config_file_t;
@@ -113,33 +120,31 @@ typedef struct {
 /**
  * @brief Learning data file structure (all zones)
  *
- * Stored in /irrigation/learning.dat (~350 bytes)
+ * Stored in /irrigation/learning.dat (~270 bytes)
  * Write trigger: Daily at midnight via impluvium_daily_reset_callback()
+ * Version 3: Simplified history to store pre-computed ppmp_ratio instead of raw pulses/moisture
  */
 typedef struct {
     uint32_t magic;                    // 0x494D504C ("IMPL")
-    uint16_t version;                  // Format version (1)
+    uint16_t version;                  // Format version (3)
     uint16_t crc16;                    // CRC16-CCITT of zones[] data
 
     struct {
-        // Learned parameters (20 bytes)
-        float calculated_ppmp_ratio;              // Pulses per moisture percent
+        // Learned parameters (28 bytes)
+        float calculated_ppmp_ratio;              // Weighted average pulses per moisture percent
         uint32_t calculated_pump_duty_cycle;      // Optimal pump speed
-        float target_moisture_gain_rate;          // Adaptive gain rate (%/sec)
+        float soil_redistribution_factor;         // Delayed/immediate moisture ratio
+        float measured_moisture_gain_rate;        // Raw gain rate from last event (%/sec) - for telemetry
         float confidence_level;                   // 0.0-1.0
         uint32_t successful_predictions;          // Success count
         uint32_t total_predictions;               // Total count
 
-        // Recent history (5 entries = 47 bytes)
-        uint8_t history_count;                    // Valid entries (0-5)
-        uint8_t history_write_index;              // Circular buffer position
-        uint16_t padding;                         // Alignment
-        float pulses_used[LEARNING_STORED_HISTORY];                // 20 bytes
-        float moisture_increase_percent[LEARNING_STORED_HISTORY];  // 20 bytes
-        bool anomaly_flags[LEARNING_STORED_HISTORY];               // 5 bytes
-        uint8_t padding2[2];                      // Alignment
+        // Recent history (5 entries, saved newest-first)
+        uint8_t history_count;                              // Valid entries (0-5)
+        float ppmp_ratio[LEARNING_STORED_HISTORY];          // Pre-computed ratios (20 bytes)
+        bool anomaly_flags[LEARNING_STORED_HISTORY];        // 5 bytes
 
-    } zones[IRRIGATION_ZONE_COUNT];    // 69 bytes × 5 = 345 bytes
+    } zones[IRRIGATION_ZONE_COUNT];    // 54 bytes × 5 = 270 bytes
 
     uint32_t last_saved;               // Timestamp (epoch seconds)
 } __attribute__((packed)) irrigation_learning_file_t;
@@ -192,8 +197,11 @@ typedef enum {
     PUMP_RAMP_DOWN = 1  // Ramp from current to zero
 } pump_ramp_direction_t;
 
-esp_err_t impluvium_pump_ramp(uint8_t zone_id, pump_ramp_direction_t direction);
-void impluvium_pump_adaptive_control(float current_gain_rate, float target_gain_rate);
+esp_err_t impluvium_pump_speed_ramping(uint8_t zone_id, pump_ramp_direction_t direction);
+
+// Between-event pump duty optimization
+void impluvium_update_pump_duty_from_gain_rate(uint8_t zone_id, float measured_moisture_increase,
+                                                uint32_t watering_duration_ms, float target_moisture_gain_rate);
 
 // Valve control with logging and validation
 esp_err_t impluvium_open_valve(uint8_t zone_id);
@@ -225,10 +233,12 @@ void impluvium_handle_midnight_reset(void);
 uint32_t impluvium_calc_moisture_check_interval(float current_temperature);
 float impluvium_calculate_temperature_correction(zone_learning_t *learning);
 float impluvium_calculate_pulse_per_moisture_percent(zone_learning_t *learning, uint8_t *valid_cycles);
-esp_err_t impluvium_calculate_zone_target_pulses(uint8_t zone_id, uint8_t queue_index);
-esp_err_t impluvium_calculate_zone_watering_predictions(void);
-esp_err_t impluvium_process_zone_watering_data(uint8_t zone_id, uint32_t pulses_used,
-                                                float moisture_increase_percent, bool learning_valid);
+esp_err_t impluvium_precalculate_zone_watering_targets(uint8_t zone_id, uint8_t queue_index);
+esp_err_t impluvium_precalculate_zone_watering_predictions(void);
+esp_err_t impluvium_postprocess_zone_watering_data(uint8_t zone_id, uint32_t pulses_used,
+                                                float moisture_increase_percent,
+                                                uint32_t watering_duration_ms, bool learning_valid);
+esp_err_t impluvium_update_redistribution_from_delayed_readings(void);
 
 // --- State Machine Functions (impluvium_state_machine.c) ---
 esp_err_t impluvium_change_state(impluvium_state_t new_state);
@@ -238,11 +248,14 @@ esp_err_t impluvium_state_stopping(void);
 esp_err_t impluvium_state_maintenance(void);
 
 // --- Safety Functions (impluvium_safety.c) ---
+void impluvium_set_anomaly(anomaly_type_t type, float value);
 esp_err_t impluvium_pre_check(void);
 void impluvium_calc_flow_rate(const char *task_tag, uint32_t *last_pulse_count,
                                      uint32_t *last_flow_measurement_time, uint32_t current_time);
-esp_err_t impluvium_watering_cutoffs_check(const char *task_tag, uint32_t time_since_start_ms);
-bool impluvium_periodic_safety_check(uint32_t *error_count, uint32_t time_since_start_ms);
+void impluvium_check_moisture_gain_rate(const char *task_tag, float current_moisture, uint32_t time_since_start_ms);
+bool impluvium_should_stop_watering(const char *task_tag, float current_moisture, uint32_t time_since_start_ms);
+bool impluvium_handle_safety_failure(uint32_t *error_count, const char *failure_reason, const char *task_tag);
+void impluvium_periodic_safety_check(const char **failure_reason, uint32_t time_since_start_ms);
 esp_err_t impluvium_emergency_stop(const char *reason);
 esp_err_t emergency_diagnostics_init(void);
 esp_err_t emergency_diagnostics_start(const char *reason);

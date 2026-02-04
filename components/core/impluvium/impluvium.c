@@ -51,6 +51,7 @@ SemaphoreHandle_t xIrrigationMutex = NULL;
 TaskHandle_t xIrrigationTaskHandle = NULL;
 TaskHandle_t xIrrigationMonitoringTaskHandle = NULL;
 TimerHandle_t xMoistureCheckTimer = NULL;
+TimerHandle_t xVerificationTimer = NULL;
 
 // Interval configuration (loaded from interval_config at init)
 uint32_t impluvium_optimal_interval_ms;       // Optimal temperature interval (temp ≥20°C)
@@ -78,6 +79,7 @@ RTC_DATA_ATTR irrigation_accumulator_rtc_t rtc_impluvium_accumulator = {0};
 // ########################## Forward Declarations ##########################
 
 static void vTimerCallbackMoistureCheck(TimerHandle_t xTimer);
+static void vTimerCallbackVerification(TimerHandle_t xTimer);
 static void impluvium_task(void *pvParameters);
 static void impluvium_daily_reset_callback(void);
 
@@ -113,6 +115,17 @@ esp_err_t impluvium_init(void)
         return ESP_FAIL;
     }
 
+    // Create one-shot timer for delayed verification (5 min after watering)
+    xVerificationTimer = xTimerCreate("VerificationTimer",
+                                      pdMS_TO_TICKS(POST_WATERING_VERIFICATION_DELAY_MS),
+                                      pdFALSE, // One-shot
+                                      (void *) 0,
+                                      vTimerCallbackVerification);
+    if (xVerificationTimer == NULL) {
+        ESP_LOGE(TAG, "Failed to create verification timer");
+        return ESP_FAIL;
+    }
+
     // Initialize system state (static variables are zero-initialized)
     irrigation_system.state = IMPLUVIUM_DISABLED;
     irrigation_system.active_zone = NO_ACTIVE_ZONE_ID; // No active zone
@@ -126,8 +139,9 @@ esp_err_t impluvium_init(void)
     for (uint8_t i = 0; i < IRRIGATION_ZONE_COUNT; i++) {
         irrigation_zones[i].zone_id = i;
         irrigation_zones[i].valve_gpio = zone_valve_gpios[i];
-        irrigation_zones[i].target_moisture_percent = 40.0f;  // 40% default target
-        irrigation_zones[i].moisture_deadband_percent = 5.0f; // +/- 5% deadband
+        irrigation_zones[i].target_moisture_percent = ZONE_DEFAULT_MOISTURE_TARGET; // 40% default target
+        irrigation_zones[i].moisture_deadband_percent = ZONE_DEFAULT_MOISTURE_DEADBAND; // +/- 5% deadband
+        irrigation_zones[i].target_moisture_gain_rate = DEFAULT_TARGET_GAIN_RATE_PER_SEC; // 1.0%/sec default
         irrigation_zones[i].watering_enabled = true;
 
         // Set ADS1115 device and channel mapping
@@ -140,11 +154,14 @@ esp_err_t impluvium_init(void)
             irrigation_zones[i].moisture_channel = ADS111X_MUX_0_GND;
         }
 
-        // Initialize learning algorithm data
-        // no memset - static variables are zero-initialized
-        irrigation_zones[i].learning.calculated_ppmp_ratio = DEFAULT_PULSES_PER_PERCENT; // Default pulses per 1% moisture
+        // Initialize learning algorithm data (explicit for clarity, even though globals are zero-initialized)
+        irrigation_zones[i].learning.calculated_ppmp_ratio = DEFAULT_PULSES_PER_MOISTURE_PERCENT;
         irrigation_zones[i].learning.calculated_pump_duty_cycle = PUMP_DEFAULT_DUTY;
-        irrigation_zones[i].learning.target_moisture_gain_rate = TARGET_MOISTURE_GAIN_RATE;
+        irrigation_zones[i].learning.soil_redistribution_factor = DEFAULT_SOIL_REDISTRIBUTION_FACTOR;
+        irrigation_zones[i].learning.measured_moisture_gain_rate = 0.0f;
+        irrigation_zones[i].learning.confidence_level = 0.0f;
+        irrigation_zones[i].learning.history_entry_count = 0;
+        irrigation_zones[i].learning.history_index = 0;
     }
 
     // Initialize hardware (delegated to actuators module)
@@ -173,7 +190,7 @@ esp_err_t impluvium_init(void)
     FLUCTUS_REQUEST_BUS_OR_FAIL(POWER_BUS_3V3, "IMPLUVIUM_TEST", {
         ESP_LOGW(TAG, "Failed to power on 3.3V bus for water level sensor test");
     });
-    vTaskDelay(pdMS_TO_TICKS(SENSOR_POWERUP_DELAY_MS)); // Wait for sensor stabilization
+    vTaskDelay(pdMS_TO_TICKS(500)); // Wait for sensor stabilization
 
     float test_water_level = 0.0f;
     ret = impluvium_read_water_level(&test_water_level);
@@ -281,6 +298,17 @@ esp_err_t impluvium_init(void)
     // This ensures HMI has valid data before first watering cycle
     telemetry_fetch_snapshot(TELEMETRY_SRC_IMPLUVIUM);
     ESP_LOGI(TAG, "Initial telemetry cache populated");
+
+    // Start the periodic moisture check timer only if system is enabled
+    if (irrigation_system.state != IMPLUVIUM_DISABLED) {
+        if (xTimerStart(xMoistureCheckTimer, 0) != pdPASS) {
+            ESP_LOGE(TAG, "Failed to start moisture check timer");
+            return ESP_FAIL;
+        }
+        ESP_LOGI(TAG, "Moisture check timer started (system enabled)");
+    } else {
+        ESP_LOGI(TAG, "System disabled - timer will start when enabled");
+    }
 
     ESP_LOGI(TAG, "IMPLUVIUM irrigation system initialized successfully");
     return ESP_OK;
@@ -396,6 +424,20 @@ static void vTimerCallbackMoistureCheck(TimerHandle_t xTimer)
     xTaskNotify(xIrrigationTaskHandle, IRRIGATION_TASK_NOTIFY_REQUEST_MOISTURE_CHECK, eSetBits);
 }
 
+/**
+ * @brief Timer callback for delayed verification (one-shot)
+ *
+ * Fires 5 minutes after watering completes to trigger delayed moisture readings
+ * for updating soil redistribution factors.
+ *
+ * @param xTimer Timer handle
+ */
+static void vTimerCallbackVerification(TimerHandle_t xTimer)
+{
+    ESP_LOGI("IMPLUVIUM(VerifyTimer)", "Delayed verification timer expired - notifying task");
+    xTaskNotify(xIrrigationTaskHandle, IRRIGATION_TASK_NOTIFY_VERIFICATION_DUE, eSetBits);
+}
+
 // ########################## Main Task ##########################
 
 /**
@@ -414,8 +456,6 @@ static void impluvium_task(void *pvParameters)
     // Wait for other systems to initialize
     vTaskDelay(pdMS_TO_TICKS(3000));
 
-    // Start the periodic moisture check timer
-    xTimerStart(xMoistureCheckTimer, 0);
     uint32_t notification_value = 0;
 
     while (1) {
@@ -469,6 +509,10 @@ static void impluvium_task(void *pvParameters)
                 // State already changed to MEASURING by API function
                 // State machine will execute below and process it
             }
+            if (notification_value & IRRIGATION_TASK_NOTIFY_VERIFICATION_DUE) {
+                ESP_LOGI(task_tag, "Notification: Delayed verification due");
+                // Handled in STANDBY state below
+            }
 
             // --- State Machine Execution ---
             // We loop here to handle sequential state transitions within one task activation
@@ -479,7 +523,11 @@ static void impluvium_task(void *pvParameters)
 
                 switch (current_state) {
                     case IMPLUVIUM_STANDBY:
-                        // Do nothing, wait for notification
+                        // Check for delayed verification
+                        if (irrigation_system.verification_pending) {
+                            impluvium_update_redistribution_from_delayed_readings();
+                        }
+                        // Otherwise, do nothing and wait for notification
                         break;
 
                     case IMPLUVIUM_DISABLED:
@@ -622,8 +670,10 @@ esp_err_t impluvium_write_to_telemetry_cache(impluvium_snapshot_t *cache)
 
         // Learning algorithm data
         cache->zones[i].calculated_ppmp_ratio = irrigation_zones[i].learning.calculated_ppmp_ratio;
-        cache->zones[i].calculated_pump_duty = irrigation_zones[i].learning.calculated_pump_duty_cycle;
-        cache->zones[i].target_moisture_gain_rate = irrigation_zones[i].learning.target_moisture_gain_rate;
+        cache->zones[i].calculated_pump_duty_cycle = irrigation_zones[i].learning.calculated_pump_duty_cycle;
+        cache->zones[i].soil_redistribution_factor = irrigation_zones[i].learning.soil_redistribution_factor;
+        cache->zones[i].target_moisture_gain_rate = irrigation_zones[i].target_moisture_gain_rate; // Moved to config
+        cache->zones[i].measured_moisture_gain_rate = irrigation_zones[i].learning.measured_moisture_gain_rate;
         cache->zones[i].confidence_level = irrigation_zones[i].learning.confidence_level;
         cache->zones[i].successful_predictions = irrigation_zones[i].learning.successful_predictions;
         cache->zones[i].total_predictions = irrigation_zones[i].learning.total_predictions;
@@ -641,6 +691,7 @@ esp_err_t impluvium_write_to_telemetry_cache(impluvium_snapshot_t *cache)
     // Anomaly tracking
     cache->current_anomaly_type = irrigation_system.current_anomaly.type;
     cache->anomaly_timestamp = irrigation_system.current_anomaly.anomaly_timestamp;
+    cache->anomaly_value = irrigation_system.current_anomaly.expected_vs_actual;
 
     xSemaphoreGive(xIrrigationMutex);
 
@@ -690,6 +741,7 @@ esp_err_t impluvium_write_realtime_to_telemetry_cache(impluvium_snapshot_rt_t *c
     }
 
     // System status flags
+    cache->emergency_stop = irrigation_system.emergency_stop;
     cache->sensors_powered = irrigation_system.sensors_powered;
     cache->sensor_data_valid = irrigation_system.sensors_powered;  // Valid when sensors powered
 

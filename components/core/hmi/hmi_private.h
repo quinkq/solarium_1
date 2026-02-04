@@ -78,6 +78,7 @@ extern uint8_t editing_zone_id;
 extern bool editing_zone_enabled;
 extern float editing_zone_target;
 extern float editing_zone_deadband;
+extern float editing_zone_moisture_gain_rate;
 
 // IMPLUVIUM manual water input state
 extern bool manual_water_input;

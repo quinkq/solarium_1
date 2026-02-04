@@ -238,10 +238,15 @@ esp_err_t tempesta_station_init(void)
         goto cleanup_main_task;
     }
 
-    // Start collection timer (uses dynamic interval configuration)
-    if (xTimerStart(xTempestaCollectionTimer, 0) != pdPASS) {
-        ESP_LOGE(TAG, "Failed to start collection timer");
-        goto cleanup_as5600_task;
+    // Start collection timer only if system is enabled (uses dynamic interval configuration)
+    if (tempesta_state != TEMPESTA_STATE_DISABLED) {
+        if (xTimerStart(xTempestaCollectionTimer, 0) != pdPASS) {
+            ESP_LOGE(TAG, "Failed to start collection timer");
+            goto cleanup_as5600_task;
+        }
+        ESP_LOGI(TAG, "Collection timer started (system enabled)");
+    } else {
+        ESP_LOGI(TAG, "System disabled - timer will start when enabled");
     }
 
     ESP_LOGI(TAG, "Weather station initialized successfully");

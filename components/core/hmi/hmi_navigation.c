@@ -61,6 +61,7 @@ static void hmi_action_zone_edit_cancel(void);
 static void hmi_action_zone_edit_toggle_enabled(void);
 static void hmi_action_zone_edit_toggle_target(void);
 static void hmi_action_zone_edit_toggle_deadband(void);
+static void hmi_action_zone_edit_toggle_moisture_gain_rate(void);
 static void hmi_action_confirm_zone_reset_learning(void);
 static void hmi_action_zone_edit_manual_water(void);
 static void hmi_action_zone_edit_save(void);
@@ -251,9 +252,10 @@ static const nav_transition_t impluvium_zone_edit_transitions[] = {
     { .item_index = 1, .next_menu = HMI_MENU_IMPLUVIUM_ZONE_EDIT,  .action = NAV_ACTION_TOGGLE,        .handler = hmi_action_zone_edit_toggle_enabled },
     { .item_index = 2, .next_menu = HMI_MENU_IMPLUVIUM_ZONE_EDIT,  .action = NAV_ACTION_EDIT_START,    .handler = hmi_action_zone_edit_toggle_target },
     { .item_index = 3, .next_menu = HMI_MENU_IMPLUVIUM_ZONE_EDIT,  .action = NAV_ACTION_EDIT_START,    .handler = hmi_action_zone_edit_toggle_deadband },
-    { .item_index = 4, .next_menu = HMI_MENU_CONFIRM,              .action = NAV_ACTION_CONFIRM_DIALOG,.handler = hmi_action_confirm_zone_reset_learning },
-    { .item_index = 5, .next_menu = HMI_MENU_IMPLUVIUM_MANUAL_WATER,.action = NAV_ACTION_NAVIGATE,     .handler = hmi_action_zone_edit_manual_water },
-    { .item_index = 6, .next_menu = HMI_MENU_IMPLUVIUM_ZONE_CONFIG,.action = NAV_ACTION_EXECUTE,       .handler = hmi_action_zone_edit_save },
+    { .item_index = 4, .next_menu = HMI_MENU_IMPLUVIUM_ZONE_EDIT,  .action = NAV_ACTION_EDIT_START,    .handler = hmi_action_zone_edit_toggle_moisture_gain_rate },
+    { .item_index = 5, .next_menu = HMI_MENU_CONFIRM,              .action = NAV_ACTION_CONFIRM_DIALOG,.handler = hmi_action_confirm_zone_reset_learning },
+    { .item_index = 6, .next_menu = HMI_MENU_IMPLUVIUM_MANUAL_WATER,.action = NAV_ACTION_NAVIGATE,     .handler = hmi_action_zone_edit_manual_water },
+    { .item_index = 7, .next_menu = HMI_MENU_IMPLUVIUM_ZONE_CONFIG,.action = NAV_ACTION_EXECUTE,       .handler = hmi_action_zone_edit_save },
 };
 
 static const nav_transition_t impluvium_manual_water_transitions[] = {
@@ -371,7 +373,7 @@ static const nav_menu_metadata_t menu_metadata_table[] = {
     { .state = HMI_MENU_IMPLUVIUM_MONITOR,      .item_count = 1, .transitions = impluvium_detail_page_transitions,    .transition_count = 1, .is_realtime = true },
     { .state = HMI_MENU_IMPLUVIUM_CONTROLS,     .item_count = 6, .transitions = impluvium_controls_transitions,       .transition_count = 6, .is_realtime = false },
     { .state = HMI_MENU_IMPLUVIUM_ZONE_CONFIG,  .item_count = 7, .transitions = impluvium_zone_config_transitions,    .transition_count = 7, .is_realtime = false },
-    { .state = HMI_MENU_IMPLUVIUM_ZONE_EDIT,    .item_count = 7, .transitions = impluvium_zone_edit_transitions,      .transition_count = 7, .is_realtime = false },
+    { .state = HMI_MENU_IMPLUVIUM_ZONE_EDIT,    .item_count = 8, .transitions = impluvium_zone_edit_transitions,      .transition_count = 8, .is_realtime = false },
     { .state = HMI_MENU_IMPLUVIUM_MANUAL_WATER, .item_count = 3, .transitions = impluvium_manual_water_transitions,   .transition_count = 3, .is_realtime = false },
     { .state = HMI_MENU_IMPLUVIUM_INTERVALS,    .item_count = 5, .transitions = impluvium_intervals_transitions,      .transition_count = 5, .is_realtime = false },
 
@@ -654,6 +656,12 @@ void hmi_handle_encoder_change(int delta)
             if (new_value < 1) new_value = 1;
             if (new_value > 20) new_value = 20;
             editing_zone_deadband = (uint8_t)new_value;
+        } else if (hmi_status.selected_item == 4) {
+            // Moisture Gain Rate: 0.1-3.0 %/sec, 0.1 steps
+            float new_value = editing_zone_moisture_gain_rate + (delta * 0.1f);
+            if (new_value < 0.1f) new_value = 0.1f;
+            if (new_value > 3.0f) new_value = 3.0f;
+            editing_zone_moisture_gain_rate = new_value;
         }
         return;
     }
@@ -1174,13 +1182,15 @@ static void hmi_action_enter_zone_edit(void)
         editing_zone_enabled = snapshot.zones[editing_zone_id].watering_enabled;
         editing_zone_target = snapshot.zones[editing_zone_id].target_moisture_percent;
         editing_zone_deadband = snapshot.zones[editing_zone_id].moisture_deadband_percent;
+        editing_zone_moisture_gain_rate = snapshot.zones[editing_zone_id].target_moisture_gain_rate;
 
         // Use defaults if config is uninitialized (both target and deadband are 0.0)
         if (editing_zone_target == 0.0f && editing_zone_deadband == 0.0f) {
             editing_zone_target = 40.0f;      // Default 40% target
             editing_zone_deadband = 5.0f;     // Default 5% deadband
-            ESP_LOGW(TAG, "Zone %d config uninitialized, using defaults: target=%.1f%%, deadband=%.1f%%",
-                     editing_zone_id, editing_zone_target, editing_zone_deadband);
+            editing_zone_moisture_gain_rate = 1.0f;  // Default 1.0 %/sec
+            ESP_LOGW(TAG, "Zone %d config uninitialized, using defaults: target=%.1f%%, deadband=%.1f%%, gain_rate=%.1f%%/s",
+                     editing_zone_id, editing_zone_target, editing_zone_deadband, editing_zone_moisture_gain_rate);
         }
     }
 
@@ -1210,11 +1220,12 @@ static void hmi_action_toggle_all_zones(void)
     }
     bool enable_all = (enabled_count < IRRIGATION_ZONE_COUNT);
 
-    // Apply to all zones (preserve existing target/deadband from refreshed snapshot)
+    // Apply to all zones (preserve existing target/deadband/gain_rate from refreshed snapshot)
     for (int i = 0; i < IRRIGATION_ZONE_COUNT; i++) {
         impluvium_update_zone_config(i,
                                       snapshot.zones[i].target_moisture_percent,
                                       snapshot.zones[i].moisture_deadband_percent,
+                                      snapshot.zones[i].target_moisture_gain_rate,
                                       enable_all);
     }
 
@@ -1246,6 +1257,11 @@ static void hmi_action_zone_edit_toggle_deadband(void)
     zone_editing = !zone_editing;
 }
 
+static void hmi_action_zone_edit_toggle_moisture_gain_rate(void)
+{
+    zone_editing = !zone_editing;
+}
+
 static void hmi_action_confirm_zone_reset_learning(void)
 {
     confirmation_action = CONFIRM_RESET_ZONE_LEARNING;
@@ -1266,10 +1282,12 @@ static void hmi_action_zone_edit_save(void)
     impluvium_update_zone_config(editing_zone_id,
                                   editing_zone_target,
                                   editing_zone_deadband,
+                                  editing_zone_moisture_gain_rate,
                                   editing_zone_enabled);
 
-    ESP_LOGI(TAG, "Zone %d config saved: enabled=%d, target=%.1f%%, deadband=%.1f%%",
-             editing_zone_id, editing_zone_enabled, editing_zone_target, editing_zone_deadband);
+    ESP_LOGI(TAG, "Zone %d config saved: enabled=%d, target=%.1f%%, deadband=%.1f%%, gain_rate=%.1f%%/s",
+             editing_zone_id, editing_zone_enabled, editing_zone_target, editing_zone_deadband,
+             editing_zone_moisture_gain_rate);
 
     // Force telemetry cache update so HMI sees new values immediately
     telemetry_fetch_snapshot(TELEMETRY_SRC_IMPLUVIUM);

@@ -191,7 +191,7 @@ esp_err_t impluvium_set_pump_speed(uint32_t pwm_duty)
  * @param direction PUMP_RAMP_UP or PUMP_RAMP_DOWN
  * @return ESP_OK on success, ESP_FAIL on failure.
  */
-esp_err_t impluvium_pump_ramp(uint8_t zone_id, pump_ramp_direction_t direction)
+esp_err_t impluvium_pump_speed_ramping(uint8_t zone_id, pump_ramp_direction_t direction)
 {
     uint32_t start_duty, target_duty, ramp_duration_ms;
     int steps = 100; // 100 steps for a smooth ramp
@@ -222,47 +222,6 @@ esp_err_t impluvium_pump_ramp(uint8_t zone_id, pump_ramp_direction_t direction)
 
     ESP_LOGI(TAG, "Pump ramp complete for zone %d at %" PRIu32 " duty.", zone_id, target_duty);
     return ESP_OK;
-}
-
-/**
- * @brief Simple adaptive pump control based on moisture gain rate
- *
- * Adjusts pump speed up or down based on whether we're meeting the target moisture gain rate.
- *
- * @param current_gain_rate Current moisture gain rate (%/sec)
- * @param target_gain_rate Target moisture gain rate (%/sec)
- */
-void impluvium_pump_adaptive_control(float current_gain_rate, float target_gain_rate)
-{
-    float rate_error = target_gain_rate - current_gain_rate;
-
-    // Only adjust if error is significant
-    if (fabs(rate_error) < PUMP_GAIN_RATE_TOLERANCE) {
-        return; // Close enough, no adjustment needed
-    }
-
-    uint32_t current_duty = irrigation_system.pump_pwm_duty;
-    uint32_t new_duty = current_duty;
-
-    if (rate_error > 0) {
-        // Need more moisture gain - increase pump speed
-        new_duty = current_duty + PUMP_ADJUSTMENT_STEP;
-        ESP_LOGD(TAG, "Increasing pump speed: %.2f < %.2f %%/sec", current_gain_rate, target_gain_rate);
-    } else {
-        // Too much moisture gain - decrease pump speed
-        new_duty = current_duty - (PUMP_ADJUSTMENT_STEP / 2); // Decrease more slowly
-        ESP_LOGD(TAG, "Decreasing pump speed: %.2f > %.2f %%/sec", current_gain_rate, target_gain_rate);
-    }
-
-    // Verify 12V bus is still powered before adjusting pump speed
-    // (FLUCTUS may revoke bus power during load shedding)
-    if (!fluctus_is_bus_powered(POWER_BUS_12V)) {
-        ESP_LOGE(TAG, "12V bus power lost - cannot adjust pump speed! Aborting.");
-        // Emergency stop will be triggered by load shedding callback
-        return;
-    }
-
-    impluvium_set_pump_speed(new_duty);
 }
 
 /**

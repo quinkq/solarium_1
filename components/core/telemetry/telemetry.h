@@ -35,6 +35,8 @@
 #define TELEMETRY_MQTT_TOPIC_INTERVAL_SET    "solarium/config/intervals/set"
 #define TELEMETRY_MQTT_TOPIC_INTERVAL_PRESET "solarium/config/intervals/preset"
 #define TELEMETRY_MQTT_TOPIC_INTERVAL_ACK    "solarium/config/intervals/ack"
+#define TELEMETRY_MQTT_TOPIC_ZONE_SET        "solarium/config/zone/set"
+#define TELEMETRY_MQTT_TOPIC_ZONE_ACK        "solarium/config/zone/ack"
 
 // MQTT QoS 1 retry configuration
 #define MQTT_PUBACK_TIMEOUT_SEC 5
@@ -245,5 +247,21 @@ esp_err_t telemetry_get_buffer_status(uint16_t *buffered_count, uint16_t *buffer
  * @note Acknowledgments are published to TELEMETRY_MQTT_TOPIC_INTERVAL_ACK with current config
  */
 esp_err_t telemetry_handle_interval_command(const char *topic, const uint8_t *data, size_t data_len);
+
+/**
+ * @brief Handle zone configuration command from MQTT
+ *
+ * Parses MessagePack payload containing zone configuration (zone_id, enabled, target_moisture,
+ * deadband, target_moisture_gain_rate), validates parameters, applies to IMPLUVIUM component,
+ * and publishes acknowledgment.
+ *
+ * @param[in] data Raw MessagePack binary data
+ * @param[in] data_len Length of data in bytes
+ * @return ESP_OK on success, ESP_FAIL on parse/validation error
+ *
+ * @note This function is called internally by telemetry's MQTT event handler
+ * @note Acknowledgments are published to TELEMETRY_MQTT_TOPIC_ZONE_ACK with updated config
+ */
+esp_err_t telemetry_handle_zone_config_command(const uint8_t *data, size_t data_len);
 
 #endif // TELEMETRY_H

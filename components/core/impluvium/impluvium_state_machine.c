@@ -62,15 +62,21 @@ esp_err_t impluvium_change_state(impluvium_state_t new_state)
 }
 
 /**
- * @brief Execute MEASURING state operations
+ * @brief MEASURING state - scan zones and build watering queue
  *
- * Powers on sensor bus, performs safety checks, scans all zones
- * for watering needs, builds prioritized watering queue.
+ * Workflow (4 phases):
+ * 1. Power state check (abort if critical/very low battery)
+ * 2. Power on sensors & safety checks
+ * 3. Scan zones (manual mode bypass OR normal moisture scan + interval check)
+ * 4. Process queue (sort by deficit → calculate predictions → transition to WATERING/STANDBY)
  *
  * @return ESP_OK on success, ESP_FAIL on safety check failure
  */
 esp_err_t impluvium_state_measuring(void)
 {
+    // ============================================================================
+    // PHASE 1: Power State Check
+    // ============================================================================
     // Check FLUCTUS power state before requesting power
     fluctus_power_state_t power_state = fluctus_get_power_state();
     if (power_state == FLUCTUS_POWER_STATE_CRITICAL) {
@@ -85,6 +91,9 @@ esp_err_t impluvium_state_measuring(void)
         return ESP_OK;
     }
 
+    // ============================================================================
+    // PHASE 2: Power On Sensors & Safety Checks
+    // ============================================================================
     // Power on sensors (3V3 for sensors, 5V for pressure transmitter)
     if (impluvium_request_power_buses(POWER_ONLY_SENSORS, "IMPLUVIUM") != ESP_OK) {
         impluvium_change_state(IMPLUVIUM_MAINTENANCE);
@@ -109,6 +118,9 @@ esp_err_t impluvium_state_measuring(void)
         return ESP_FAIL;
     }
 
+    // ============================================================================
+    // PHASE 3: Scan Zones for Watering Needs
+    // ============================================================================
     // **MANUAL WATERING MODE**: Bypass normal moisture checks and directly queue the manual zone
     if (irrigation_system.manual_watering_active) {
         uint8_t zone_id = irrigation_system.manual_water_zone;
@@ -193,6 +205,9 @@ esp_err_t impluvium_state_measuring(void)
         }
     }
 
+    // ============================================================================
+    // PHASE 4: Process Queue and Transition
+    // ============================================================================
     // Process the watering queue
     if (irrigation_system.watering_queue_size > 0) {
         // Sort queue by moisture deficit (highest priority first) - Insertion Sort
@@ -210,7 +225,7 @@ esp_err_t impluvium_state_measuring(void)
         }
 
         // Calculate predicted pulses for each zone using learning algorithm
-        impluvium_calculate_zone_watering_predictions();
+        impluvium_precalculate_zone_watering_predictions();
 
         // Start watering queue - keep sensors powered
         irrigation_system.queue_index = 0;
@@ -230,30 +245,39 @@ esp_err_t impluvium_state_measuring(void)
 }
 
 /**
- * @brief Execute WATERING state initialization
+ * @brief WATERING state - initialize hardware and start monitoring
  *
- * Sets up watering for current zone: opens valve, ramps up pump,
- * initializes flow counting, notifies monitoring task.
+ * Called ONCE when entering WATERING state (not continuously). Sets up hardware
+ * for current zone in queue, then hands control to monitoring task for duration.
+ *
+ * Workflow (5 phases):
+ * 1. Validate queue index
+ * 2. Request power (12V bus + level shifter)
+ * 3. Request STELLARIA dimming (optional load reduction)
+ * 4. Hardware startup (valve open → pump ramp up)
+ * 5. Initialize state tracking & notify monitoring task
  *
  * @return ESP_OK on success, ESP_FAIL on pump/valve failure
  */
 esp_err_t impluvium_state_watering(void)
 {
-    // Now called only once when transitioning into the WATERING state.
-    // It sets up the watering for the current zone in the queue.
-
-    // Get current zone from queue
+    // ============================================================================
+    // PHASE 1: Validate Queue Index
+    // ============================================================================
     if (irrigation_system.queue_index >= irrigation_system.watering_queue_size) {
         ESP_LOGE(TAG, "Invalid queue index in WATERING state");
         impluvium_change_state(IMPLUVIUM_STOPPING);
         return ESP_FAIL;
     }
-
+    // Get current zone from queue
     uint8_t zone_id = irrigation_system.watering_queue[irrigation_system.queue_index].zone_id;
     irrigation_zone_t *zone = &irrigation_zones[zone_id];
     ESP_LOGI(TAG, "Watering sequence started for zone %d", zone_id);
 
-    // Request 12V power for valve & pump operation (sensors already powered from measuring state)
+    // ============================================================================
+    // PHASE 2: Request Power (12V Bus + Level Shifter)
+    // ============================================================================
+    // Request 12V power for valve & pump operation (sensors already powered during measuring state)
     FLUCTUS_REQUEST_BUS_OR_FAIL(POWER_BUS_12V, "IMPLUVIUM", {
         impluvium_close_valve(zone_id);
         impluvium_release_power_buses(POWER_ONLY_SENSORS, "IMPLUVIUM");
@@ -270,21 +294,27 @@ esp_err_t impluvium_state_watering(void)
         return ESP_FAIL;
     }
 
+    // ============================================================================
+    // PHASE 3: Request STELLARIA Dimming (Optional Load Reduction)
+    // ============================================================================
     // Request STELLARIA to dim lights for power management during irrigation
     esp_err_t ret = stellaria_request_irrigation_dim(true);
     if(ret != ESP_OK) {
-        ESP_LOGI(TAG, "Skiping STELLARIA dimming...");
+        ESP_LOGI(TAG, "Skiping STELLARIA dimming... (ret != ESP_OK)");
     } else {
         ESP_LOGI(TAG, "STELLARIA dimming active - delaying for 1s.");
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 
+    // ============================================================================
+    // PHASE 4: Hardware Startup (Valve + Pump)
+    // ============================================================================
     // Open valve and wait for actuation
     impluvium_open_valve(zone_id);
     vTaskDelay(pdMS_TO_TICKS(VALVE_OPEN_DELAY_MS));
 
     // Ramp up pump speed
-    if (impluvium_pump_ramp(zone_id, PUMP_RAMP_UP) != ESP_OK) {
+    if (impluvium_pump_speed_ramping(zone_id, PUMP_RAMP_UP) != ESP_OK) {
         ESP_LOGE(TAG, "Pump ramp-up failed for zone %d, turning off power buses", zone_id);
         impluvium_close_valve(zone_id);
         fluctus_release_level_shifter("IMPLUVIUM");
@@ -293,6 +323,9 @@ esp_err_t impluvium_state_watering(void)
         return ESP_FAIL;
     }
 
+    // ============================================================================
+    // PHASE 5: Initialize State Tracking & Notify Monitoring
+    // ============================================================================
     // Reset flow sensor counter and update system state
     pcnt_unit_clear_count(flow_pcnt_unit);
     pcnt_unit_get_count(flow_pcnt_unit, (int *) &irrigation_system.watering_start_pulses);
@@ -314,25 +347,35 @@ esp_err_t impluvium_state_watering(void)
 }
 
 /**
- * @brief STOPPING state - stop pump, update learning, process next zone in queue
+ * @brief STOPPING state - per-zone cleanup and queue advancement
+ *
+ * This state executes after EACH zone finishes watering (not just at the end of the full irrigation session).
+ * It handles: hardware shutdown, volume calculation, learning updates, and either transitions to the next
+ * zone in queue (→ WATERING) or completes the session (→ MAINTENANCE).
+ *
+ * Workflow (4 phases):
+ * 1. Hardware shutdown (pump, valves, lights)
+ * 2. Calculate water usage (volume, RTC accumulator)
+ * 3. Update learning data (manual skip OR normal learning + verification storage)
+ * 4. Advance queue (next zone OR finish session + power off)
  */
 esp_err_t impluvium_state_stopping(void)
 {
     uint8_t active_zone = irrigation_system.active_zone;
 
+    // ============================================================================
+    // PHASE 1: Hardware Shutdown
+    // ============================================================================
     // Notify monitoring task to stop
     xTaskNotify(xIrrigationMonitoringTaskHandle, MONITORING_TASK_NOTIFY_STOP_MONITORING, eSetBits);
 
     // Ramp down pump (3 seconds for gentle shutdown)
-    if (impluvium_pump_ramp(active_zone, PUMP_RAMP_DOWN) != ESP_OK) {
+    if (impluvium_pump_speed_ramping(active_zone, PUMP_RAMP_DOWN) != ESP_OK) {
         ESP_LOGW(TAG, "Pump ramp-down failed, forcing immediate stop");
         impluvium_set_pump_speed(0);
     }
     ESP_LOGI(TAG, "Pump stopped - delaying %dms for pressure equalization", PRESSURE_EQUALIZE_DELAY_MS);
     vTaskDelay(pdMS_TO_TICKS(PRESSURE_EQUALIZE_DELAY_MS));
-
-    // Restore STELLARIA to previous intensity (irrigation complete)
-    stellaria_request_irrigation_dim(false);
 
     // Close current zone valve
     if (active_zone < IRRIGATION_ZONE_COUNT) {
@@ -345,7 +388,9 @@ esp_err_t impluvium_state_stopping(void)
     // Release level shifter after valves closed and pump stopped
     fluctus_release_level_shifter("IMPLUVIUM");
 
-    // Calculate volume used and update learning algorithm
+    // ============================================================================
+    // PHASE 2: Calculate Water Usage
+    // ============================================================================
     if (active_zone < IRRIGATION_ZONE_COUNT && irrigation_system.queue_index < irrigation_system.watering_queue_size) {
         int total_pulses;
         pcnt_unit_get_count(flow_pcnt_unit, &total_pulses);
@@ -356,6 +401,9 @@ esp_err_t impluvium_state_stopping(void)
         impluvium_update_accumulator(active_zone, volume_ml);
         impluvium_check_hourly_rollover();
 
+        // ============================================================================
+        // PHASE 3: Update Learning Data
+        // ============================================================================
         // **MANUAL WATERING MODE**: Skip learning algorithm, just log volume used
         if (irrigation_system.manual_watering_active) {
             ESP_LOGI(TAG, "Manual watering completed for zone %d: %lu pulses, %.1f mL (%d seconds)",
@@ -376,15 +424,18 @@ esp_err_t impluvium_state_stopping(void)
             if (impluvium_read_moisture_sensor(active_zone, &final_moisture_percent) == ESP_OK) {
             irrigation_zones[active_zone].last_moisture_percent = final_moisture_percent; // Store last reading
             watering_queue_item_t *queue_item = &irrigation_system.watering_queue[irrigation_system.queue_index];
-            float moisture_increase_percent = final_moisture_percent - queue_item->moisture_at_start_percent;
+            float measured_moisture_increase = final_moisture_percent - queue_item->moisture_at_start_percent;
 
             // Check for anomalies that would invalidate learning data
             // Note: Temperature check is for learning validity only - safety was already verified before watering
             float current_temperature = tempesta_get_temperature();
+            if(current_temperature == WEATHER_INVALID_VALUE ||
+                current_temperature < TEMP_EXTREME_LOW ||
+                current_temperature > TEMP_EXTREME_HIGH) {
+                    impluvium_set_anomaly(ANOMALY_TEMPERATURE_EXTREME, current_temperature);
+            }
 
-            if (irrigation_system.current_anomaly.type != ANOMALY_NONE ||
-                current_temperature == WEATHER_INVALID_VALUE ||
-                current_temperature < TEMP_EXTREME_LOW || current_temperature > TEMP_EXTREME_HIGH) {
+            if (irrigation_system.current_anomaly.type != ANOMALY_NONE) {
                 learning_valid = false;
                 ESP_LOGD(TAG,
                          "Zone %d: Learning data invalidated (anomaly=%d, temp=%.1f°C) - extreme conditions affect soil behavior",
@@ -397,22 +448,9 @@ esp_err_t impluvium_state_stopping(void)
             uint32_t current_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
             uint32_t watering_duration_ms = current_time - irrigation_system.watering_start_time;
 
-            // Update learning algorithm with results
-            impluvium_process_zone_watering_data(active_zone, pulses_used, moisture_increase_percent, learning_valid);
-
-            // Learn optimal target moisture gain rate (only for valid, reasonable cycles)
-            if (learning_valid && watering_duration_ms > 5000 && watering_duration_ms < 60000) { // 5s to 60s range
-                float actual_gain_rate = moisture_increase_percent / (watering_duration_ms / 1000.0f);
-                if (actual_gain_rate > 0.1f && actual_gain_rate < 2.0f) { // Reasonable gain rate range
-                    zone_learning_t *learning = &irrigation_zones[active_zone].learning;
-                    // Update target gain rate with exponential moving average (5% new, 95% old for slower adaptation)
-                    learning->target_moisture_gain_rate =
-                        (learning->target_moisture_gain_rate * 0.95f) + (actual_gain_rate * 0.05f);
-
-                    ESP_LOGI(TAG, "Zone %d: Updated target gain rate: %.2f %%/sec (measured %.2f %%/sec over %lu s)",
-                             active_zone, learning->target_moisture_gain_rate, actual_gain_rate, watering_duration_ms / 1000);
-                }
-            }
+            // Update learning algorithm with results (includes between-event pump duty optimization)
+            impluvium_postprocess_zone_watering_data(active_zone, pulses_used, measured_moisture_increase,
+                                                  watering_duration_ms, learning_valid);
 
             ESP_LOGI(TAG,
                      "Zone %d: Used %lu pulses, %.1fmL, moisture %.1f%%->%.1f%% (+%.1f%%)",
@@ -421,7 +459,14 @@ esp_err_t impluvium_state_stopping(void)
                      volume_ml,
                      queue_item->moisture_at_start_percent,
                      final_moisture_percent,
-                     moisture_increase_percent);
+                     measured_moisture_increase);
+
+            // Store data for delayed verification (5 min check to update redistribution factor)
+            uint8_t vi = irrigation_system.verification_zone_count;
+            irrigation_system.verification_zones[vi].zone_id = active_zone;
+            irrigation_system.verification_zones[vi].moisture_at_start_percent = queue_item->moisture_at_start_percent;
+            irrigation_system.verification_zones[vi].moisture_immediate_percent = final_moisture_percent;
+            irrigation_system.verification_zone_count++;
             }
         } // End of normal watering (else block)
 
@@ -429,6 +474,9 @@ esp_err_t impluvium_state_stopping(void)
         irrigation_system.watering_queue[irrigation_system.queue_index].watering_completed = true;
     }
 
+    // ============================================================================
+    // PHASE 4: Advance Queue and Transition
+    // ============================================================================
     // Reset anomaly detection for next zone
     memset(&irrigation_system.current_anomaly, 0, sizeof(watering_anomaly_t));
 
@@ -447,6 +495,22 @@ esp_err_t impluvium_state_stopping(void)
         // All zones completed - finish session
         ESP_LOGI(TAG, "All %d zones in queue completed", irrigation_system.watering_queue_size);
 
+        // Restore STELLARIA to previous intensity (irrigation complete)
+        stellaria_request_irrigation_dim(false);
+
+        // Schedule delayed verification (5 minutes from now) to update redistribution factors
+        if (irrigation_system.verification_zone_count > 0) {
+            irrigation_system.verification_pending = true;
+            if (xTimerStart(xVerificationTimer, 0) == pdPASS) {
+                ESP_LOGI(TAG, "Started verification timer for %d zones (5 min delay)",
+                         irrigation_system.verification_zone_count);
+            } else {
+                ESP_LOGE(TAG, "Failed to start verification timer");
+                irrigation_system.verification_pending = false;
+                irrigation_system.verification_zone_count = 0;
+            }
+        }
+
         // Power off all buses now that all zones are done
         fluctus_release_bus_power(POWER_BUS_12V, "IMPLUVIUM");
         fluctus_release_bus_power(POWER_BUS_5V, "IMPLUVIUM");
@@ -464,15 +528,22 @@ esp_err_t impluvium_state_stopping(void)
 }
 
 /**
- * @brief MAINTENANCE state - perform system maintenance tasks and emergency diagnostics
+ * @brief MAINTENANCE state - post-watering cleanup or emergency diagnostics
  *
- * Handles:
- * - Emergency diagnostics execution and analysis
- * - Daily volume resets
- * - NVS configuration saves
+ * Dual-purpose state: normal cleanup after successful watering OR emergency diagnostic workflow.
+ *
+ * Workflow (3 phases):
+ * 1. Check for new emergency trigger (start diagnostics if flagged)
+ * 2. Process emergency diagnostics (5-state nested state machine)
+ * 3. Normal maintenance (telemetry publish → return to STANDBY)
+ *
+ * Emergency sub-states: NONE → TRIGGERED → DIAGNOSING → USER_REQUIRED/RESOLVED
  */
 esp_err_t impluvium_state_maintenance(void)
 {
+    // ============================================================================
+    // PHASE 1: Check for New Emergency Trigger
+    // ============================================================================
     // If an emergency was triggered, start the diagnostic process.
     if (irrigation_system.emergency_stop) {
         ESP_LOGI(TAG, "Emergency detected, beginning diagnostics...");
@@ -483,6 +554,9 @@ esp_err_t impluvium_state_maintenance(void)
         return ESP_OK;
     }
 
+    // ============================================================================
+    // PHASE 2: Process Emergency Diagnostics (Nested State Machine)
+    // ============================================================================
     // If we are in an emergency, the diagnostic logic will handle the flow.
     // If not, we perform normal maintenance and return to idle.
     if (irrigation_system.emergency.state != EMERGENCY_NONE) {
@@ -545,6 +619,9 @@ esp_err_t impluvium_state_maintenance(void)
                 break;
         }
     } else {
+        // ============================================================================
+        // PHASE 3: Normal Maintenance (Post-Watering Cleanup)
+        // ============================================================================
         // Normal maintenance after a watering cycle
         ESP_LOGI(TAG, "Maintenance tasks completed, returning to IDLE");
         impluvium_change_state(IMPLUVIUM_STANDBY);

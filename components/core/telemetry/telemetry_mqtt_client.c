@@ -101,6 +101,7 @@ void telemetry_mqtt_event_handler(void *handler_args, esp_event_base_t base,
             esp_mqtt_client_subscribe(mqtt_client, "solarium/cmd/realtime", 1);
             esp_mqtt_client_subscribe(mqtt_client, TELEMETRY_MQTT_TOPIC_INTERVAL_SET, 1);
             esp_mqtt_client_subscribe(mqtt_client, TELEMETRY_MQTT_TOPIC_INTERVAL_PRESET, 1);
+            esp_mqtt_client_subscribe(mqtt_client, TELEMETRY_MQTT_TOPIC_ZONE_SET, 1);
 
             ESP_LOGI(TAG, "MQTT ready");
             break;
@@ -160,6 +161,17 @@ void telemetry_mqtt_event_handler(void *handler_args, esp_event_base_t base,
                                                                    event->data_len);
                 if (ret != ESP_OK) {
                     ESP_LOGW(TAG, "Failed to process interval command from topic: %.*s",
+                             event->topic_len, event->topic);
+                }
+            }
+            // Handle zone configuration commands
+            else if (strncmp(event->topic, TELEMETRY_MQTT_TOPIC_ZONE_SET,
+                            strlen(TELEMETRY_MQTT_TOPIC_ZONE_SET)) == 0) {
+
+                esp_err_t ret = telemetry_handle_zone_config_command((const uint8_t*)event->data,
+                                                                      event->data_len);
+                if (ret != ESP_OK) {
+                    ESP_LOGW(TAG, "Failed to process zone config command from topic: %.*s",
                              event->topic_len, event->topic);
                 }
             }
