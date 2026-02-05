@@ -65,10 +65,15 @@
 #define FLUCTUS_PHOTORESISTOR_THRESHOLD 0.010f       // Minimum error threshold (V)
 #define FLUCTUS_SERVO_POWERUP_DELAY_MS  100          // Servo power stabilization
 
+// Servo Control Task Parameters (Refactored smooth tracking)
+#define FLUCTUS_SERVO_CONTROL_LOOP_MS           250     // Control loop period (250ms for smooth motion)
+#define FLUCTUS_SERVO_MAX_STEP_PER_ITERATION    15      // Max duty change per iteration (slow, deliberate movement)
+#define FLUCTUS_SERVO_SETTLING_TIME_MS          3000    // Time below threshold to declare convergence
+#define FLUCTUS_SERVO_SETTLING_COUNT            (FLUCTUS_SERVO_SETTLING_TIME_MS / FLUCTUS_SERVO_CONTROL_LOOP_MS)  // 12 iterations
+
 // Solar Tracking Automation Configuration
 #define FLUCTUS_TRACKING_CORRECTION_INTERVAL_MS         (15 * 60 * 1000)  // 15 minutes between correction cycles
-#define FLUCTUS_TRACKING_ADJUSTMENT_DURATION_MS         3000              // Tracking update interval (when correcting)
-#define FLUCTUS_TRACKING_ADJUSTMENT_CYCLE_TIMEOUT_MS    30000             // 30 seconds max correction time
+#define FLUCTUS_TRACKING_ADJUSTMENT_CYCLE_TIMEOUT_MS    30000             // 30 seconds max correction time (enforced by inner xTaskNotifyWait)
 #define FLUCTUS_TRACKING_SUNRISE_BUFFER_MINUTES         30                // Start tracking 30 min before sunrise
 #define FLUCTUS_TRACKING_SUNSET_BUFFER_MINUTES          30                // Allow disable 30 min before sunset
 
@@ -113,6 +118,7 @@
 #define FLUCTUS_NOTIFY_SUNRISE               (1UL << 3)  // Sunrise detected - wake SLEEPING tracking (solar task)
 #define FLUCTUS_NOTIFY_POWER_STATE_CHANGE    (1UL << 4)  // Power state change detected (core orchestration task)
 #define FLUCTUS_NOTIFY_CONFIG_UPDATE         (1UL << 5)  // Configuration updated - recalculate timeouts (monitoring task)
+#define FLUCTUS_NOTIFY_SERVO_CONVERGED       (1UL << 6)  // Servo control → state machine: tracking converged
 
 // Battery Voltage Thresholds (12V AGM, 50% SOC = 0%)
 #define FLUCTUS_BATTERY_LEVEL_POWER_SAVING    12.48f  // 40% SOC - Impose limit on STELLARIA
@@ -178,9 +184,6 @@ typedef struct {
     uint8_t bus_ref_count[POWER_BUS_COUNT];     // Reference counting for consumers
     char bus_consumers[POWER_BUS_COUNT][FLUCTUS_POWER_BUS_MAX_CONSUMERS][16]; // Consumer names per bus (DEFINE sets max per bus)
     fluctus_power_state_t power_state;          // Current power management state
-    solar_tracking_state_t solar_tracking_state; // Solar tracking state machine
-    uint32_t current_yaw_duty;                  // Current yaw servo position
-    uint32_t current_pitch_duty;                // Current pitch servo position
     bool safety_shutdown;                       // Overcurrent safety shutdown flag
     bool manual_reset_required;                 // Manual reset flag for safety
     time_t last_activity_time;                  // Last consumer activity timestamp
@@ -214,8 +217,43 @@ typedef struct {
     bool thermal_monitoring_active;     // Thermal monitoring mode active (high frequency temp reads)
 } fluctus_monitoring_data_t;
 
-// Deprecated: fluctus_solar_tracking_data_t has been replaced by fluctus_solar_snapshot_t
-// (defined below in the Snapshot Functions section)
+
+/**
+ * @brief Solar tracking state structure - SOURCE OF TRUTH for all solar/servo data
+ *
+ * This is the single authoritative source for:
+ * - Current servo positions (hardware state)
+ * - Solar tracking state machine state
+ * - Photoresistor readings and tracking errors
+ *
+ * Protected by xSolarMutex. Used for both:
+ * - Internal decision making (servo control, state machine)
+ * - Telemetry snapshot generation (MQTT, HMI)
+ *
+ * THREAD SAFETY: All reads/writes must hold xSolarMutex
+ */
+typedef struct {
+    // Tracking state machine
+    solar_tracking_state_t tracking_state;
+
+    // Servo positions - SOURCE OF TRUTH for hardware state
+    uint32_t current_yaw_duty;          // Raw servo PWM duty cycle (410-2048)
+    uint32_t current_pitch_duty;        // Raw servo PWM duty cycle (410-2048)
+    uint8_t yaw_position_percent;       // 0-100% (derived from duty for telemetry)
+    uint8_t pitch_position_percent;     // 0-100% (derived from duty for telemetry)
+
+    // Tracking errors (updated during correction cycles)
+    float yaw_error;                    // Tracking error in volts (left-right differential)
+    float pitch_error;                  // Tracking error in volts (top-bottom differential)
+
+    // Photoresistor raw readings (TL, TR, BL, BR)
+    float photoresistor_readings[4];    // Individual photoresistor voltages
+
+    // Validity and timestamp
+    bool valid;                         // Sensor reading validity flag
+    time_t timestamp;                   // Last update timestamp
+
+} fluctus_solar_data_t;
 
 typedef enum {
     FLUCTUS_EVENT_BUS_ON = 0,
@@ -453,28 +491,6 @@ typedef struct {
 } power_accumulator_rtc_t;
 
 // ################ Snapshot Functions ################
-
-/**
- * @brief Solar tracking snapshot structure for solar position and error data
- * Contains fast-changing solar tracking values (updated during CORRECTING phase)
- * Replaces the old fluctus_solar_tracking_data_t for unified data handling
- */
-typedef struct {
-    // Solar tracking state (fast-changing during correction)
-    solar_tracking_state_t tracking_state;
-    uint8_t yaw_position_percent;      // 0-100%
-    uint8_t pitch_position_percent;     // 0-100%
-    float yaw_error;                    // Tracking error in volts
-    float pitch_error;                  // Tracking error in volts
-    uint32_t current_yaw_duty;          // Raw servo PWM duty cycle
-    uint32_t current_pitch_duty;        // Raw servo PWM duty cycle
-
-    // Photoresistor raw readings (TL, TR, BL, BR)
-    float photoresistor_readings[4];    // Individual photoresistor voltages
-    bool valid;                         // Reading validity
-
-    time_t timestamp;
-} fluctus_solar_snapshot_t;
 
 /**
  * @brief Unified FLUCTUS snapshot structure for HMI display and MQTT distribution

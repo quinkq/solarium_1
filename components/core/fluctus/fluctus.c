@@ -38,6 +38,7 @@ static const char *TAG = "FLUCTUS";
 // Task handles
 TaskHandle_t xFluctusMonitoringTaskHandle = NULL;
 TaskHandle_t xFluctusSolarTrackingTaskHandle = NULL;
+TaskHandle_t xFluctusSolarServoControlTaskHandle = NULL;
 TaskHandle_t xFluctusCoreOrchestrationTaskHandle = NULL;
 
 // System initialization flag
@@ -148,7 +149,9 @@ void fluctus_handle_power_state_change(fluctus_power_state_t new_state)
                 wifi_helper_set_shutdown(true);                     // Shutdown WiFi (save ~20mA)
                 telemetry_enable_telemetry_publishing(false);       // Buffering only (critical power)
                 telemetry_force_realtime_monitoring_disable(true);  // Force disable realtime mode
-                if (system_status.solar_tracking_state != SOLAR_TRACKING_DISABLED) {
+                // Check solar tracking state (read from solar_data)
+                solar_tracking_state_t current_solar_state = fluctus_get_solar_tracking_state();
+                if (current_solar_state != SOLAR_TRACKING_DISABLED) {
                     current_parking_reason = PARKING_REASON_CRITICAL_POWER;
                     fluctus_disable_solar_tracking();
                 }
@@ -160,7 +163,11 @@ void fluctus_handle_power_state_change(fluctus_power_state_t new_state)
                     system_status.bus_enabled[i] = false;
                     fluctus_update_bus_hardware(i);
                 }
-                system_status.solar_tracking_state = SOLAR_TRACKING_DISABLED;
+                // Force solar tracking disabled (write to solar_data with mutex)
+                if (xSemaphoreTake(xSolarMutex, pdMS_TO_TICKS(FLUCTUS_MUTEX_TIMEOUT_QUICK_MS)) == pdTRUE) {
+                    solar_data.tracking_state = SOLAR_TRACKING_DISABLED;
+                    xSemaphoreGive(xSolarMutex);
+                }
                 break;
             default:
                 break;
@@ -294,8 +301,7 @@ esp_err_t fluctus_init(void)
     // Initialize system status
     memset(&system_status, 0, sizeof(fluctus_power_status_t));
     system_status.power_state = FLUCTUS_POWER_STATE_NORMAL;
-    system_status.current_yaw_duty = FLUCTUS_SERVO_CENTER_DUTY;
-    system_status.current_pitch_duty = FLUCTUS_SERVO_CENTER_DUTY;
+    // Note: solar_data (servo positions, tracking state) initialized in fluctus_solar_tracking.c
 
     // Register sunrise callback for automatic SLEEPING → STANDBY transitions
     ret = solar_calc_register_sunrise_callback(fluctus_on_sunrise_callback);
@@ -353,6 +359,26 @@ esp_err_t fluctus_init(void)
         ret = ESP_FAIL;
         goto cleanup;
     }
+
+    // Create servo control task (starts suspended, resumed during CORRECTING state)
+    task_ret = xTaskCreate(
+        fluctus_solar_servo_correction_task,
+        "solar_servo_ctrl",
+        4096,
+        NULL,
+        5,
+        &xFluctusSolarServoControlTaskHandle
+    );
+
+    if (task_ret != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create servo control task");
+        ret = ESP_FAIL;
+        goto cleanup;
+    }
+
+    // Start suspended - will be resumed when entering CORRECTING state
+    vTaskSuspend(xFluctusSolarServoControlTaskHandle);
+    ESP_LOGI(TAG, "Servo control task created (suspended until CORRECTING state)");
 
     // Create core orchestration task (event-driven load shedding coordinator)
     task_ret = xTaskCreate(
@@ -535,15 +561,15 @@ esp_err_t fluctus_write_to_telemetry_cache(fluctus_snapshot_t *cache)
 
     xSemaphoreGive(xMonitoringMutex);
 
-    // 3. Lock solar tracking data (cached_solar_data and solar state)
+    // 3. Lock solar tracking data (solar_data - source of truth)
     if (xSemaphoreTake(xSolarMutex, pdMS_TO_TICKS(FLUCTUS_MUTEX_TIMEOUT_QUICK_MS)) != pdTRUE) {
         return ESP_FAIL;
     }
 
     // Solar tracking - current state (minimal, no debug data)
-    cache->tracking_state = system_status.solar_tracking_state;
-    cache->yaw_position_percent = (uint8_t)fluctus_duty_to_percent(system_status.current_yaw_duty);
-    cache->pitch_position_percent = (uint8_t)fluctus_duty_to_percent(system_status.current_pitch_duty);
+    cache->tracking_state = solar_data.tracking_state;
+    cache->yaw_position_percent = solar_data.yaw_position_percent;
+    cache->pitch_position_percent = solar_data.pitch_position_percent;
 
     xSemaphoreGive(xSolarMutex);
 
@@ -635,14 +661,21 @@ esp_err_t fluctus_write_realtime_to_telemetry_cache(fluctus_snapshot_t *cache)
     cache->bus_6v6_consumers = system_status.bus_ref_count[POWER_BUS_6V6];
     cache->bus_12v_consumers = system_status.bus_ref_count[POWER_BUS_12V];
 
-    // Solar tracking - dynamic state
-    cache->tracking_state = system_status.solar_tracking_state;
-    cache->yaw_position_percent = (uint8_t)fluctus_duty_to_percent(system_status.current_yaw_duty);
-    cache->pitch_position_percent = (uint8_t)fluctus_duty_to_percent(system_status.current_pitch_duty);
-    cache->current_yaw_duty = system_status.current_yaw_duty;       // DEBUG: raw PWM duty
-    cache->current_pitch_duty = system_status.current_pitch_duty;   // DEBUG: raw PWM duty
-
     xSemaphoreGive(xPowerBusMutex);
+
+    // 1b. Lock solar state (read from solar_data - source of truth)
+    if (xSemaphoreTake(xSolarMutex, pdMS_TO_TICKS(FLUCTUS_MUTEX_TIMEOUT_QUICK_MS)) != pdTRUE) {
+        return ESP_FAIL;
+    }
+
+    // Solar tracking - dynamic state
+    cache->tracking_state = solar_data.tracking_state;
+    cache->yaw_position_percent = solar_data.yaw_position_percent;
+    cache->pitch_position_percent = solar_data.pitch_position_percent;
+    cache->current_yaw_duty = solar_data.current_yaw_duty;       // DEBUG: raw PWM duty
+    cache->current_pitch_duty = solar_data.current_pitch_duty;   // DEBUG: raw PWM duty
+
+    xSemaphoreGive(xSolarMutex);
 
     // 2. Lock monitoring data (power monitoring)
     if (xSemaphoreTake(xMonitoringMutex, pdMS_TO_TICKS(FLUCTUS_MUTEX_TIMEOUT_QUICK_MS)) != pdTRUE) {
@@ -686,15 +719,15 @@ esp_err_t fluctus_write_realtime_to_telemetry_cache(fluctus_snapshot_t *cache)
 
     xSemaphoreGive(xMonitoringMutex);
 
-    // 3. Lock solar tracking data (cached_solar_data - debug info only)
+    // 3. Lock solar tracking data (solar_data - debug info only)
     if (xSemaphoreTake(xSolarMutex, pdMS_TO_TICKS(FLUCTUS_MUTEX_TIMEOUT_QUICK_MS)) != pdTRUE) {
         return ESP_FAIL;
     }
 
     // Solar tracking - full debug data (photoresistors, errors)
-    cache->yaw_error = cached_solar_data.yaw_error;
-    cache->pitch_error = cached_solar_data.pitch_error;
-    memcpy(cache->photoresistor_readings, cached_solar_data.photoresistor_readings, sizeof(cache->photoresistor_readings));  // DEBUG
+    cache->yaw_error = solar_data.yaw_error;
+    cache->pitch_error = solar_data.pitch_error;
+    memcpy(cache->photoresistor_readings, solar_data.photoresistor_readings, sizeof(cache->photoresistor_readings));  // DEBUG
 
     xSemaphoreGive(xSolarMutex);
 

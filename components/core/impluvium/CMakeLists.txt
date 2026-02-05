@@ -6,7 +6,7 @@ idf_component_register(
         "impluvium_actuators.c"
         "impluvium_learning.c"
         "impluvium_state_machine.c"
-        "impluvium_safety.c"
+        "impluvium_safety_monitor.c"
         "impluvium_storage.c"
     INCLUDE_DIRS "."
     REQUIRES

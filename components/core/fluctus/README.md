@@ -32,7 +32,7 @@ Each module owns its state and mutex to prevent high-frequency tasks (500ms moni
 |--------|-------|-------|------|
 | `fluctus_power_bus.c` | `system_status`, `hardware_bus_state[]` | `xPowerBusMutex` | - |
 | `fluctus_power_monitor.c` | `monitoring_data`, `ina219_dev[]` | `xMonitoringMutex` | `fluctus_monitor` (Med-5) |
-| `fluctus_solar_tracking.c` | `cached_solar_data` | `xSolarMutex` | `fluctus_solar` (Med-5) |
+| `fluctus_solar_tracking.c` | `solar_data` (source of truth) | `xSolarMutex` | `fluctus_solar` (Med-5)<br>`fluctus_servo_control` (Med-5) |
 | `fluctus_accumulator.c` | `rtc_fluctus_accumulator` | `xEnergyMutex` | - |
 | `fluctus.c` | Orchestration | - | `fluctus_core_orq` (Low-3) |
 
@@ -41,7 +41,33 @@ Each module owns its state and mutex to prevent high-frequency tasks (500ms moni
 **Task Communication:**
 - `fluctus_monitor` (Med-5): Detects battery state changes, sends `xTaskNotify()` to orchestration task
 - `fluctus_core_orq` (Low-3): Receives notifications, coordinates component shutdowns (non-blocking)
-- `fluctus_solar` (Med-5): Independent timer-driven corrections, no inter-task communication
+- `fluctus_solar` (Med-5): State machine - daytime checks, power management, blocks during CORRECTING
+- `fluctus_servo_control` (Med-5): 250ms control loop - sensor reads, servo corrections, convergence detection
+
+**Solar Tracking Dual-Task Architecture:**
+
+The solar tracking system uses two cooperating tasks for clean separation of concerns:
+
+1. **State Machine Task** (`fluctus_solar`):
+   - Handles 15-min interval timing
+   - Performs ONE-TIME daytime/light check before correction
+   - Manages 6.6V bus power (on/off)
+   - **Blocks during CORRECTING** using `xTaskNotifyWait(30s timeout)` waiting for servo task
+   - Receives notifications: ENABLE, DISABLE, SUNRISE, SERVO_CONVERGED
+   - Forces servo task suspension on timeout or DISABLE
+
+2. **Servo Control Task** (`fluctus_servo_control`):
+   - Created SUSPENDED, resumed by state machine when CORRECTING starts
+   - Runs 250ms loop: reads photoresistors, applies small corrections (max 15 duty units)
+   - Detects convergence: 3 seconds continuous below 0.01V threshold
+   - Notifies state machine on convergence, then suspends self
+   - No timeout checking (handled by state machine's wait timeout)
+
+**Benefits:**
+- State machine doesn't poll during correction (blocks efficiently)
+- Servo task focuses purely on corrections without exit condition complexity
+- Single timeout authority (state machine's `xTaskNotifyWait`)
+- Power management centralized in one place (state machine)
 
 **Priority Rationale:**
 - Med-5 for monitoring/solar: Time-sensitive sensor readings and servo control
@@ -98,7 +124,7 @@ Each module owns its state and mutex to prevent high-frequency tasks (500ms moni
 - Min duty: 410 (14-bit @ 50Hz)
 - Center duty: 1229
 - Max duty: 2048
-- Max adjustment: ±250 duty units per cycle
+- Max adjustment: ±15 duty units per 250ms iteration (smooth tracking)
 
 ## Key Features
 
@@ -206,7 +232,7 @@ Power Gating:
 
 - **DISABLED**: Parked center, waits for user enable notification
 - **STANDBY**: Idle, checks daytime every 15min, starts correction if OK
-- **CORRECTING**: 3s loop - reads sensors, applies corrections until error <0.01V or 30s timeout
+- **CORRECTING**: Blocking state - daytime check, power up 6.6V, resume servo task, wait for convergence/timeout (30s) or disable
 - **PARKING**: Transient - parks servos, chooses next state based on reason (SUNSET/USER/CRITICAL)
 - **SLEEPING**: Parked east/up, waits for sunrise callback (-30min buffer) to auto-resume
 - **ERROR**: Progressive backoff (5s/10s/15s/20s delay), returns to STANDBY unless 5× failures → DISABLED (requires manual `fluctus_enable_solar_tracking()` to restart)
@@ -214,16 +240,17 @@ Power Gating:
 **Photoresistor Feedback:**
 - 4× sensors (ADS1115-2): Top-Left/Top-Right/Bottom-Left/Bottom-Right
 - Differential errors: `yaw = (TL+BL) - (TR+BR)`, `pitch = (TL+TR) - (BL+BR)`
-- Proportional control: Adjustment scales with error (max 250 duty units/cycle)
+- Proportional control: Adjustment scales with error (max 15 duty units per 250ms iteration)
 - Error margin: 0.010V threshold (prevents jitter)
+- Settling time: 3 seconds continuous below threshold required for convergence
 
 **Parking Positions:**
 - Night: Yaw 10% (east), Pitch 60% (up) - ready for sunrise
 - Error: Yaw 50%, Pitch 50% (center) - safe fallback
 
 **Power Gating:**
-- 6.6V bus only ON during CORRECTING state
-- Typical duty cycle: 3-5s active per 15min = 0.3-0.6%
+- 6.6V bus only ON during CORRECTING state (servo task active)
+- Typical duty cycle: 3-10s active per 15min = 0.3-1.1%
 
 ### 4. Five-State Load Shedding
 
@@ -415,7 +442,8 @@ RTC RAM structure (persistent across resets):
 
 **Task Stacks:**
 - `fluctus_monitor`: 4096 bytes
-- `fluctus_solar`: 4096 bytes
+- `fluctus_solar`: 4096 bytes (state machine)
+- `fluctus_servo_control`: 4096 bytes (servo corrections)
 - `fluctus_core_orq`: 2048 bytes
 
 **Timing:**
@@ -440,9 +468,16 @@ Key defines in `fluctus.h`:
 #define FLUCTUS_POWER_ACTIVE_MONITOR_INTERVAL_MS    500
 #define FLUCTUS_POWER_STEADY_MONITOR_INTERVAL_MS    (15 * 60 * 1000)
 
-// Solar tracking
-#define FLUCTUS_TRACKING_CORRECTION_INTERVAL_MS     (15 * 60 * 1000)
-#define FLUCTUS_PHOTORESISTOR_THRESHOLD             0.010f
+// Solar tracking - state machine
+#define FLUCTUS_TRACKING_CORRECTION_INTERVAL_MS         (15 * 60 * 1000)
+#define FLUCTUS_TRACKING_ADJUSTMENT_CYCLE_TIMEOUT_MS    30000
+#define FLUCTUS_PHOTORESISTOR_THRESHOLD                 0.010f
+
+// Solar tracking - servo control task
+#define FLUCTUS_SERVO_CONTROL_LOOP_MS              250
+#define FLUCTUS_SERVO_MAX_STEP_PER_ITERATION       15
+#define FLUCTUS_SERVO_SETTLING_TIME_MS             3000
+#define FLUCTUS_SERVO_SETTLING_COUNT               12  // (3000 / 250)
 
 // Thermal
 #define FLUCTUS_FAN_TURN_ON_TEMP_THRESHOLD          32.0f

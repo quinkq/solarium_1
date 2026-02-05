@@ -285,7 +285,7 @@ void fluctus_set_ina_metering_mode(bool monitoring_active)
         // Refresh cache: Read photoresistors and update daytime state
         should_pv_be_active = fluctus_is_daytime_with_sufficient_light();
         pv_daytime_cache = should_pv_be_active;
-        if (cached_solar_data.valid) {
+        if (solar_data.valid) {
             last_pv_check_time = esp_timer_get_time() / 1000;
             ESP_LOGD(TAG, "PV daytime check refreshed: %s", should_pv_be_active ? "day" : "night");
         }

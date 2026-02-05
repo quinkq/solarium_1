@@ -46,9 +46,6 @@ SemaphoreHandle_t xPowerBusMutex = NULL;
 fluctus_power_status_t system_status = {.bus_enabled = {false, false, false, false},
                                         .bus_ref_count = {0, 0, 0, 0},
                                         .power_state = FLUCTUS_POWER_STATE_NORMAL,
-                                        .solar_tracking_state = SOLAR_TRACKING_DISABLED,
-                                        .current_yaw_duty = FLUCTUS_SERVO_CENTER_DUTY,
-                                        .current_pitch_duty = FLUCTUS_SERVO_CENTER_DUTY,
                                         .safety_shutdown = false,
                                         .manual_reset_required = false,
                                         .last_activity_time = 0};

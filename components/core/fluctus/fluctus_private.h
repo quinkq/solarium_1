@@ -55,7 +55,8 @@ extern int64_t overcurrent_start_time;
 extern bool overcurrent_timer_active;
 
 // Solar Tracking State (owned by fluctus_solar_tracking.c)
-extern fluctus_solar_snapshot_t cached_solar_data;
+// solar_data is the SOURCE OF TRUTH for all solar/servo data (protected by xSolarMutex)
+extern fluctus_solar_data_t solar_data;
 extern int64_t last_correction_time;
 extern int64_t correction_start_time;
 extern uint8_t consecutive_tracking_errors;
@@ -97,6 +98,7 @@ extern parking_reason_t current_parking_reason;
 extern TaskHandle_t xFluctusCoreOrchestrationTaskHandle;  // Core orchestration task (Low-3)
 extern TaskHandle_t xFluctusMonitoringTaskHandle;         // Power monitoring task (Med-5)
 extern TaskHandle_t xFluctusSolarTrackingTaskHandle;      // Solar tracking task (Med-5)
+extern TaskHandle_t xFluctusSolarServoControlTaskHandle;  // Servo control task (Med-5)
 
 // ########################## System Flags & Configuration ##########################
 
@@ -145,29 +147,32 @@ void fluctus_monitoring_task(void *parameters);  // FreeRTOS task
 // ==================== Solar Tracking Functions ====================
 // Module: fluctus_solar_tracking.c
 
-esp_err_t fluctus_read_photoresistors(fluctus_solar_snapshot_t *data);
+esp_err_t fluctus_read_photoresistors(fluctus_solar_data_t *data);
 esp_err_t fluctus_servo_set_position(ledc_channel_t channel, uint32_t duty_cycle);
-uint32_t fluctus_calculate_servo_correction(float error, uint32_t current_duty);
 uint32_t fluctus_percent_to_duty(float percent);
 float fluctus_duty_to_percent(uint32_t duty);
 esp_err_t fluctus_park_servos_night(void);
 esp_err_t fluctus_park_servos_error(void);
 bool fluctus_tracking_error_margin_check(float yaw_error, float pitch_error);
 void fluctus_set_tracking_state(solar_tracking_state_t new_state, const char *log_msg);
-bool fluctus_apply_servo_corrections(fluctus_solar_snapshot_t *tracking_data);
 bool fluctus_is_daytime_with_sufficient_light(void);
 
 // Solar tracking state handlers
 void fluctus_solar_state_standby(int64_t current_time_ms);
-void fluctus_solar_state_correcting(int64_t current_time_ms);
+void fluctus_solar_state_correcting(void);  // Blocking entry function, no parameters
 void fluctus_solar_state_parking(void);
 void fluctus_solar_state_error(void);
 
 // Solar tracking sunrise callback
 void fluctus_on_sunrise_callback(void);
 
-// FreeRTOS task
+// FreeRTOS tasks
 void fluctus_solar_tracking_task(void *parameters);
+void fluctus_solar_servo_correction_task(void *parameters);
+
+// Refactored smooth tracking helper functions
+bool fluctus_apply_servo_corrections_smooth(fluctus_solar_data_t *tracking_data);
+void fluctus_update_solar_cache(fluctus_solar_data_t *reading);
 
 // ==================== Thermal Management Functions ====================
 // Module: fluctus_thermal.c

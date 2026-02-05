@@ -1,5 +1,5 @@
 /**
- * @file impluvium_safety.c
+ * @file impluvium_safety_monitor.c
  * @brief Safety monitoring and emergency diagnostics for IMPLUVIUM irrigation system
  *
  * Implements pre-check validation, real-time safety monitoring during watering,

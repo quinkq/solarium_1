@@ -31,12 +31,11 @@
  * OPTIMIZATION:
  * - Cached photoresistor data shared with power metering (avoids redundant ADC reads)
  * - Average light intensity forwarded to STELLARIA for auto mode
- * - Single source of truth: system_status.solar_tracking_state
+ * - Single source of truth: solar_data (tracking state, servo positions, sensor readings)
  *
  * THREAD SAFETY:
  * - Protected by xSolarMutex (100ms timeout)
- * - State stored in system_status.solar_tracking_state (shared with power_bus)
- * - Servo positions stored in system_status.current_yaw_duty/pitch_duty
+ * - All solar/servo data stored in solar_data (protected by xSolarMutex)
  * - Runs in solar tracking task (Med-5 priority)
  *
  * Part of the Solarium project - Solar-powered garden automation system
@@ -59,9 +58,20 @@ static const char *TAG = "FLUCTUS_SOLAR";
 
 SemaphoreHandle_t xSolarMutex = NULL;  // Solar tracking mutex (initialized in fluctus.c)
 
-// Cached solar tracking data (populated by photoresistor reads)
-// Shared with telemetry and power metering to avoid redundant ADC reads
-fluctus_solar_snapshot_t cached_solar_data = {0};
+// Solar state - SOURCE OF TRUTH for all solar/servo data
+// Shared with telemetry and power metering, protected by xSolarMutex
+fluctus_solar_data_t solar_data = {
+    .tracking_state = SOLAR_TRACKING_DISABLED,
+    .current_yaw_duty = FLUCTUS_SERVO_CENTER_DUTY,
+    .current_pitch_duty = FLUCTUS_SERVO_CENTER_DUTY,
+    .yaw_position_percent = 50,  // Center position
+    .pitch_position_percent = 50,
+    .yaw_error = 0.0f,
+    .pitch_error = 0.0f,
+    .photoresistor_readings = {0.0f, 0.0f, 0.0f, 0.0f},
+    .valid = false,
+    .timestamp = 0
+};
 
 // Correction cycle timing
 int64_t last_correction_time = 0;      // Last correction cycle start time (for interval timing)
@@ -78,6 +88,11 @@ uint8_t consecutive_tracking_errors = 0;
 static bool solar_debug_mode_active = false;
 static int64_t debug_mode_start_time = 0;
 #define FLUCTUS_DEBUG_MODE_TIMEOUT_MS 90000  // 90 seconds auto-timeout
+
+// Servo control task state (for smooth tracking refactor)
+static uint8_t settling_counter = 0;           // Consecutive readings below threshold
+static uint16_t total_correction_iterations = 0;  // Total iterations in current correction cycle
+static bool servo_control_active = false;      // Task active flag (for debug logging)
 
 // ########################## Servo PWM Initialization ##########################
 
@@ -162,7 +177,7 @@ esp_err_t fluctus_servo_pwm_init(void)
  *
  * Other fields (tracking_state, servo positions) are NOT modified.
  */
-esp_err_t fluctus_read_photoresistors(fluctus_solar_snapshot_t *data)
+esp_err_t fluctus_read_photoresistors(fluctus_solar_data_t *data)
 {
     if (data == NULL) {
         return ESP_ERR_INVALID_ARG;
@@ -236,8 +251,8 @@ esp_err_t fluctus_servo_set_position(ledc_channel_t channel, uint32_t duty_cycle
  * @brief Set servo position directly for debug/testing (PUBLIC API)
  *
  * This function is called by HMI servo debug mode to directly control servos.
- * It updates both the hardware PWM and the internal system_status so that
- * telemetry and display show the correct position.
+ * It updates both the hardware PWM and the internal solar_data (source of truth)
+ * so that telemetry and display show the correct position.
  *
  * Thread-safe with xSolarMutex.
  */
@@ -260,14 +275,13 @@ esp_err_t fluctus_servo_debug_set_position(ledc_channel_t channel, uint32_t duty
     esp_err_t ret = fluctus_servo_set_position(channel, duty_cycle);
 
     if (ret == ESP_OK) {
-        // Update internal state so telemetry reflects the new position
-        if (xSemaphoreTake(xPowerBusMutex, pdMS_TO_TICKS(FLUCTUS_MUTEX_TIMEOUT_QUICK_MS)) == pdTRUE) {
-            if (channel == FLUCTUS_SERVO_YAW_CHANNEL) {
-                system_status.current_yaw_duty = duty_cycle;
-            } else if (channel == FLUCTUS_SERVO_PITCH_CHANNEL) {
-                system_status.current_pitch_duty = duty_cycle;
-            }
-            xSemaphoreGive(xPowerBusMutex);
+        // Update solar_data (source of truth) so telemetry reflects the new position
+        if (channel == FLUCTUS_SERVO_YAW_CHANNEL) {
+            solar_data.current_yaw_duty = duty_cycle;
+            solar_data.yaw_position_percent = (uint8_t)fluctus_duty_to_percent(duty_cycle);
+        } else if (channel == FLUCTUS_SERVO_PITCH_CHANNEL) {
+            solar_data.current_pitch_duty = duty_cycle;
+            solar_data.pitch_position_percent = (uint8_t)fluctus_duty_to_percent(duty_cycle);
         }
     }
 
@@ -276,79 +290,135 @@ esp_err_t fluctus_servo_debug_set_position(ledc_channel_t channel, uint32_t duty
 }
 
 /**
- * @brief Calculate servo adjustment based on tracking error
+ * @brief Apply servo corrections with smooth, small adjustments (refactored)
  *
- * Implements proportional control with clamping:
- * - Error < threshold: No adjustment (within acceptable range)
- * - Error ≥ threshold: Proportional adjustment (scaled by 1000)
- * - Max adjustment: ±FLUCTUS_MAX_SERVO_ADJUSTMENT per cycle
+ * Replaces fluctus_apply_servo_corrections() with smaller step size for continuous tracking.
+ * Uses lower proportional gain (100 vs 1000) and smaller max step (15 vs 250) for smooth motion.
  *
- * @param error Tracking error in volts (from differential photoresistor calculation)
- * @param current_duty Current servo duty cycle value
- * @return New duty cycle value (clamped to safe servo limits)
- */
-uint32_t fluctus_calculate_servo_correction(float error, uint32_t current_duty)
-{
-    if (fabs(error) < FLUCTUS_PHOTORESISTOR_THRESHOLD) {
-        return current_duty; // No adjustment needed
-    }
-    
-    // Proportional control
-    int32_t adjustment = (int32_t)(error * 1000); // Scale factor
-    
-    // Limit adjustment magnitude
-    if (adjustment > FLUCTUS_MAX_SERVO_ADJUSTMENT) {
-        adjustment = FLUCTUS_MAX_SERVO_ADJUSTMENT;
-    } else if (adjustment < -FLUCTUS_MAX_SERVO_ADJUSTMENT) {
-        adjustment = -FLUCTUS_MAX_SERVO_ADJUSTMENT;
-    }
-    
-    int32_t new_duty = (int32_t)current_duty + adjustment;
-    
-    // Clamp to servo limits
-    if (new_duty < FLUCTUS_SERVO_MIN_DUTY) {
-        new_duty = FLUCTUS_SERVO_MIN_DUTY;
-    } else if (new_duty > FLUCTUS_SERVO_MAX_DUTY) {
-        new_duty = FLUCTUS_SERVO_MAX_DUTY;
-    }
-    
-    return (uint32_t)new_duty;
-}
-
-/**
- * @brief Apply servo corrections based on tracking data
+ * Thread-safe: Takes xSolarMutex to read/write solar_data (source of truth for servo positions).
+ *
  * @param tracking_data Tracking data with yaw/pitch errors
  * @return true if servos were updated
  */
-bool fluctus_apply_servo_corrections(fluctus_solar_snapshot_t *tracking_data)
+bool fluctus_apply_servo_corrections_smooth(fluctus_solar_data_t *tracking_data)
 {
-    uint32_t new_yaw_duty = fluctus_calculate_servo_correction(tracking_data->yaw_error,
-                                                    system_status.current_yaw_duty);
-    uint32_t new_pitch_duty = fluctus_calculate_servo_correction(tracking_data->pitch_error,
-                                                      system_status.current_pitch_duty);
+    // Calculate desired adjustment direction with small step size
+    int32_t yaw_adjustment = 0;
+    int32_t pitch_adjustment = 0;
 
+    if (fabsf(tracking_data->yaw_error) >= FLUCTUS_PHOTORESISTOR_THRESHOLD) {
+        // Proportional with small max step (lower gain for 250ms loop vs old 3s)
+        yaw_adjustment = (int32_t)(tracking_data->yaw_error * 100);  // Lower gain (was 1000)
+        if (yaw_adjustment > FLUCTUS_SERVO_MAX_STEP_PER_ITERATION) {
+            yaw_adjustment = FLUCTUS_SERVO_MAX_STEP_PER_ITERATION;
+        } else if (yaw_adjustment < -FLUCTUS_SERVO_MAX_STEP_PER_ITERATION) {
+            yaw_adjustment = -FLUCTUS_SERVO_MAX_STEP_PER_ITERATION;
+        }
+    }
+
+    if (fabsf(tracking_data->pitch_error) >= FLUCTUS_PHOTORESISTOR_THRESHOLD) {
+        pitch_adjustment = (int32_t)(tracking_data->pitch_error * 100);
+        if (pitch_adjustment > FLUCTUS_SERVO_MAX_STEP_PER_ITERATION) {
+            pitch_adjustment = FLUCTUS_SERVO_MAX_STEP_PER_ITERATION;
+        } else if (pitch_adjustment < -FLUCTUS_SERVO_MAX_STEP_PER_ITERATION) {
+            pitch_adjustment = -FLUCTUS_SERVO_MAX_STEP_PER_ITERATION;
+        }
+    }
+
+    // Take mutex to safely read/write servo positions in solar_data
+    if (xSemaphoreTake(xSolarMutex, pdMS_TO_TICKS(FLUCTUS_MUTEX_TIMEOUT_QUICK_MS)) != pdTRUE) {
+        ESP_LOGW(TAG, "Failed to take xSolarMutex for servo correction");
+        return false;
+    }
+
+    // Apply adjustments with clamping
     bool updated = false;
-    if (new_yaw_duty != system_status.current_yaw_duty) {
-        if (fluctus_servo_set_position(FLUCTUS_SERVO_YAW_CHANNEL, new_yaw_duty) == ESP_OK) {
-            system_status.current_yaw_duty = new_yaw_duty;
+
+    if (yaw_adjustment != 0) {
+        int32_t new_yaw = (int32_t)solar_data.current_yaw_duty + yaw_adjustment;
+        // Clamp to servo limits
+        if (new_yaw < FLUCTUS_SERVO_MIN_DUTY) {
+            new_yaw = FLUCTUS_SERVO_MIN_DUTY;
+        } else if (new_yaw > FLUCTUS_SERVO_MAX_DUTY) {
+            new_yaw = FLUCTUS_SERVO_MAX_DUTY;
+        }
+
+        if ((uint32_t)new_yaw != solar_data.current_yaw_duty) {
+            fluctus_servo_set_position(FLUCTUS_SERVO_YAW_CHANNEL, (uint32_t)new_yaw);
+            solar_data.current_yaw_duty = (uint32_t)new_yaw;
+            solar_data.yaw_position_percent = (uint8_t)fluctus_duty_to_percent((uint32_t)new_yaw);
             updated = true;
         }
     }
 
-    if (new_pitch_duty != system_status.current_pitch_duty) {
-        if (fluctus_servo_set_position(FLUCTUS_SERVO_PITCH_CHANNEL, new_pitch_duty) == ESP_OK) {
-            system_status.current_pitch_duty = new_pitch_duty;
+    if (pitch_adjustment != 0) {
+        int32_t new_pitch = (int32_t)solar_data.current_pitch_duty + pitch_adjustment;
+        // Clamp to servo limits
+        if (new_pitch < FLUCTUS_SERVO_MIN_DUTY) {
+            new_pitch = FLUCTUS_SERVO_MIN_DUTY;
+        } else if (new_pitch > FLUCTUS_SERVO_MAX_DUTY) {
+            new_pitch = FLUCTUS_SERVO_MAX_DUTY;
+        }
+
+        if ((uint32_t)new_pitch != solar_data.current_pitch_duty) {
+            fluctus_servo_set_position(FLUCTUS_SERVO_PITCH_CHANNEL, (uint32_t)new_pitch);
+            solar_data.current_pitch_duty = (uint32_t)new_pitch;
+            solar_data.pitch_position_percent = (uint8_t)fluctus_duty_to_percent((uint32_t)new_pitch);
             updated = true;
         }
     }
 
     if (updated) {
-        ESP_LOGD(TAG, "Correcting - Yaw: %lu, Pitch: %lu, Errors: %.3fV/%.3fV",
-                system_status.current_yaw_duty, system_status.current_pitch_duty,
+        ESP_LOGD(TAG, "Smooth correction - Yaw: %lu, Pitch: %lu, Errors: %.3fV/%.3fV",
+                solar_data.current_yaw_duty, solar_data.current_pitch_duty,
                 tracking_data->yaw_error, tracking_data->pitch_error);
     }
 
+    xSemaphoreGive(xSolarMutex);
     return updated;
+}
+
+/**
+ * @brief Update solar state with fresh sensor readings (refactored helper)
+ *
+ * Updates solar_data (SOURCE OF TRUTH) with fresh photoresistor readings and errors.
+ * Also updates STELLARIA with average light intensity.
+ *
+ * IMPORTANT: solar_data already contains current servo positions/tracking state,
+ * this function only updates sensor readings (photoresistors, errors, timestamp).
+ *
+ * @param reading Fresh photoresistor reading with errors calculated
+ */
+void fluctus_update_solar_cache(fluctus_solar_data_t *reading)
+{
+    if (reading == NULL) {
+        return;
+    }
+
+    // Update solar_data with fresh sensor readings (servo positions already up-to-date)
+    if (xSemaphoreTake(xSolarMutex, pdMS_TO_TICKS(FLUCTUS_MUTEX_TIMEOUT_QUICK_MS)) == pdTRUE) {
+        // Copy photoresistor data and errors
+        memcpy(solar_data.photoresistor_readings,
+               reading->photoresistor_readings,
+               sizeof(solar_data.photoresistor_readings));
+        solar_data.yaw_error = reading->yaw_error;
+        solar_data.pitch_error = reading->pitch_error;
+        solar_data.valid = reading->valid;
+        solar_data.timestamp = reading->timestamp;
+
+        // Update derived percent values from current duty cycles
+        solar_data.yaw_position_percent = (uint8_t)fluctus_duty_to_percent(solar_data.current_yaw_duty);
+        solar_data.pitch_position_percent = (uint8_t)fluctus_duty_to_percent(solar_data.current_pitch_duty);
+
+        xSemaphoreGive(xSolarMutex);
+    }
+
+    // Update STELLARIA with average light intensity
+    float avg_light = (reading->photoresistor_readings[0] +
+                       reading->photoresistor_readings[1] +
+                       reading->photoresistor_readings[2] +
+                       reading->photoresistor_readings[3]) / 4.0f;
+    stellaria_update_light_intensity(avg_light);
 }
 
 // ########################## Utility Functions ##########################
@@ -394,7 +464,7 @@ float fluctus_duty_to_percent(uint32_t duty)
  * Position: 10% yaw (left/east), 60% pitch (upward tilt)
  *
  * Includes servo power-up delay (200ms) to allow servos to settle before releasing power.
- * Updates system_status with final servo positions.
+ * Updates solar_data (source of truth) with final servo positions.
  *
  * @return ESP_OK on success, ESP_FAIL if any servo command fails
  */
@@ -407,8 +477,14 @@ esp_err_t fluctus_park_servos_night(void)
     esp_err_t ret2 = fluctus_servo_set_position(FLUCTUS_SERVO_PITCH_CHANNEL, pitch_duty);
 
     if (ret1 == ESP_OK && ret2 == ESP_OK) {
-        system_status.current_yaw_duty = yaw_duty;
-        system_status.current_pitch_duty = pitch_duty;
+        // Update solar_data (source of truth) with mutex protection
+        if (xSemaphoreTake(xSolarMutex, pdMS_TO_TICKS(FLUCTUS_MUTEX_TIMEOUT_QUICK_MS)) == pdTRUE) {
+            solar_data.current_yaw_duty = yaw_duty;
+            solar_data.current_pitch_duty = pitch_duty;
+            solar_data.yaw_position_percent = (uint8_t)FLUCTUS_SERVO_NIGHT_PARK_YAW_PERCENT;
+            solar_data.pitch_position_percent = (uint8_t)FLUCTUS_SERVO_NIGHT_PARK_PITCH_PERCENT;
+            xSemaphoreGive(xSolarMutex);
+        }
         ESP_LOGI(TAG, "Servos parked in night position (yaw=%.0f%%, pitch=%.0f%%)",
                  FLUCTUS_SERVO_NIGHT_PARK_YAW_PERCENT, FLUCTUS_SERVO_NIGHT_PARK_PITCH_PERCENT);
     }
@@ -428,7 +504,7 @@ esp_err_t fluctus_park_servos_night(void)
  * - Correction timeout occurs
  *
  * Includes servo power-up delay (200ms) to allow servos to settle before releasing power.
- * Updates system_status with final servo positions.
+ * Updates solar_data (source of truth) with final servo positions.
  *
  * @return ESP_OK on success, ESP_FAIL if any servo command fails
  */
@@ -441,8 +517,14 @@ esp_err_t fluctus_park_servos_error(void)
     esp_err_t ret2 = fluctus_servo_set_position(FLUCTUS_SERVO_PITCH_CHANNEL, pitch_duty);
 
     if (ret1 == ESP_OK && ret2 == ESP_OK) {
-        system_status.current_yaw_duty = yaw_duty;
-        system_status.current_pitch_duty = pitch_duty;
+        // Update solar_data (source of truth) with mutex protection
+        if (xSemaphoreTake(xSolarMutex, pdMS_TO_TICKS(FLUCTUS_MUTEX_TIMEOUT_QUICK_MS)) == pdTRUE) {
+            solar_data.current_yaw_duty = yaw_duty;
+            solar_data.current_pitch_duty = pitch_duty;
+            solar_data.yaw_position_percent = (uint8_t)FLUCTUS_SERVO_ERROR_PARK_YAW_PERCENT;
+            solar_data.pitch_position_percent = (uint8_t)FLUCTUS_SERVO_ERROR_PARK_PITCH_PERCENT;
+            xSemaphoreGive(xSolarMutex);
+        }
         ESP_LOGW(TAG, "Servos parked in error/center position (yaw=%.0f%%, pitch=%.0f%%)",
                  FLUCTUS_SERVO_ERROR_PARK_YAW_PERCENT, FLUCTUS_SERVO_ERROR_PARK_PITCH_PERCENT);
     }
@@ -473,7 +555,7 @@ bool fluctus_tracking_error_margin_check(float yaw_error, float pitch_error)
  * 1. Astronomical daytime check (cheap, always available)
  * 2. Photoresistor light intensity check (requires hardware)
  *
- * IMPORTANT: Updates global cached_solar_data with fresh photoresistor readings.
+ * IMPORTANT: Updates global solar_data with fresh photoresistor readings.
  * This cache is used by snapshot functions to avoid redundant photoresistor reads.
  *
  * Used by:
@@ -492,36 +574,19 @@ bool fluctus_is_daytime_with_sufficient_light(void)
 
     // Second check: Actual light intensity from photoresistors
     // Read fresh photoresistor data (populates photoresistor_readings, errors, valid, timestamp)
-    fluctus_solar_snapshot_t temp_data = {0};
+    fluctus_solar_data_t temp_data = {0};
     if (fluctus_read_photoresistors(&temp_data) != ESP_OK || !temp_data.valid) {
         return false;
     }
 
-    // Update global cache with fresh photoresistor data + current servo state
-    if (xSemaphoreTake(xSolarMutex, pdMS_TO_TICKS(FLUCTUS_MUTEX_TIMEOUT_QUICK_MS)) == pdTRUE) {
-        // Copy photoresistor data
-        memcpy(cached_solar_data.photoresistor_readings, temp_data.photoresistor_readings, sizeof(cached_solar_data.photoresistor_readings));
-        cached_solar_data.yaw_error = temp_data.yaw_error;
-        cached_solar_data.pitch_error = temp_data.pitch_error;
-        cached_solar_data.valid = temp_data.valid;
-        cached_solar_data.timestamp = temp_data.timestamp;
+    // Update global cache with fresh photoresistor data (also updates STELLARIA)
+    fluctus_update_solar_cache(&temp_data);
 
-        // Add current servo positions and state
-        cached_solar_data.tracking_state = system_status.solar_tracking_state;
-        cached_solar_data.current_yaw_duty = system_status.current_yaw_duty;
-        cached_solar_data.current_pitch_duty = system_status.current_pitch_duty;
-        cached_solar_data.yaw_position_percent = (uint8_t)fluctus_duty_to_percent(system_status.current_yaw_duty);
-        cached_solar_data.pitch_position_percent = (uint8_t)fluctus_duty_to_percent(system_status.current_pitch_duty);
-
-        xSemaphoreGive(xSolarMutex);
-    }
-
-    // Calculate average light and update STELLARIA
+    // Calculate average light for threshold check
     float avg_light = (temp_data.photoresistor_readings[0] +
                       temp_data.photoresistor_readings[1] +
                       temp_data.photoresistor_readings[2] +
                       temp_data.photoresistor_readings[3]) / 4.0f;
-    stellaria_update_light_intensity(avg_light);
 
     // Combined decision: astronomical daytime AND sufficient light detected
     return (avg_light >= FLUCTUS_SOLAR_LIGHT_THRESHOLD);
@@ -529,13 +594,16 @@ bool fluctus_is_daytime_with_sufficient_light(void)
 
 /**
  * @brief Thread-safe state transition with logging
+ *
+ * Updates solar_data.tracking_state (source of truth) with mutex protection.
+ *
  * @param new_state Target state
  * @param log_msg Log message (NULL to skip logging)
  */
 void fluctus_set_tracking_state(solar_tracking_state_t new_state, const char *log_msg)
 {
     if (xSemaphoreTake(xSolarMutex, pdMS_TO_TICKS(FLUCTUS_MUTEX_TIMEOUT_QUICK_MS)) == pdTRUE) {
-        system_status.solar_tracking_state = new_state;
+        solar_data.tracking_state = new_state;
         if (log_msg) {
             ESP_LOGI(TAG, "%s", log_msg);
         }
@@ -587,9 +655,13 @@ void fluctus_solar_state_standby(int64_t current_time_ms)
             vTaskDelay(pdMS_TO_TICKS(FLUCTUS_SERVO_POWERUP_DELAY_MS));
             correction_start_time = current_time_ms;
             last_correction_time = current_time_ms;
+
+            // Resume servo control task for smooth tracking
+            vTaskResume(xFluctusSolarServoControlTaskHandle);
+
             fluctus_set_tracking_state(SOLAR_TRACKING_CORRECTING,
-                solar_debug_mode_active ? "Starting DEBUG correction cycle (6.6V bus powered on)" :
-                                         "Starting correction cycle (6.6V bus powered on)");
+                solar_debug_mode_active ? "Starting DEBUG correction cycle (6.6V bus powered on, servo task resumed)" :
+                                         "Starting correction cycle (6.6V bus powered on, servo task resumed)");
         } else {
             ESP_LOGE(TAG, "Failed to power 6.6V bus for solar tracking");
         }
@@ -597,81 +669,97 @@ void fluctus_solar_state_standby(int64_t current_time_ms)
 }
 
 /**
- * @brief Handle CORRECTING state - continuous servo adjustments
+ * @brief Handle CORRECTING state - blocking entry function with exit condition handling
  *
- * Runs every 5 seconds during active tracking to adjust servo positions.
- * Checks for sunset, convergence, and timeout conditions.
+ * This function is called ONCE when entering CORRECTING state. It performs:
+ * 1. ONE-TIME daytime/light check at entry
+ * 2. Power up 6.6V bus and resume servo control task
+ * 3. BLOCK waiting for completion notifications (CONVERGED/TIMEOUT/DISABLE)
+ * 4. Handle exit conditions and clean up (power off, set next state)
+ *
+ * BLOCKING DESIGN:
+ * - Uses xTaskNotifyWait() to block until servo task completes or is interrupted
+ * - 45s safety timeout prevents indefinite blocking if servo task hangs
+ * - Can be interrupted by DISABLE notification (user or critical power)
+ *
+ * SEPARATION OF CONCERNS:
+ * - This function: Entry checks, power management, blocking wait, cleanup
+ * - Servo control task: Timeout monitoring, sensor reads, servo control, convergence detection
+ *
  * In debug mode, bypasses daytime checks for continuous testing.
- *
- * OPTIMIZATION: Uses cached photoresistor data from fluctus_is_daytime_with_sufficient_light()
- * to avoid redundant ADC reads (reduces correction cycle time by ~1s).
- *
- * @param current_time_ms Current time in milliseconds (for timeout check)
  */
-void fluctus_solar_state_correcting(int64_t current_time_ms)
+void fluctus_solar_state_correcting(void)
 {
-    // In debug mode, skip sunset checks and continue correcting
-    if (!solar_debug_mode_active) {
-        // Normal mode: Check if sunset occurred - abort correction and park
-        // NOTE: This call updates cached_solar_data with fresh photoresistor readings
-        if (!fluctus_is_daytime_with_sufficient_light()) {
-            fluctus_release_bus_power(POWER_BUS_6V6, "FLUCTUS_SOLAR");
-
-            // Insufficient light detected - determine if it's true sunset or just cloudy
-            if (solar_calc_is_daytime_buffered()) {
-                // Cloudy during correction - abort but stay in STANDBY
-                fluctus_set_tracking_state(SOLAR_TRACKING_STANDBY, "Insufficient light during correction - aborting cycle");
-            } else {
-                // True sunset during correction
-                current_parking_reason = PARKING_REASON_SUNSET;
-                fluctus_set_tracking_state(SOLAR_TRACKING_PARKING, "Sunset during correction - aborting");
-            }
-            return;
+    // ===== ENTRY: ONE-TIME DAYTIME/LIGHT CHECK =====
+    if (!solar_debug_mode_active && !fluctus_is_daytime_with_sufficient_light()) {
+        // Insufficient light detected - determine if it's true sunset or just cloudy
+        if (solar_calc_is_daytime_buffered()) {
+            // Cloudy during daytime - abort, retry next interval
+            fluctus_set_tracking_state(SOLAR_TRACKING_STANDBY,
+                "Insufficient light for correction - will retry");
+        } else {
+            // True sunset
+            current_parking_reason = PARKING_REASON_SUNSET;
+            fluctus_set_tracking_state(SOLAR_TRACKING_PARKING,
+                "Sunset detected - parking");
         }
-    } else {
-        // Debug mode: Skip daytime checks, but still read photoresistors for debugging
-        ESP_LOGD(TAG, "Debug mode active in CORRECTING - bypassing sunset checks");
-        // Still need to read photoresistors for servo correction
-        fluctus_read_photoresistors(&cached_solar_data);
-    }
-
-    // Use cached photoresistor data (just updated by daytime check above)
-    fluctus_solar_snapshot_t tracking_data;
-    if (xSemaphoreTake(xSolarMutex, pdMS_TO_TICKS(FLUCTUS_MUTEX_TIMEOUT_QUICK_MS)) == pdTRUE) {
-        memcpy(&tracking_data, &cached_solar_data, sizeof(fluctus_solar_snapshot_t));
-        xSemaphoreGive(xSolarMutex);
-    } else {
-        ESP_LOGW(TAG, "Failed to access cached solar data during correction");
         return;
     }
 
-    if (!tracking_data.valid) {
-        ESP_LOGW(TAG, "Cached photoresistor data invalid during correction");
-        return;
-    }
-
-    // NOTE: No need to explicitly update TELEMETRY here - the main cache is updated
-    // via cached_solar_data which is populated by fluctus_is_daytime_with_sufficient_light()
-    // The REALTIME telemetry_fetch_snapshot() at fluctus_monitoring_task will pick up the latest cached data
-
-    // Check if errors are acceptable (correction complete)
-    if (fluctus_tracking_error_margin_check(tracking_data.yaw_error, tracking_data.pitch_error)) {
-        fluctus_release_bus_power(POWER_BUS_6V6, "FLUCTUS_SOLAR");
-        consecutive_tracking_errors = 0;  // Reset error counter on successful correction
-        fluctus_set_tracking_state(SOLAR_TRACKING_STANDBY, "Correction complete - errors within threshold (6.6V bus powered off)");
-        return;
-    }
-
-    // Check for timeout
-    int64_t correction_duration = current_time_ms - correction_start_time;
-    if (correction_duration >= FLUCTUS_TRACKING_ADJUSTMENT_CYCLE_TIMEOUT_MS) {
-        ESP_LOGW(TAG, "Correction timeout after %lld ms - entering error state", correction_duration);
+    // ===== POWER UP AND START SERVO TASK =====
+    if (fluctus_request_bus_power(POWER_BUS_6V6, "FLUCTUS_SOLAR") != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to power 6.6V bus for correction");
         fluctus_set_tracking_state(SOLAR_TRACKING_ERROR, NULL);
         return;
     }
 
-    // Apply servo corrections
-    fluctus_apply_servo_corrections(&tracking_data);
+    vTaskDelay(pdMS_TO_TICKS(FLUCTUS_SERVO_POWERUP_DELAY_MS));
+    correction_start_time = esp_timer_get_time() / 1000;
+
+    // Resume servo task - it will notify us when done
+    vTaskResume(xFluctusSolarServoControlTaskHandle);
+    ESP_LOGI(TAG, "Correction cycle started (6.6V powered, servo task resumed)");
+
+    // ===== BLOCK: WAIT FOR COMPLETION OR DISABLE (30s timeout) =====
+    uint32_t notification = 0;
+    BaseType_t notified = xTaskNotifyWait(
+        0,  // Don't clear on entry
+        FLUCTUS_NOTIFY_SERVO_CONVERGED | FLUCTUS_NOTIFY_SOLAR_DISABLE,
+        &notification,
+        pdMS_TO_TICKS(FLUCTUS_TRACKING_ADJUSTMENT_CYCLE_TIMEOUT_MS)  // 30s timeout
+    );
+
+    // ===== CHECK FOR TIMEOUT (no notification received in 30s) =====
+    if (notified == pdFALSE || notification == 0) {
+        ESP_LOGW(TAG, "Correction timeout after 30s - suspending servo task");
+        vTaskSuspend(xFluctusSolarServoControlTaskHandle);
+        // Don't release power - ERROR handler will release it
+        fluctus_set_tracking_state(SOLAR_TRACKING_ERROR, "Correction timeout");
+        return;
+    }
+
+    // ===== HANDLE DISABLE (interrupt during correction) =====
+    if (notification & FLUCTUS_NOTIFY_SOLAR_DISABLE) {
+        ESP_LOGI(TAG, "Disable requested during correction - aborting");
+        vTaskSuspend(xFluctusSolarServoControlTaskHandle);
+        // Don't release power - PARKING handler will release it
+
+        // Check if it's user disable or critical power
+        if (current_parking_reason != PARKING_REASON_CRITICAL_POWER) {
+            current_parking_reason = PARKING_REASON_USER_DISABLE;
+        }
+        fluctus_set_tracking_state(SOLAR_TRACKING_PARKING, "Disabled during correction");
+        return;
+    }
+
+    // ===== HANDLE CONVERGENCE =====
+    if (notification & FLUCTUS_NOTIFY_SERVO_CONVERGED) {
+        ESP_LOGI(TAG, "Correction converged successfully");
+        consecutive_tracking_errors = 0;  // Reset error counter on success
+        // Release power here - STANDBY doesn't handle power release
+        fluctus_release_bus_power(POWER_BUS_6V6, "FLUCTUS_SOLAR");
+        fluctus_set_tracking_state(SOLAR_TRACKING_STANDBY, "Correction complete");
+    }
 }
 
 /**
@@ -770,6 +858,90 @@ void fluctus_on_sunrise_callback(void)
     }
 }
 
+// ########################## Servo Control Task (Refactored Smooth Tracking) ##########################
+
+/**
+ * @brief Servo control task for smooth, continuous solar tracking corrections
+ *
+ * Runs at 250ms intervals during CORRECTING state to provide fluid servo motion.
+ * Replaces the old 3-second correction cycles with many small adjustments.
+ *
+ * BEHAVIOR:
+ * - Created at init, starts SUSPENDED
+ * - Resumed when state machine enters CORRECTING state
+ * - Runs 250ms loop:
+ *   1. Read all 4 photoresistors (~44ms)
+ *   2. Calculate yaw/pitch errors
+ *   3. Update solar_data for telemetry
+ *   4. If errors below threshold: increment settling counter (12 iterations = 3s)
+ *   5. If errors above threshold: reset counter, apply small correction (max 15 duty units)
+ *   6. If settled for 3s: notify CONVERGED, suspend self
+ * - Suspended on convergence (or forcibly by state machine on timeout/disable)
+ *
+ * SEPARATION OF CONCERNS:
+ * - State machine: Daytime check, timeout (via xTaskNotifyWait), power management
+ * - This task: Sensor reads, servo control, convergence detection
+ *
+ * Thread-safe with xSolarMutex for cache updates.
+ */
+void fluctus_solar_servo_correction_task(void *parameters)
+{
+    ESP_LOGI(TAG, "Servo control task started (will run suspended until CORRECTING state)");
+
+    while (true) {
+        servo_control_active = true;
+        total_correction_iterations++;
+
+        // ===== READ PHOTORESISTORS =====
+        fluctus_solar_data_t reading = {0};
+        esp_err_t read_ret = fluctus_read_photoresistors(&reading);
+        if (read_ret != ESP_OK || !reading.valid) {
+            ESP_LOGW(TAG, "Servo control: Failed to read photoresistors, retrying next cycle");
+            vTaskDelay(pdMS_TO_TICKS(FLUCTUS_SERVO_CONTROL_LOOP_MS));
+            continue;
+        }
+
+        // Update cache for telemetry (thread-safe, also updates STELLARIA)
+        fluctus_update_solar_cache(&reading);
+
+        // ===== CHECK ERROR THRESHOLD =====
+        bool within_threshold = fluctus_tracking_error_margin_check(reading.yaw_error, reading.pitch_error);
+
+        if (within_threshold) {
+            // Errors acceptable - increment settling counter
+            settling_counter++;
+            ESP_LOGD(TAG, "Servo control: Within threshold (%d/%d) - Yaw: %.3fV, Pitch: %.3fV",
+                     settling_counter, FLUCTUS_SERVO_SETTLING_COUNT,
+                     reading.yaw_error, reading.pitch_error);
+
+            if (settling_counter >= FLUCTUS_SERVO_SETTLING_COUNT) {
+                // ===== CONVERGED =====
+                ESP_LOGI(TAG, "Servo control: CONVERGED after %d iterations (%.1fs total, 3s settling)",
+                         total_correction_iterations,
+                         (float)total_correction_iterations * FLUCTUS_SERVO_CONTROL_LOOP_MS / 1000.0f);
+                xTaskNotify(xFluctusSolarTrackingTaskHandle,
+                           FLUCTUS_NOTIFY_SERVO_CONVERGED, eSetBits);
+                settling_counter = 0;
+                total_correction_iterations = 0;
+                servo_control_active = false;
+                vTaskSuspend(NULL);  // Suspend until next correction cycle
+                // On resume, counters already reset
+                continue;
+            }
+        } else {
+            // Errors too large - reset settling counter and apply correction
+            if (settling_counter > 0) {
+                ESP_LOGD(TAG, "Servo control: Error exceeded threshold - resetting settling counter");
+            }
+            settling_counter = 0;
+            fluctus_apply_servo_corrections_smooth(&reading);
+        }
+
+        // Wait for next control loop iteration
+        vTaskDelay(pdMS_TO_TICKS(FLUCTUS_SERVO_CONTROL_LOOP_MS));
+    }
+}
+
 // ########################## Solar Tracking Main Task ##########################
 
 /**
@@ -778,7 +950,7 @@ void fluctus_on_sunrise_callback(void)
  * Uses task notifications for efficient power management:
  * - DISABLED: Wait indefinitely for ENABLE notification (no CPU usage)
  * - STANDBY: 15-minute intervals for correction cycles
- * - CORRECTING: 5-second updates during active tracking
+ * - CORRECTING: 3-second updates during active tracking
  * - PARKING/ERROR: Execute immediately
  *
  * Notifications:
@@ -793,24 +965,10 @@ void fluctus_solar_tracking_task(void *parameters)
     while (true) {
         // Read current state and perform safety checks
         bool debug_mode_active_snapshot = false;  // Thread-safe local copy
-        if (xSemaphoreTake(xSolarMutex, pdMS_TO_TICKS(FLUCTUS_MUTEX_TIMEOUT_QUICK_MS)) == pdTRUE) {
-            current_state = system_status.solar_tracking_state;
 
-            // Safety check: Disable tracking if shutdown or critical power
-            if (system_status.safety_shutdown ||
-                system_status.power_state >= FLUCTUS_POWER_STATE_CRITICAL) {
-                if (current_state != SOLAR_TRACKING_DISABLED) {
-                    system_status.solar_tracking_state = SOLAR_TRACKING_DISABLED;
-                    current_state = SOLAR_TRACKING_DISABLED;
-                    ESP_LOGW(TAG, "Solar tracking disabled due to safety or power state");
-                }
-                // Also disable debug mode if shutdown or critical power active
-                if (solar_debug_mode_active) {
-                    solar_debug_mode_active = false;
-                    debug_mode_start_time = 0;
-                    ESP_LOGI(TAG, "Debug mode disabled due to safety/power state");
-                }
-            }
+        // Read solar tracking state (protected by xSolarMutex)
+        if (xSemaphoreTake(xSolarMutex, pdMS_TO_TICKS(FLUCTUS_MUTEX_TIMEOUT_QUICK_MS)) == pdTRUE) {
+            current_state = solar_data.tracking_state;
 
             // Check debug mode timeout (90 seconds)
             if (solar_debug_mode_active && debug_mode_start_time > 0) {
@@ -822,12 +980,40 @@ void fluctus_solar_tracking_task(void *parameters)
                 }
             }
 
-            // Take thread-safe snapshot of debug mode flag for timeout calculation
+            // Take thread-safe snapshot of debug mode flag
             debug_mode_active_snapshot = solar_debug_mode_active;
 
             xSemaphoreGive(xSolarMutex);
         } else {
             continue;
+        }
+
+        // Safety check: Read power state (protected by xPowerBusMutex)
+        bool safety_override = false;
+        if (xSemaphoreTake(xPowerBusMutex, pdMS_TO_TICKS(FLUCTUS_MUTEX_TIMEOUT_QUICK_MS)) == pdTRUE) {
+            if (system_status.safety_shutdown ||
+                system_status.power_state >= FLUCTUS_POWER_STATE_CRITICAL) {
+                safety_override = true;
+            }
+            xSemaphoreGive(xPowerBusMutex);
+        }
+
+        // Apply safety override if needed (write to solar_data)
+        if (safety_override && current_state != SOLAR_TRACKING_DISABLED) {
+            if (xSemaphoreTake(xSolarMutex, pdMS_TO_TICKS(FLUCTUS_MUTEX_TIMEOUT_QUICK_MS)) == pdTRUE) {
+                solar_data.tracking_state = SOLAR_TRACKING_DISABLED;
+                current_state = SOLAR_TRACKING_DISABLED;
+
+                // Also disable debug mode
+                if (solar_debug_mode_active) {
+                    solar_debug_mode_active = false;
+                    debug_mode_start_time = 0;
+                    ESP_LOGI(TAG, "Debug mode disabled due to safety/power state");
+                }
+
+                xSemaphoreGive(xSolarMutex);
+                ESP_LOGW(TAG, "Solar tracking disabled due to safety or power state");
+            }
         }
 
         // Determine timeout based on current state
@@ -846,7 +1032,9 @@ void fluctus_solar_tracking_task(void *parameters)
                 }
                 break;
             case SOLAR_TRACKING_CORRECTING:
-                timeout = pdMS_TO_TICKS(FLUCTUS_TRACKING_ADJUSTMENT_DURATION_MS);  // 3 seconds for single correction cycle
+                // CORRECTING blocks inside its function - should not reach here normally
+                // If we do reach here, state was already set by correcting function
+                timeout = 0;  // Execute immediately to handle new state
                 break;
             case SOLAR_TRACKING_PARKING:
             case SOLAR_TRACKING_ERROR:
@@ -890,6 +1078,8 @@ void fluctus_solar_tracking_task(void *parameters)
                 }
                 continue;  // Skip to next iteration
             }
+            // Note: SERVO_CONVERGED and SERVO_TIMEOUT notifications are handled inside
+            // fluctus_solar_state_correcting() which blocks waiting for them
         }
 
         // Get current time for state machine execution
@@ -911,7 +1101,7 @@ void fluctus_solar_tracking_task(void *parameters)
                 break;
 
             case SOLAR_TRACKING_CORRECTING:
-                fluctus_solar_state_correcting(current_time_ms);
+                fluctus_solar_state_correcting();
                 break;
 
             case SOLAR_TRACKING_PARKING:
@@ -1004,6 +1194,9 @@ esp_err_t fluctus_disable_solar_tracking(void)
 
 /**
  * @brief Get current solar tracking state (lightweight, no snapshot fetch)
+ *
+ * Reads from solar_data.tracking_state (source of truth).
+ *
  * @return Current solar_tracking_state_t value
  * @note Thread-safe, uses quick mutex with 100ms timeout. Returns DISABLED on mutex timeout.
  */
@@ -1015,7 +1208,7 @@ solar_tracking_state_t fluctus_get_solar_tracking_state(void)
 
     solar_tracking_state_t state = SOLAR_TRACKING_DISABLED;
     if (xSemaphoreTake(xSolarMutex, pdMS_TO_TICKS(FLUCTUS_MUTEX_TIMEOUT_QUICK_MS)) == pdTRUE) {
-        state = system_status.solar_tracking_state;
+        state = solar_data.tracking_state;
         xSemaphoreGive(xSolarMutex);
     }
 
