@@ -53,7 +53,7 @@ esp_err_t impluvium_gpio_init(void)
  */
 esp_err_t impluvium_pump_init(void)
 {
-    // Config timer
+    // --- PWM mode (1kHz, 10-bit) ---
     ledc_timer_config_t timer_config = {
         .speed_mode = LEDC_LOW_SPEED_MODE,
         .timer_num = PUMP_PWM_TIMER,
@@ -68,13 +68,12 @@ esp_err_t impluvium_pump_init(void)
         return ret;
     }
 
-    // Configure pump PWM channel
     ledc_channel_config_t channel_config = {
         .gpio_num = PUMP_PWM_GPIO,
         .speed_mode = LEDC_LOW_SPEED_MODE,
         .channel = PUMP_PWM_CHANNEL,
         .timer_sel = PUMP_PWM_TIMER,
-        .duty = 0, // Start with pump off
+        .duty = 0,
         .hpoint = 0,
     };
 
@@ -84,8 +83,27 @@ esp_err_t impluvium_pump_init(void)
         return ret;
     }
 
-    ESP_LOGI(TAG, "Pump PWM initialized - GPIO42, 1kHz, 10bit");
+    ESP_LOGI(TAG, "Pump PWM initialized - GPIO46, 1kHz, 10bit");
     return ESP_OK;
+
+    // --- ON/OFF mode (binary GPIO control) - disabled ---
+    /*
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << PUMP_PWM_GPIO),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    esp_err_t ret = gpio_config(&io_conf);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to configure pump GPIO: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    gpio_set_level(PUMP_PWM_GPIO, 0);
+    ESP_LOGI(TAG, "Pump initialized as ON/OFF - GPIO%d", PUMP_PWM_GPIO);
+    return ESP_OK;
+    */
 }
 
 /**
@@ -154,12 +172,12 @@ esp_err_t impluvium_flow_sensor_init(void)
  */
 esp_err_t impluvium_set_pump_speed(uint32_t pwm_duty)
 {
-    // Enforce pump speed limits
+    // --- PWM mode ---
     if (pwm_duty > 1023) {
         pwm_duty = PUMP_MAX_DUTY;
     }
     if (pwm_duty > 0 && pwm_duty < PUMP_MIN_DUTY) {
-        ESP_LOGW(TAG, "Pump duty %" PRIu32 " below minimum %d , adjusting", pwm_duty, PUMP_MIN_DUTY);
+        ESP_LOGW(TAG, "Pump duty %" PRIu32 " below minimum %d, adjusting", pwm_duty, PUMP_MIN_DUTY);
         pwm_duty = PUMP_MIN_DUTY;
     }
 
@@ -171,10 +189,18 @@ esp_err_t impluvium_set_pump_speed(uint32_t pwm_duty)
     }
 
     if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "Pump speed set to %" PRIu32 " /1023 (%.1f%%)", pwm_duty, (pwm_duty / 1023.0f) * 100.0f);
+        ESP_LOGI(TAG, "Pump speed set to %" PRIu32 "/1023 (%.1f%%)", pwm_duty, (pwm_duty / 1023.0f) * 100.0f);
     }
-
     return ret;
+
+    // --- ON/OFF mode - disabled ---
+    /*
+    uint8_t level = (pwm_duty > 0) ? 1 : 0;
+    irrigation_system.pump_pwm_duty = level ? PUMP_MAX_DUTY : 0;
+    esp_err_t ret = gpio_set_level(PUMP_PWM_GPIO, level);
+    if (ret == ESP_OK) ESP_LOGI(TAG, "Pump %s", level ? "ON" : "OFF");
+    return ret;
+    */
 }
 
 /**
@@ -193,52 +219,55 @@ esp_err_t impluvium_set_pump_speed(uint32_t pwm_duty)
  */
 esp_err_t impluvium_pump_speed_ramping(uint8_t zone_id, pump_ramp_direction_t direction)
 {
+    // --- PWM ramp mode ---
+    // Note: safety monitoring during ramp is intentionally delegated to irrigation_monitoring_task,
+    // which is notified to start immediately after this function returns in impluvium_state_watering().
     uint32_t start_duty, target_duty, ramp_duration_ms;
-    int steps = 100; // 100 steps for a smooth ramp
+    int steps = 10;
 
     if (direction == PUMP_RAMP_UP) {
         ESP_LOGI(TAG, "Ramping up pump for zone %d...", zone_id);
         start_duty = PUMP_MIN_DUTY;
         target_duty = irrigation_zones[zone_id].learning.calculated_pump_duty_cycle;
         ramp_duration_ms = PUMP_RAMPUP_TIME_MS;
-    } else { // PUMP_RAMP_DOWN
+    } else {
         ESP_LOGI(TAG, "Ramping down pump for zone %d...", zone_id);
-        start_duty = irrigation_system.pump_pwm_duty; // Current duty
+        start_duty = irrigation_system.pump_pwm_duty;
         target_duty = 0;
         ramp_duration_ms = PUMP_RAMPDOWN_TIME_MS;
     }
 
     uint32_t step_delay = ramp_duration_ms / steps;
 
-    // Calculate how often to perform safety checks - align with monitoring task interval
-    int safety_check_interval = WATERING_MONITORING_INTERVAL_MS / step_delay;
-    if (safety_check_interval < 1) {
-        safety_check_interval = 1;  // At least check every step if ramp is very slow
-    }
-
     for (int i = 0; i <= steps; i++) {
-        // Periodic safety check (throttled to WATERING_MONITORING_INTERVAL_MS intervals)
-        if (i % safety_check_interval == 0) {
-            const char *failure_reason = NULL;
-            impluvium_periodic_safety_check(&failure_reason, 0);  // Pass 0 to skip flow check
-            if (failure_reason != NULL) {
-                ESP_LOGE(TAG, "Safety failure during pump ramp: %s", failure_reason);
-                impluvium_set_pump_speed(0);
-                return ESP_FAIL;
-            }
-        }
-
         int32_t duty_delta = (int32_t)target_duty - (int32_t)start_duty;
         uint32_t duty = start_duty + (duty_delta * i) / steps;
+        if (direction == PUMP_RAMP_DOWN && duty > 0 && duty < PUMP_MIN_DUTY) duty = 0;
         if (impluvium_set_pump_speed(duty) != ESP_OK) {
             ESP_LOGE(TAG, "Failed to set pump speed during ramp");
             return ESP_FAIL;
         }
         vTaskDelay(pdMS_TO_TICKS(step_delay));
     }
-
     ESP_LOGI(TAG, "Pump ramp complete for zone %d at %" PRIu32 " duty.", zone_id, target_duty);
     return ESP_OK;
+
+    // --- ON/OFF mode - disabled ---
+    /*
+    if (direction == PUMP_RAMP_UP) {
+        const char *failure_reason = NULL;
+        impluvium_periodic_safety_check(&failure_reason, 0);
+        if (failure_reason != NULL) {
+            ESP_LOGE(TAG, "Safety failure before pump start: %s", failure_reason);
+            return ESP_FAIL;
+        }
+        ESP_LOGI(TAG, "Pump ON for zone %d", zone_id);
+        return impluvium_set_pump_speed(PUMP_MAX_DUTY);
+    } else {
+        ESP_LOGI(TAG, "Pump OFF for zone %d", zone_id);
+        return impluvium_set_pump_speed(0);
+    }
+    */
 }
 
 /**

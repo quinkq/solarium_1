@@ -39,7 +39,6 @@
 // Zone settings
 #define ZONE_DEFAULT_MOISTURE_DEADBAND 5.0f; // +/- 5% default deadband
 #define ZONE_DEFAULT_MOISTURE_TARGET 40.0f;  // 40% default target
-// #define ZONE_MOISTURE_TARGET_OFFSET 2.0f;    // DEPRECATED: Replaced by dynamic cutoff using soil_redistribution_factor
 
 // Sensor Retry Settings
 #define SENSOR_READ_MAX_RETRIES 3     // Maximum retry attempts for sensor readings
@@ -50,12 +49,12 @@
 #define PUMP_PWM_RESOLUTION LEDC_TIMER_10_BIT
 #define PUMP_PWM_TIMER LEDC_TIMER_0  // Dedicated timer for pump (avoid sharing with Stellaria)
 #define PUMP_PWM_CHANNEL LEDC_CHANNEL_4  // Changed from 2 to avoid conflict with pitch servo
-#define PUMP_MIN_DUTY 434 // 42% minimum duty cycle (pump stall protection)
+#define PUMP_MIN_DUTY 511 // 50% minimum duty cycle (pump stall protection)
 #define PUMP_MAX_DUTY 1023
-#define PUMP_DEFAULT_DUTY 512 // 50% default startup duty cycle
+#define PUMP_DEFAULT_DUTY 664 // default startup duty cycle
 // Dynamic Pump Control Settings
-#define PUMP_RAMPUP_TIME_MS 5000        // 5-second ramp-up time
-#define PUMP_RAMPDOWN_TIME_MS 3000      // 3-second ramp-down time (gentler hardware stress)
+#define PUMP_RAMPUP_TIME_MS 2000        // 2-second ramp-up time
+#define PUMP_RAMPDOWN_TIME_MS 1000      // 1-second ramp-down time (gentler hardware stress)
 
 // Flow and Monitoring
 #define WATERING_MONITORING_INTERVAL_MS 500      // 500ms monitoring during watering

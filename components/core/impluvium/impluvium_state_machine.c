@@ -195,7 +195,7 @@ esp_err_t impluvium_state_measuring(void)
             } else {
                 // Moisture within acceptable range
                 ESP_LOGI(TAG,
-                         "Zone %d: SKIPPED - moisture %.1f%% within target %.1f%% ±%.1f%% (deficit %.1f%%)",
+                         "Zone %d: SKIPPED - moisture %.1f%% within target %.1f%% +%.1f%% (deficit %.1f%%)",
                          zone_id,
                          moisture_percent,
                          zone->target_moisture_percent,
@@ -540,8 +540,12 @@ esp_err_t impluvium_state_stopping(void)
     irrigation_system.last_moisture_check = xTaskGetTickCount() * portTICK_PERIOD_MS;
 
     if (graceful_stop) {
-        // Graceful stop - go directly to DISABLED (skip MAINTENANCE)
+        // Graceful stop (user request) - go directly to DISABLED (skip MAINTENANCE)
         ESP_LOGI(TAG, "Graceful stop complete - transitioning to DISABLED");
+        impluvium_change_state(IMPLUVIUM_DISABLED);
+    } else if (irrigation_system.load_shed_shutdown) {
+        // Full cycle completed while load shed was pending - disable without re-queuing
+        ESP_LOGI(TAG, "Load shed cycle complete - transitioning to DISABLED");
         impluvium_change_state(IMPLUVIUM_DISABLED);
     } else {
         // Normal completion - go to MAINTENANCE for telemetry

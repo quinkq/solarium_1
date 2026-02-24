@@ -523,9 +523,17 @@ static void impluvium_task(void *pvParameters)
 
                 switch (current_state) {
                     case IMPLUVIUM_STANDBY:
-                        // Check for delayed verification
-                        if (irrigation_system.verification_pending) {
+                        // Check for delayed verification - only when the 5-min timer fires,
+                        // not during the same task activation that set verification_pending
+                        if ((notification_value & IRRIGATION_TASK_NOTIFY_VERIFICATION_DUE) &&
+                            irrigation_system.verification_pending) {
+                            // Release mutex during verification: the function blocks for ~1.3s
+                            // (1000ms stabilization delay + ADC reads). Holding the mutex that
+                            // long causes impluvium_set_shutdown() to timeout at 1000ms when
+                            // FLUCTUS triggers a load-shedding state change during this window.
+                            xSemaphoreGive(xIrrigationMutex);
                             impluvium_update_redistribution_from_delayed_readings();
+                            xSemaphoreTake(xIrrigationMutex, portMAX_DELAY);
                         }
                         // Otherwise, do nothing and wait for notification
                         break;
@@ -1086,28 +1094,53 @@ esp_err_t impluvium_set_shutdown(bool shutdown, impluvium_shutdown_reason_t reas
         ESP_LOGI(TAG, "System shutdown requested via %s", reason_str);
         irrigation_system.shutdown_reason = reason;
 
-        if (irrigation_system.state == IMPLUVIUM_WATERING ||
-            irrigation_system.state == IMPLUVIUM_STOPPING) {
-            // GRACEFUL STOP: Let current zone finish, then disable
-            // The state machine will check this flag in impluvium_state_stopping()
+        bool mid_cycle = (irrigation_system.state == IMPLUVIUM_MEASURING ||
+                          irrigation_system.state == IMPLUVIUM_WATERING ||
+                          irrigation_system.state == IMPLUVIUM_STOPPING);
+
+        if (reason == IMPLUVIUM_SHUTDOWN_LOAD_SHED && mid_cycle) {
+            // Load shed during active cycle: only CRITICAL interrupts immediately
+            fluctus_power_state_t pwr = fluctus_get_power_state();
+            if (pwr == FLUCTUS_POWER_STATE_CRITICAL) {
+                ESP_LOGW(TAG, "CRITICAL power during active cycle - triggering emergency stop");
+                xSemaphoreGive(xIrrigationMutex);
+                impluvium_perform_emergency_stop(NULL);
+                return ESP_OK;
+            }
+            // Non-critical: complete all queued zones before disabling.
+            // load_shed_shutdown flag (set above via legacy update) blocks new cycles in timer callback.
+            // impluvium_state_stopping() checks the flag and goes to DISABLED on session end.
+            ESP_LOGI(TAG, "Load shed (power %d) mid-cycle - completing all zones before disabling", pwr);
+            // Timer keeps running - callback already skips when load_shed_shutdown is set
+        } else if (irrigation_system.state == IMPLUVIUM_WATERING ||
+                   irrigation_system.state == IMPLUVIUM_STOPPING) {
+            // User request mid-cycle: graceful stop (current zone finishes, remaining skipped)
             ESP_LOGI(TAG, "Watering in progress - requesting graceful stop (current zone will finish)");
             irrigation_system.graceful_stop_requested = true;
+            xTimerStop(xMoistureCheckTimer, 0);
         } else {
-            // Not watering - can transition immediately
+            // Not mid-cycle: immediate disable
             impluvium_change_state(IMPLUVIUM_DISABLED);
+            xTimerStop(xMoistureCheckTimer, 0);
         }
-
-        // Stop moisture check timer (no new cycles)
-        xTimerStop(xMoistureCheckTimer, 0);
     } else {
         ESP_LOGI(TAG, "System re-enabled via %s", reason_str);
 
         // Clear shutdown flags
         irrigation_system.graceful_stop_requested = false;
 
-        // Transition back to STANDBY and restart moisture timer
-        impluvium_change_state(IMPLUVIUM_STANDBY);
-        xTimerStart(xMoistureCheckTimer, 0);
+        if (irrigation_system.state == IMPLUVIUM_DISABLED) {
+            // Normal re-enable from fully disabled state
+            impluvium_change_state(IMPLUVIUM_STANDBY);
+            xTimerStart(xMoistureCheckTimer, 0);
+        } else if (irrigation_system.state == IMPLUVIUM_STANDBY) {
+            // Cycle completed while load shed was pending - already in standby, timer still running
+            ESP_LOGI(TAG, "Re-enabled from standby (post load-shed cycle) - resuming normal operation");
+            xTimerStart(xMoistureCheckTimer, 0);  // safe no-op if already running
+        } else {
+            // Mid-cycle re-enable: flags cleared, ongoing cycle continues uninterrupted
+            ESP_LOGI(TAG, "Re-enabled mid-cycle (state %d) - flags cleared, cycle continues", irrigation_system.state);
+        }
     }
 
     xSemaphoreGive(xIrrigationMutex);
