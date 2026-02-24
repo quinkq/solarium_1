@@ -219,6 +219,19 @@ esp_err_t fluctus_update_bus_hardware(power_bus_t bus)
 /**
  * @brief Add consumer to bus tracking
  */
+/**
+ * @brief Check if consumer is already tracked on a bus
+ */
+static bool fluctus_is_consumer_tracked(power_bus_t bus, const char *consumer_id)
+{
+    for (int i = 0; i < FLUCTUS_POWER_BUS_MAX_CONSUMERS; i++) {
+        if (strcmp(system_status.bus_consumers[bus][i], consumer_id) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 esp_err_t fluctus_add_consumer(power_bus_t bus, const char *consumer_id)
 {
     if (bus >= POWER_BUS_COUNT || consumer_id == NULL) {
@@ -353,9 +366,14 @@ esp_err_t fluctus_request_bus_power(power_bus_t bus, const char *consumer_id)
             return ESP_ERR_INVALID_STATE;
         }
 
-        // Add consumer and increment reference count
+        // Add consumer and increment reference count (skip if already tracked — prevents
+        // ref count leak when the same consumer requests a bus multiple times, e.g. IMPLUVIUM
+        // requesting 12V for each zone in a multi-zone watering session)
+        bool already_tracked = fluctus_is_consumer_tracked(bus, consumer_id);
         fluctus_add_consumer(bus, consumer_id);
-        system_status.bus_ref_count[bus]++;
+        if (!already_tracked) {
+            system_status.bus_ref_count[bus]++;
+        }
 
         // Enable bus if not already enabled
         if (!system_status.bus_enabled[bus]) {
@@ -392,8 +410,13 @@ esp_err_t fluctus_request_bus_power(power_bus_t bus, const char *consumer_id)
                 ESP_LOGD(TAG, "Power-up delay complete for %s bus", power_bus_names[bus]);
             }
 
-            // Notify monitoring task of power activity to start constant monitoring
-            if (xFluctusMonitoringTaskHandle != NULL) {
+            // Notify monitoring task of power activity to start constant monitoring.
+            // Skip self-notification: if the monitoring task itself requests a bus (e.g. DS18B20_READ),
+            // notifying it would cause a perpetual active-monitoring loop — the pending notification
+            // makes the next xTaskNotifyWait() return immediately, re-setting monitoring_active=true
+            // every 30s forever even after all external consumers have released the buses.
+            if (xFluctusMonitoringTaskHandle != NULL &&
+                xTaskGetCurrentTaskHandle() != xFluctusMonitoringTaskHandle) {
                 xTaskNotify(xFluctusMonitoringTaskHandle, FLUCTUS_NOTIFY_POWER_ACTIVITY, eSetBits);
             }
         } else {
@@ -499,6 +522,16 @@ bool fluctus_is_bus_powered(power_bus_t bus)
 /**
  * @brief Add consumer to level shifter tracking
  */
+static bool fluctus_is_level_shifter_consumer_tracked(const char *consumer_id)
+{
+    for (int i = 0; i < FLUCTUS_LEVEL_SHIFTER_MAX_CONSUMERS; i++) {
+        if (strcmp(system_status.level_shifter_consumers[i], consumer_id) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static esp_err_t fluctus_add_level_shifter_consumer(const char *consumer_id)
 {
     if (consumer_id == NULL) {
@@ -597,9 +630,12 @@ esp_err_t fluctus_request_level_shifter(const char *consumer_id)
             return ESP_ERR_INVALID_STATE;
         }
 
-        // Add consumer and increment reference count
+        // Add consumer and increment reference count (skip if already tracked)
+        bool already_tracked = fluctus_is_level_shifter_consumer_tracked(consumer_id);
         fluctus_add_level_shifter_consumer(consumer_id);
-        system_status.level_shifter_ref_count++;
+        if (!already_tracked) {
+            system_status.level_shifter_ref_count++;
+        }
 
         // Enable level shifter if not already enabled
         if (!system_status.level_shifter_enabled) {

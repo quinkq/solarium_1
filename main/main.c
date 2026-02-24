@@ -135,6 +135,8 @@ void app_main(void)
 
     // Initialize I2C subsystem
     vTaskDelay(pdMS_TO_TICKS(100));
+    ESP_LOGI(TAG, "Initializing I2C...");
+    ESP_ERROR_CHECK(i2cdev_init());
 
     // Initialize SPI2 bus (shared by ABP sensor and HMI display)
     vTaskDelay(pdMS_TO_TICKS(100));

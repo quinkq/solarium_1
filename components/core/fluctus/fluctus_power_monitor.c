@@ -710,10 +710,16 @@ void fluctus_monitoring_task(void *parameters)
             fluctus_check_overcurrent();
             fluctus_monitor_check_power_state_change();  // Check battery state and notify core on changes
 
-            // Check if any buses are still active
+            // Check if any buses are still active (excluding the monitoring task's
+            // own DS18B20 hold on 3V3 — that must not count as external activity,
+            // otherwise the DS18B20 read perpetuates monitoring_active=true indefinitely)
             bool system_active = false;
             for (int i = 0; i < POWER_BUS_COUNT; i++) {
                 if (system_status.bus_enabled[i]) {
+                    if (i == POWER_BUS_3V3 && ds18b20_power_held &&
+                        system_status.bus_ref_count[POWER_BUS_3V3] == 1) {
+                        continue; // 3V3 held only by our own DS18B20 read, not external
+                    }
                     system_active = true;
                     break;
                 }

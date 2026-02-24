@@ -121,10 +121,10 @@
 #define FLUCTUS_NOTIFY_SERVO_CONVERGED       (1UL << 6)  // Servo control → state machine: tracking converged
 
 // Battery Voltage Thresholds (12V AGM, 50% SOC = 0%)
-#define FLUCTUS_BATTERY_LEVEL_POWER_SAVING    12.48f  // 40% SOC - Impose limit on STELLARIA
-#define FLUCTUS_BATTERY_LEVEL_LOW_POWER       12.33f  // 25% SOC - Turn off STELLARIA
-#define FLUCTUS_BATTERY_LEVEL_VERY_LOW        12.23f  // 15% SOC - Turn off IMPLUVIUM  
-#define FLUCTUS_BATTERY_LEVEL_CRITICAL        12.08f  // 0% SOC  - Turn off TEMPESTA + Solar
+#define FLUCTUS_BATTERY_LEVEL_POWER_SAVING    12.40f  // 40% SOC - Impose limit on STELLARIA
+#define FLUCTUS_BATTERY_LEVEL_LOW_POWER       12.25f  // 25% SOC - Turn off STELLARIA
+#define FLUCTUS_BATTERY_LEVEL_VERY_LOW        12.15f  // 15% SOC - Turn off IMPLUVIUM  
+#define FLUCTUS_BATTERY_LEVEL_CRITICAL        12.00f  // 0% SOC  - Turn off TEMPESTA + Solar
 
 #define FLUCTUS_STATE_DEBOUNCE_REQUIRED_COUNT 3  // Require 3 consecutive readings to change state
 

@@ -69,6 +69,7 @@ extern power_accumulator_rtc_t rtc_fluctus_accumulator;
 extern onewire_addr_t ds18b20_addr;
 extern bool ds18b20_found;
 extern int64_t last_temp_read_time;
+extern bool ds18b20_power_held;
 
 // DS18B20 async conversion state machine
 typedef enum {
