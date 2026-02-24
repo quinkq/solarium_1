@@ -3,7 +3,9 @@
 ## Status
 v0.2-alpha - 01.2025
 Dry testing complete. With most of the features tested, currently building hydraulic system (and compact enclosures to match), making field testing/deployment possible in the near future.
-
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/89cf4c63-4b47-4390-9b8a-68802c780b96" width="640">
+</p>
 ## Overview
 
 Solarium is a self-contained, renewable-powered garden automation platform running on a single ESP32-S3. The system is built around four main subsystems: **FLUCTUS** (power & solar tracking), **TEMPESTA** (weather station with 8 sensors), **IMPLUVIUM** (learning irrigation controller), and **STELLARIA** (adaptive LED lighting). All data flows through **TELEMETRY**, a caching system with two-tier MQTT buffering, while **HMI** provides a custom menu system on a small OLED screen.
@@ -33,7 +35,9 @@ Caching hub receiving push-based data injections from seven sources at variable 
 
 - #### HMI - Complete custom menu system
 Custom UI system with SH1106 OLED screen and EC11 encoder. Framebuffer rendering, 47-state menu hierarchy with table-driven navigation, variable refresh rates.
-
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/5b8e38bc-2f30-44e3-ab89-b3ed8657b49c" width="640">
+</p>
 
 ### Additionally:
 - **wifi_helper** - Power-aware WiFi management with exponential backoff and RSSI monitoring
@@ -126,8 +130,10 @@ The MCP23008 I2C GPIO expander replaces hardware PCNT with interrupt-driven soft
 - **Display**: SH1106 128×64 OLED (SPI) with EC11 rotary encoder (via MCP23008)
 - **Interfaces**: I2C, SPI, UART, GPIO, OneWire, PWM
 - **Power**: 4-bus distribution (3.3V/5V/6.6V/12V) with solar input and 12V 14Ah battery
-
-![20251013_135107](https://github.com/user-attachments/assets/67a5d10f-e1c2-459f-9a77-ee2e89fb2cb5)
+- 
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/2388d66f-b94a-46c5-af34-02582b1dfcc6" width="640">
+</p>
 
 ## Development Status
 
