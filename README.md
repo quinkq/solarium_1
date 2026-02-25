@@ -57,6 +57,10 @@ Custom UI system with SH1106 OLED screen and EC11 encoder. Framebuffer rendering
 
 ### Original Work (~19,000 lines)
 
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/50614ae9-41e1-4c3d-b50e-53d8aa514346" width="640">
+</p>
+
 ## General system's hardware layout (due to be updated)
 
 ![solarium_topo-1](https://github.com/user-attachments/assets/5801f9b7-c7d6-40f8-a188-8f4dde045b36)
